@@ -1,0 +1,14 @@
+resources/version_0.25.06.01.yml
+resources/version_0.25.07.01.yml
+consts/__pycache__/program_config.cpython-312.pyc
+__pycache__/program_config.cpython-312.pyc
+control/__pycache__/upgrade_db.cpython-312.pyc
+load_yml/__pycache__/load_yml.cpython-312.pyc
+log_model/__pycache__/log_manager.cpython-312.pyc
+log_model/log/main.log
+resources/1111.exe
+resources/audio_data.db
+resources/backup/audio_data_backup.db
+.vscode/settings.json
+resources/
+control/__pycache__/
