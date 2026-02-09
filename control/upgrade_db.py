@@ -3,12 +3,14 @@ import os
 import shutil
 import sqlite3
 import yaml
+
 from consts.program_config import DATABASE_PATH, BACKUP_DIR, DEFAULT_DIR, TARGET_VERSION, ALL_VERSIONS
+from log_model.log_manager import LogManager
 
 
 class DataBaseManager:
-    def __init__(self, db_path, logger):
-        self.logger = logger
+    def __init__(self, db_path):
+        self.logger = LogManager.set_log_handler("db_core")
         self.db_path = db_path
         if not os.path.exists(self.db_path):
             self.logger.error(f"数据库文件不存在: {self.db_path}")
@@ -17,7 +19,8 @@ class DataBaseManager:
         self.modify_table_set = set()
 
     @staticmethod
-    def backup_db(logger):
+    def backup_db():
+        logger = LogManager.set_log_handler("db_core")
         backup_path = os.path.join(BACKUP_DIR, "audio_data_backup.db")
         if not os.path.exists(BACKUP_DIR):
             os.makedirs(BACKUP_DIR)
@@ -32,7 +35,8 @@ class DataBaseManager:
             return False
 
     @staticmethod
-    def restore_db(logger):
+    def restore_db():
+        logger = LogManager.set_log_handler("db_core")
         backup_path = os.path.join(BACKUP_DIR, "audio_data_backup.db")
         if os.path.exists(backup_path):
             shutil.copy(backup_path, DATABASE_PATH)
@@ -46,13 +50,16 @@ class DataBaseManager:
         if not os.path.exists(config_file_path):
             self.logger.error(f"找不到 YAML 文件: {config_file_path}")
             raise FileNotFoundError(f"找不到 YAML 文件: {config_file_path}")
-        with open(config_file_path, 'r', encoding='utf-8') as f:
+        with open(config_file_path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
-        sql_flag = True
+        sql_flag = False
         if "db" in data:
-             sql_flag = False
+            if "sqls_operate" in data["db"]:
+                sql_flag = True
+        if sql_flag is False:
+            return sql_flag, []
         sqls = data.get("db", {}).get("sqls_operate", [])
-        modify_tables =  data.get("db", {}).get("data_check", {}).get("add", [])
+        modify_tables = data.get("db", {}).get("data_check", {}).get("add", [])
         del_modify_tables = data.get("db", {}).get("data_check", {}).get("del", [])
 
         if modify_tables:
@@ -74,7 +81,7 @@ class DataBaseManager:
         if not sqls:
             self.logger.info("无更新SQL")
             print("无更新SQL")
-            return
+            return True
 
         success_count = 0
         try:
@@ -122,7 +129,7 @@ class DataBaseManager:
             );
             """
         self.conn.execute(create_table_sql)
-        now_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        now_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         insert_sql = """
             INSERT INTO system_info_table (name, value)
             VALUES
@@ -130,11 +137,11 @@ class DataBaseManager:
                 ('last_running_version',null),
                 ('update_time', ?);
             """
-        init_version = '0.12'
+        init_version = "0.12"
         self.conn.execute(insert_sql, (init_version, now_time))
         self.conn.commit()
         return init_version
-    
+
     def check_table_data(self):
         backup_database_path = os.path.join(BACKUP_DIR, "audio_data_backup.db")
         sql_connect = sqlite3.connect(backup_database_path)
@@ -185,13 +192,12 @@ class DataBaseManager:
 
     def update_version(self):
         db_current_version = self.get_current_version()
-        now_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        self.conn.execute("UPDATE system_info_table SET value = ? WHERE name = 'last_running_version';",
-                          (db_current_version,))
-        self.conn.execute("UPDATE system_info_table SET value = ? WHERE name = 'current_version';",
-                          (TARGET_VERSION,))
-        self.conn.execute("UPDATE system_info_table SET value = ? WHERE name = 'update_time';",
-                          (now_time,))
+        now_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.conn.execute(
+            "UPDATE system_info_table SET value = ? WHERE name = 'last_running_version';", (db_current_version,)
+        )
+        self.conn.execute("UPDATE system_info_table SET value = ? WHERE name = 'current_version';", (TARGET_VERSION,))
+        self.conn.execute("UPDATE system_info_table SET value = ? WHERE name = 'update_time';", (now_time,))
         self.conn.commit()
         self.conn.close()
         print(f"数据库版本信息已更新到 {TARGET_VERSION}")
