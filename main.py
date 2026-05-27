@@ -5,6 +5,7 @@ import sqlite3
 
 from control.upgrade_db import DataBaseManager
 from control.upgrade_config import ConfigManager
+from control.upgrade_exe import ExeUpgradeManager
 from log_model.log_manager import LogManager
 from consts.program_config import DEFAULT_DIR, DEFAULT_TARGET_DIR, DATABASE_PATH, BACKUP_DIR
 
@@ -55,8 +56,12 @@ if __name__ == "__main__":
     result_db = db.upgrade()
     result_config = config_manager.update_config_file()
     result_ui = True
+    result_exe = False
     result_program = False
     if result_db and result_config and result_ui:
+        exe_manager = ExeUpgradeManager(logger, config_manager.upgrade_version_list)
+        result_exe = exe_manager.run()
+    if result_db and result_config and result_ui and result_exe:
         result_program = update_version_program(logger)[0]
     if result_program:
         print("更新成功!")
