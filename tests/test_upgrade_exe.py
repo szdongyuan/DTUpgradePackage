@@ -1,3 +1,4 @@
+import os
 import shutil
 import subprocess
 import sys
@@ -169,6 +170,40 @@ def test_explicit_cwd_is_used(local_tmp_path, capsys):
     assert ExeUpgradeManager(DummyLogger(), ["1.0"], base_dir=str(local_tmp_path)).run() is True
 
     assert str(work_dir) in capsys.readouterr().out
+
+
+def test_copy_to_parent_runs_temp_copy_and_cleans_up(local_tmp_path, monkeypatch):
+    source = local_tmp_path / "resources" / "config" / "DBUpgrade.exe"
+    source.parent.mkdir(parents=True)
+    source.write_text("fake exe content", encoding="utf-8")
+    write_version_file(
+        local_tmp_path,
+        {
+            "version": "1.0",
+            "exe": [
+                {
+                    "name": "DBUpgrade",
+                    "path": "resources/config/DBUpgrade.exe",
+                    "copy_to_parent": True,
+                    "cleanup_after_run": True,
+                }
+            ],
+        },
+    )
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("control.upgrade_exe.subprocess.run", fake_run)
+
+    assert ExeUpgradeManager(DummyLogger(), ["1.0"], base_dir=str(local_tmp_path)).run() is True
+
+    temp_exe = local_tmp_path.parent / "DBUpgrade.exe"
+    assert calls[0][0] == [os.path.realpath(str(temp_exe))]
+    assert calls[0][1]["cwd"] == os.path.realpath(str(local_tmp_path.parent))
+    assert not temp_exe.exists()
 
 
 def test_positive_timeout_is_honored(local_tmp_path):

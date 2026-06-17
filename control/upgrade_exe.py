@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 
 from consts.program_config import DEFAULT_DIR
@@ -80,6 +81,14 @@ class ExeUpgradeManager(object):
             if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
                 return None, "exe 配置 timeout 必须是大于 0 的数字", required
 
+        copy_to_parent = raw_config.get("copy_to_parent", False)
+        if not isinstance(copy_to_parent, bool):
+            copy_to_parent = False
+
+        cleanup_after_run = raw_config.get("cleanup_after_run", False)
+        if not isinstance(cleanup_after_run, bool):
+            cleanup_after_run = False
+
         resolved_path, error = self._resolve_path(raw_path)
         if error:
             return None, error, required
@@ -88,7 +97,7 @@ class ExeUpgradeManager(object):
 
         raw_cwd = raw_config.get("cwd")
         if raw_cwd is None:
-            cwd = os.path.dirname(resolved_path)
+            cwd = self._get_parent_dir() if copy_to_parent else os.path.dirname(resolved_path)
         else:
             if not isinstance(raw_cwd, str) or not raw_cwd.strip():
                 return None, "exe 配置 cwd 必须是非空字符串", required
@@ -105,6 +114,8 @@ class ExeUpgradeManager(object):
             "cwd": cwd,
             "timeout": timeout,
             "required": required,
+            "copy_to_parent": copy_to_parent,
+            "cleanup_after_run": cleanup_after_run,
         }, None, required
 
     def _resolve_path(self, value):
@@ -124,13 +135,59 @@ class ExeUpgradeManager(object):
         except (ValueError, OSError):
             return False
 
+    def _get_parent_dir(self):
+        return os.path.realpath(os.path.join(self.base_dir, os.pardir))
+
+    def _copy_to_parent(self, source_path):
+        parent_dir = self._get_parent_dir()
+        target_path = os.path.realpath(os.path.join(parent_dir, os.path.basename(source_path)))
+        try:
+            parent_norm = os.path.normcase(parent_dir)
+            target_norm = os.path.normcase(target_path)
+            if os.path.commonpath([parent_norm, target_norm]) != parent_norm:
+                return None, f"临时可执行程序目标路径不合法: {target_path}"
+        except (ValueError, OSError):
+            return None, f"临时可执行程序目标路径不合法: {target_path}"
+
+        if os.path.exists(target_path):
+            return None, f"临时可执行程序目标已存在: {target_path}"
+
+        try:
+            shutil.copy2(source_path, target_path)
+        except Exception as e:
+            return None, f"复制可执行程序失败: {source_path} -> {target_path}, 错误: {e}"
+
+        self._log_info(f"临时复制可执行程序: {source_path} -> {target_path}")
+        return target_path, None
+
+    def _cleanup_temp_file(self, temp_path):
+        if not temp_path:
+            return True
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+                self._log_info(f"临时可执行程序已删除: {temp_path}")
+            return True
+        except Exception as e:
+            self._log_error(f"删除临时可执行程序失败: {temp_path}, 错误: {e}")
+            return False
+
     def _run_one(self, config):
-        command = [config["path"]] + config["args"]
+        run_path = config["path"]
+        temp_path = None
+        if config["copy_to_parent"]:
+            temp_path, error = self._copy_to_parent(config["path"])
+            if error:
+                return self._handle_failure(error, config["required"])
+            run_path = temp_path
+
+        command = [run_path] + config["args"]
         start_message = (
-            f"启动可执行程序: {config['name']}, 路径: {config['path']}, "
+            f"启动可执行程序: {config['name']}, 路径: {run_path}, "
             f"参数: {config['args']}, 工作目录: {config['cwd']}"
         )
         self._log_info(start_message)
+        result_success = False
         try:
             result = subprocess.run(
                 command,
@@ -142,19 +199,25 @@ class ExeUpgradeManager(object):
             )
         except subprocess.TimeoutExpired as e:
             message = f"可执行程序执行超时: {config['name']}, 超时时间: {config['timeout']} 秒"
-            result = self._handle_failure(message, config["required"])
+            result_success = self._handle_failure(message, config["required"])
             self._log_captured_output(config["name"], e.stdout, e.stderr)
-            return result
         except Exception as e:
-            message = f"可执行程序启动失败: {config['name']}, 路径: {config['path']}, 错误: {e}"
-            return self._handle_failure(message, config["required"])
-
-        self._log_info(f"可执行程序执行结束: {config['name']}, 退出码: {result.returncode}")
-        self._log_captured_output(config["name"], result.stdout, result.stderr)
-        if result.returncode != 0:
-            message = f"可执行程序返回非零退出码: {config['name']}, 退出码: {result.returncode}"
-            return self._handle_failure(message, config["required"])
-        return True
+            message = f"可执行程序启动失败: {config['name']}, 路径: {run_path}, 错误: {e}"
+            result_success = self._handle_failure(message, config["required"])
+        else:
+            self._log_info(f"可执行程序执行结束: {config['name']}, 退出码: {result.returncode}")
+            self._log_captured_output(config["name"], result.stdout, result.stderr)
+            if result.returncode != 0:
+                message = f"可执行程序返回非零退出码: {config['name']}, 退出码: {result.returncode}"
+                result_success = self._handle_failure(message, config["required"])
+            else:
+                result_success = True
+        finally:
+            if config["cleanup_after_run"] and temp_path:
+                cleanup_success = self._cleanup_temp_file(temp_path)
+                if result_success and not cleanup_success:
+                    return False
+        return result_success
 
     def _log_captured_output(self, name, stdout, stderr):
         stdout_text = self._normalize_output(stdout).rstrip()
