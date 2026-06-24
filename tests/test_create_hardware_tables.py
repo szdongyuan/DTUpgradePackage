@@ -412,3 +412,30 @@ def test_malformed_json_rolls_back_and_main_returns_failure(
 
     assert main() == 1
     assert "失败" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "ui/ui_config/mic_channel_calibration.json",
+        "ui/ui_config/mic_channel_calibration.josn",
+    ],
+)
+def test_malformed_calibration_json_is_fatal_when_selected_devices_missing(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    relative_path,
+):
+    db_path = _create_empty_system_db(tmp_path)
+    _write_text(tmp_path, relative_path, "{bad json")
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(json.JSONDecodeError):
+        create_hardware_tables()
+
+    assert "hardware_assets" not in _table_names(db_path)
+    assert "hardware_channel_calibrations" not in _table_names(db_path)
+
+    assert main() == 1
+    assert "失败" in capsys.readouterr().out

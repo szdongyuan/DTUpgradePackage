@@ -276,10 +276,11 @@ def _valid_numeric(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def _load_calibration(ui_config_dir: Path, warnings):
+def _load_calibration(ui_config_dir: Path, warnings, warn_if_missing=True):
     calibration_path = _select_calibration_path(ui_config_dir)
     if calibration_path is None:
-        warnings.append(WARNING_CALIBRATION_MISSING)
+        if warn_if_missing:
+            warnings.append(WARNING_CALIBRATION_MISSING)
         return None
     return _load_json_if_exists(calibration_path)
 
@@ -348,6 +349,11 @@ def create_hardware_tables(db_path=None, ui_config_dir=None):
         _create_tables(conn)
 
         selected_devices = _load_legacy_selected_devices(config_dir, warnings)
+        calibration = _load_calibration(
+            config_dir,
+            warnings,
+            warn_if_missing=selected_devices is not None,
+        )
         mic_payload = None
         if selected_devices is not None:
             mic_payload, _speaker_payload = _import_legacy_hardware(
@@ -355,7 +361,6 @@ def create_hardware_tables(db_path=None, ui_config_dir=None):
                 selected_devices,
                 warnings,
             )
-            calibration = _load_calibration(config_dir, warnings)
             if calibration is not None:
                 _sync_calibration(conn, mic_payload, calibration, warnings)
 
