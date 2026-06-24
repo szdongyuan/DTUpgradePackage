@@ -1,9 +1,8 @@
 import os
 import sys
 import shutil
-import sqlite3
 
-from control.upgrade_db import DataBaseManager
+from control.upgrade_db import DataBaseManager, get_version_database_path, read_current_version_from_db
 from control.upgrade_config import ConfigManager
 from control.upgrade_exe import ExeUpgradeManager
 from log_model.log_manager import LogManager
@@ -29,16 +28,7 @@ def update_version_program(
 
 def get_current_version():
     try:
-        conn = sqlite3.connect(DATABASE_PATH)
-        cursor = conn.cursor()
-        cursor.execute("SELECT value FROM system_info_table WHERE name = 'current_version';")
-        result = cursor.fetchone()
-        cursor.close()
-        conn.close()
-        if result:
-            return result[0]
-        else:
-            return None
+        return read_current_version_from_db(get_version_database_path())
     except Exception as e:
         print(f"获取当前版本失败: {e}")
 
@@ -70,7 +60,7 @@ if __name__ == "__main__":
 
         if os.path.exists(backup_path):
             os.remove(backup_path)
-            update_manager = DataBaseManager(DATABASE_PATH)
+            update_manager = DataBaseManager(get_version_database_path())
             update_manager.update_version()
             print("删除备份配置文件")
             config_manager.delete_backup_file()

@@ -6,6 +6,7 @@ import sys
 DEFAULT_TARGET_DIR = os.path.dirname(os.path.realpath(sys.argv[0])).replace("\\", "/") + "/../"
 DEFAULT_DIR = os.path.dirname(os.path.realpath(sys.argv[0])).replace("\\", "/") + "/"
 DATABASE_PATH = DEFAULT_TARGET_DIR + "database/audio_data.db"
+SYSTEM_DATABASE_PATH = DEFAULT_TARGET_DIR + "database/system_data.db"
 # DATABASE_PATH = DEFAULT_DIR + "resources/audio_data.db"
 BACKUP_DIR = DEFAULT_DIR + "resources/backup/"
 CONFIG_DIR = DEFAULT_DIR + "resources/config/"

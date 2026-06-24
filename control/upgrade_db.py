@@ -4,8 +4,28 @@ import shutil
 import sqlite3
 import yaml
 
-from consts.program_config import DATABASE_PATH, BACKUP_DIR, DEFAULT_DIR, TARGET_VERSION, ALL_VERSIONS
+from consts.program_config import DATABASE_PATH, SYSTEM_DATABASE_PATH, BACKUP_DIR, DEFAULT_DIR, TARGET_VERSION, ALL_VERSIONS
 from log_model.log_manager import LogManager
+
+
+def read_current_version_from_db(db_path):
+    if not os.path.exists(db_path):
+        return None
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.execute("SELECT value FROM system_info_table WHERE name = 'current_version';")
+        result = cur.fetchone()
+        return result[0] if result else None
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+
+def get_version_database_path():
+    if read_current_version_from_db(SYSTEM_DATABASE_PATH) is not None:
+        return SYSTEM_DATABASE_PATH
+    return DATABASE_PATH
 
 
 class DataBaseManager:
