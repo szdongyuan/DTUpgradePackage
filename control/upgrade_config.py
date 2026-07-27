@@ -146,40 +146,64 @@ class ConfigManager(object):
         self.logger.info(f"升级版本列表：{self.upgrade_version_list}")
 
     def backup_config_file(self, config_file_source_path):
+        managed_roots = (
+            (
+                AI_MODEL_CONFIG_PATH,
+                BACKUP_AI_MODEL_CONFIG_PATH,
+                "ai_model_config_flag",
+            ),
+            (
+                UI_CONFIG_PATH,
+                BACKUP_UI_CONFIG_PATH,
+                "ui_config_flag",
+            ),
+            (
+                UI_PIC_PATH,
+                BACKUP_UI_PIC_PATH,
+                "ui_pic_flag",
+            ),
+            (
+                SCANNER_BARCODE_CONFIG_PATH,
+                BACKUP_SCANNER_BARCODE_CONFIG_PATH,
+                "scannre_barcode_config_flag",
+            ),
+        )
+
         for file_path in config_file_source_path:
             file_path = DEFAULT_TARGET_DIR + file_path
-            backup_source_path = None
-            backup_path = None
-            if self.ai_model_config_flag or self.scannre_barcode_config_flag or self.ui_pic_flag or self.ui_config_flag:
-                if self.is_parent_path_os(AI_MODEL_CONFIG_PATH, file_path) and self.ai_model_config_flag:
-                    backup_path = BACKUP_AI_MODEL_CONFIG_PATH
-                    backup_source_path = AI_MODEL_CONFIG_PATH
-                    self.ai_model_config_flag = False
-                elif self.is_parent_path_os(UI_CONFIG_PATH, file_path) and self.ui_config_flag:
-                    backup_path = BACKUP_UI_CONFIG_PATH
-                    backup_source_path = UI_CONFIG_PATH
-                    self.ui_config_flag = False
-                elif self.is_parent_path_os(UI_PIC_PATH, file_path) and self.ui_pic_flag:
-                    backup_path = BACKUP_UI_PIC_PATH
-                    backup_source_path = UI_PIC_PATH
-                    self.ui_pic_flag = False
-                elif (
-                    self.is_parent_path_os(SCANNER_BARCODE_CONFIG_PATH, file_path) and self.scannre_barcode_config_flag
-                ):
-                    backup_path = BACKUP_SCANNER_BARCODE_CONFIG_PATH
-                    backup_source_path = SCANNER_BARCODE_CONFIG_PATH
-                    self.scannre_barcode_config_flag = False
+            managed_root = next(
+                (
+                    (backup_source_path, backup_path, flag_name)
+                    for backup_source_path, backup_path, flag_name in managed_roots
+                    if self.is_parent_path_os(backup_source_path, file_path)
+                ),
+                None,
+            )
+            if managed_root is None:
+                message = f"配置文件不在可备份目录中: {file_path}"
+                print(message)
+                self.logger.error(message)
+                return False
 
-                if not os.path.exists(BACKUP_DIR):
-                    os.makedirs(BACKUP_DIR)
-                try:
-                    self.smart_copy(backup_source_path, backup_path)
-                    self.logger.info(f"配置文件备份已保存到 {backup_path}")
-                    print(f"配置文件备份已保存到 {backup_path}")
-                except Exception as e:
-                    print(f"备份配置文件时发生错误：{e}")
-                    self.logger.error(f"备份配置文件时发生错误：{e}")
+            backup_source_path, backup_path, flag_name = managed_root
+            if getattr(self, flag_name) is False:
+                continue
+
+            try:
+                os.makedirs(BACKUP_DIR, exist_ok=True)
+                if not self.smart_copy(backup_source_path, backup_path):
+                    message = f"配置文件备份失败: {backup_source_path} -> {backup_path}"
+                    print(message)
+                    self.logger.error(message)
                     return False
+            except Exception as e:
+                print(f"备份配置文件时发生错误：{e}")
+                self.logger.error(f"备份配置文件时发生错误：{e}")
+                return False
+
+            setattr(self, flag_name, False)
+            self.logger.info(f"配置文件备份已保存到 {backup_path}")
+            print(f"配置文件备份已保存到 {backup_path}")
         return True
 
     def update_config_file(self):
@@ -214,50 +238,99 @@ class ConfigManager(object):
             return False
 
     def restore_config(self):
-        try:
-            if self.ui_pic_flag is False:
-                self.smart_copy(BACKUP_UI_PIC_PATH, UI_PIC_PATH)
-                print("ui图片配置文件已恢复")
-                self.logger.info("ui图片配置文件已恢复")
-            if self.ai_model_config_flag is False:
-                self.smart_copy(BACKUP_AI_MODEL_CONFIG_PATH, AI_MODEL_CONFIG_PATH)
-                print("ai模型配置文件已恢复")
-                self.logger.info("ai模型配置文件已恢复")
-            if self.scannre_barcode_config_flag is False:
-                self.smart_copy(BACKUP_SCANNER_BARCODE_CONFIG_PATH, SCANNER_BARCODE_CONFIG_PATH)
-                print("条码扫描配置文件已恢复")
-                self.logger.info("条码扫描配置文件已恢复")
-            if self.ui_config_flag is False:
-                self.smart_copy(BACKUP_UI_CONFIG_PATH, UI_CONFIG_PATH)
-                print("UI配置文件已恢复")
-                self.logger.info("UI配置文件已恢复")
-            print("配置文件已恢复")
-            self.delete_backup_file()
-        except Exception as e:
-            print(f"配置文件恢复失败: {e}")
+        restore_targets = (
+            (
+                "ui_pic_flag",
+                BACKUP_UI_PIC_PATH,
+                UI_PIC_PATH,
+                "ui图片配置文件",
+            ),
+            (
+                "ai_model_config_flag",
+                BACKUP_AI_MODEL_CONFIG_PATH,
+                AI_MODEL_CONFIG_PATH,
+                "ai模型配置文件",
+            ),
+            (
+                "scannre_barcode_config_flag",
+                BACKUP_SCANNER_BARCODE_CONFIG_PATH,
+                SCANNER_BARCODE_CONFIG_PATH,
+                "条码扫描配置文件",
+            ),
+            (
+                "ui_config_flag",
+                BACKUP_UI_CONFIG_PATH,
+                UI_CONFIG_PATH,
+                "UI配置文件",
+            ),
+        )
+        restore_succeeded = True
+
+        for flag_name, backup_path, target_path, display_name in restore_targets:
+            if getattr(self, flag_name) is not False:
+                continue
+
+            try:
+                copy_succeeded = self.smart_copy(backup_path, target_path)
+            except Exception as e:
+                copy_succeeded = False
+                self.logger.error(f"{display_name}恢复失败: {e}")
+
+            if copy_succeeded:
+                print(f"{display_name}已恢复")
+                self.logger.info(f"{display_name}已恢复")
+            else:
+                restore_succeeded = False
+                message = f"{display_name}恢复失败: {backup_path} -> {target_path}"
+                print(message)
+                self.logger.error(message)
+
+        if not restore_succeeded:
+            print("配置文件恢复失败，保留备份文件")
+            return False
+
+        print("配置文件已恢复")
+        return self.delete_backup_file()
 
     def delete_backup_file(self):
         self.logger.info("正在删除备份文件...")
         print("正在删除备份文件...")
-        try:
-            if self.ui_pic_flag is False:
-                self.smart_remove(BACKUP_UI_PIC_PATH)
-                print("ui图片配置备份文件已删除")
-                self.logger.info("ui图片配置备份文件已删除")
-            if self.ai_model_config_flag is False:
-                self.smart_remove(BACKUP_AI_MODEL_CONFIG_PATH, AI_MODEL_CONFIG_PATH)
-                print("ai模型配置备份文件已删除")
-                self.logger.info("ai模型配置备份文件已删除")
-            if self.scannre_barcode_config_flag is False:
-                self.smart_remove(BACKUP_SCANNER_BARCODE_CONFIG_PATH, SCANNER_BARCODE_CONFIG_PATH)
-                print("条码扫描配置备份文件已删除")
-                self.logger.info("条码扫描配置备份文件已删除")
-            if self.ui_config_flag is False:
-                self.smart_remove(BACKUP_UI_CONFIG_PATH, UI_CONFIG_PATH)
-                print("UI配置备份文件已删除")
-                self.logger.info("UI配置备份文件已删除")
-        except Exception as e:
-            print(f"配置文件删除失败: {e}")
+        backup_targets = (
+            ("ui_pic_flag", BACKUP_UI_PIC_PATH, "ui图片配置备份文件"),
+            (
+                "ai_model_config_flag",
+                BACKUP_AI_MODEL_CONFIG_PATH,
+                "ai模型配置备份文件",
+            ),
+            (
+                "scannre_barcode_config_flag",
+                BACKUP_SCANNER_BARCODE_CONFIG_PATH,
+                "条码扫描配置备份文件",
+            ),
+            ("ui_config_flag", BACKUP_UI_CONFIG_PATH, "UI配置备份文件"),
+        )
+        delete_succeeded = True
+
+        for flag_name, backup_path, display_name in backup_targets:
+            if getattr(self, flag_name) is not False:
+                continue
+
+            try:
+                removed = self.smart_remove(backup_path)
+            except Exception as e:
+                removed = False
+                self.logger.error(f"{display_name}删除失败: {e}")
+
+            if removed:
+                print(f"{display_name}已删除")
+                self.logger.info(f"{display_name}已删除")
+            else:
+                delete_succeeded = False
+                message = f"{display_name}删除失败，保留备份: {backup_path}"
+                print(message)
+                self.logger.error(message)
+
+        return delete_succeeded
 
 
 if __name__ == "__main__":
