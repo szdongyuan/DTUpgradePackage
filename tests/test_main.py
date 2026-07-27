@@ -37,6 +37,7 @@ def install_fake_upgrade(
     *,
     failure_stage=None,
     failure_mode="false",
+    construction_failure=None,
     database_restore="success",
     config_restore="success",
     database_cleanup="success",
@@ -55,6 +56,18 @@ def install_fake_upgrade(
 
     class FakeDataBaseManager:
         def __init__(self, path):
+            if (
+                construction_failure == "initial_db_manager_construct"
+                and path == "database.db"
+            ):
+                events.append(construction_failure)
+                raise RuntimeError(f"{construction_failure} raised")
+            if (
+                construction_failure == "final_version_db_manager_construct"
+                and path == "version.db"
+            ):
+                events.append(construction_failure)
+                raise RuntimeError(f"{construction_failure} raised")
             self.path = path
 
         @staticmethod
@@ -77,6 +90,9 @@ def install_fake_upgrade(
 
     class FakeConfigManager:
         def __init__(self, supplied_logger, current_version):
+            if construction_failure == "config_manager_construct":
+                events.append(construction_failure)
+                raise RuntimeError(f"{construction_failure} raised")
             received_loggers.append(supplied_logger)
             self.current_version = current_version
             self.upgrade_version_list = ["1.0"]
@@ -103,6 +119,9 @@ def install_fake_upgrade(
 
     class FakeExeUpgradeManager:
         def __init__(self, supplied_logger, upgrade_version_list):
+            if construction_failure == "exe_manager_construct":
+                events.append(construction_failure)
+                raise RuntimeError(f"{construction_failure} raised")
             self.logger = supplied_logger
             self.upgrade_version_list = upgrade_version_list
 
@@ -171,6 +190,23 @@ def test_run_upgrade_uses_default_logger_and_orders_commit_before_cleanup(monkey
     ]
 
 
+def test_default_logger_construction_failure_returns_false_before_backup(monkeypatch):
+    scenario = install_fake_upgrade(monkeypatch)
+
+    def fail_logger_construction(_name):
+        raise RuntimeError("logger construction raised")
+
+    monkeypatch.setattr(
+        upgrade_main.LogManager,
+        "set_log_handler",
+        fail_logger_construction,
+    )
+
+    assert upgrade_main.run_upgrade() is False
+
+    assert scenario.events == []
+
+
 @pytest.mark.parametrize(
     ("cleanup_stage", "cleanup_behavior"),
     [
@@ -204,6 +240,36 @@ def test_post_commit_cleanup_failures_are_independent_and_non_fatal(
     assert "config_restore" not in scenario.events
     assert scenario.recovery_files[cleanup_stage] is True
     assert any(level == "warning" for level, _message in scenario.logger.messages)
+
+
+@pytest.mark.parametrize(
+    "failing_message",
+    [
+        "更新成功!",
+        "删除备份数据库",
+        "删除备份配置文件",
+    ],
+)
+def test_post_commit_reporting_failures_do_not_block_either_cleanup(
+    monkeypatch,
+    failing_message,
+):
+    scenario = install_fake_upgrade(monkeypatch)
+
+    def failing_print(message):
+        if message == failing_message:
+            raise RuntimeError(f"print failed: {message}")
+
+    monkeypatch.setattr(upgrade_main, "print", failing_print, raising=False)
+
+    assert upgrade_main.run_upgrade(scenario.logger) is True
+
+    assert scenario.events[-2:] == [
+        "database_backup_cleanup",
+        "config_backup_cleanup",
+    ]
+    assert "database_restore" not in scenario.events
+    assert "config_restore" not in scenario.events
 
 
 @pytest.mark.parametrize(
@@ -247,6 +313,36 @@ def test_pre_commit_stage_failures_stop_the_pipeline_and_restore_both_backups(
     assert "config_backup_cleanup" not in scenario.events
 
 
+@pytest.mark.parametrize(
+    "failing_message",
+    [
+        "更新失败，用备份的数据替换",
+        "正在恢复数据库...",
+        "正在恢复配置文件...",
+    ],
+)
+def test_rollback_reporting_failures_do_not_block_either_restore(
+    monkeypatch,
+    failing_message,
+):
+    scenario = install_fake_upgrade(
+        monkeypatch,
+        failure_stage="exe_run",
+    )
+
+    def failing_print(message):
+        if message == failing_message:
+            raise RuntimeError(f"print failed: {message}")
+
+    monkeypatch.setattr(upgrade_main, "print", failing_print, raising=False)
+
+    assert upgrade_main.run_upgrade(scenario.logger) is False
+
+    assert scenario.events[-2:] == ["database_restore", "config_restore"]
+    assert "database_backup_cleanup" not in scenario.events
+    assert "config_backup_cleanup" not in scenario.events
+
+
 @pytest.mark.parametrize("failure_mode", ["false", "raise"])
 def test_initial_database_backup_failure_returns_without_rollback(
     monkeypatch,
@@ -262,6 +358,72 @@ def test_initial_database_backup_failure_returns_without_rollback(
 
     assert scenario.events == ["backup_db"]
     assert scenario.recovery_files == {"database": True, "config": True}
+
+
+@pytest.mark.parametrize(
+    (
+        "construction_failure",
+        "expected_events",
+    ),
+    [
+        (
+            "config_manager_construct",
+            [
+                "backup_db",
+                "config_manager_construct",
+                "database_restore",
+            ],
+        ),
+        (
+            "initial_db_manager_construct",
+            [
+                "backup_db",
+                "initial_db_manager_construct",
+                "database_restore",
+                "config_restore",
+            ],
+        ),
+        (
+            "exe_manager_construct",
+            [
+                "backup_db",
+                "db_upgrade",
+                "config_update",
+                "exe_manager_construct",
+                "database_restore",
+                "config_restore",
+            ],
+        ),
+        (
+            "final_version_db_manager_construct",
+            [
+                "backup_db",
+                "db_upgrade",
+                "config_update",
+                "exe_run",
+                "program_update",
+                "final_version_db_manager_construct",
+                "database_restore",
+                "config_restore",
+            ],
+        ),
+    ],
+)
+def test_manager_construction_exceptions_roll_back_and_short_circuit(
+    monkeypatch,
+    construction_failure,
+    expected_events,
+):
+    scenario = install_fake_upgrade(
+        monkeypatch,
+        construction_failure=construction_failure,
+    )
+
+    assert upgrade_main.run_upgrade(scenario.logger) is False
+
+    assert scenario.events == expected_events
+    assert "database_backup_cleanup" not in scenario.events
+    assert "config_backup_cleanup" not in scenario.events
 
 
 @pytest.mark.parametrize(
@@ -472,3 +634,44 @@ def test_later_failures_restore_exact_json_bytes_with_real_config_manager(
     assert "database_restore" in events
     assert tree.target_path.read_bytes() == tree.original_target_bytes
     assert not tree.ui_config_backup.exists()
+
+
+@pytest.mark.parametrize(
+    ("upgrade_succeeded", "expected_exit_code"),
+    [
+        (True, 0),
+        (False, 1),
+    ],
+)
+def test_cli_wrapper_pauses_and_exits_for_run_result(
+    monkeypatch,
+    upgrade_succeeded,
+    expected_exit_code,
+):
+    events = []
+
+    def fake_run_upgrade():
+        events.append("run_upgrade")
+        return upgrade_succeeded
+
+    def fake_system(command):
+        events.append(("system", command))
+        return 0
+
+    def fake_exit(exit_code):
+        events.append(("exit", exit_code))
+        raise SystemExit(exit_code)
+
+    monkeypatch.setattr(upgrade_main, "run_upgrade", fake_run_upgrade)
+    monkeypatch.setattr(upgrade_main.os, "system", fake_system)
+    monkeypatch.setattr(upgrade_main.sys, "exit", fake_exit)
+
+    with pytest.raises(SystemExit) as raised:
+        upgrade_main._run_cli()
+
+    assert raised.value.code == expected_exit_code
+    assert events == [
+        "run_upgrade",
+        ("system", "pause"),
+        ("exit", expected_exit_code),
+    ]

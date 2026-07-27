@@ -44,17 +44,24 @@ def _log_safely(logger, level, message):
         pass
 
 
+def _print_safely(message):
+    try:
+        print(message)
+    except Exception:
+        pass
+
+
 def _require_success(result, stage_name):
     if not result:
         raise _UpgradeStageFailed(f"{stage_name}失败")
 
 
 def _restore_after_failure(logger, config_manager):
-    print("更新失败，用备份的数据替换")
+    _print_safely("更新失败，用备份的数据替换")
     _log_safely(logger, "error", "更新失败，用备份的数据替换")
 
     try:
-        print("正在恢复数据库...")
+        _print_safely("正在恢复数据库...")
         database_restored = DataBaseManager.restore_db()
         if database_restored is False:
             _log_safely(logger, "error", "数据库恢复失败，保留数据库备份")
@@ -66,7 +73,7 @@ def _restore_after_failure(logger, config_manager):
         return
 
     try:
-        print("正在恢复配置文件...")
+        _print_safely("正在恢复配置文件...")
         config_restored = config_manager.restore_config()
         if config_restored is False:
             _log_safely(logger, "error", "配置文件恢复失败，保留配置备份")
@@ -115,7 +122,11 @@ def _cleanup_config_backups(logger, config_manager):
 
 def run_upgrade(logger=None):
     if logger is None:
-        logger = LogManager.set_log_handler("core")
+        try:
+            logger = LogManager.set_log_handler("core")
+        except Exception as e:
+            _print_safely(f"日志初始化失败: {e}")
+            return False
 
     try:
         result_backup = DataBaseManager.backup_db()
@@ -151,15 +162,25 @@ def run_upgrade(logger=None):
         _restore_after_failure(logger, config_manager)
         return False
 
-    print("更新成功!")
-    print("删除备份数据库")
-    _cleanup_database_backup(logger)
-    print("删除备份配置文件")
-    _cleanup_config_backups(logger, config_manager)
+    _print_safely("更新成功!")
+    _print_safely("删除备份数据库")
+    try:
+        _cleanup_database_backup(logger)
+    except Exception as e:
+        _log_safely(logger, "warning", f"数据库备份清理异常: {e}")
+    _print_safely("删除备份配置文件")
+    try:
+        _cleanup_config_backups(logger, config_manager)
+    except Exception as e:
+        _log_safely(logger, "warning", f"配置备份清理异常: {e}")
     return True
 
 
-if __name__ == "__main__":
+def _run_cli():
     upgrade_succeeded = run_upgrade()
     os.system("pause")
     sys.exit(0 if upgrade_succeeded else 1)
+
+
+if __name__ == "__main__":
+    _run_cli()
