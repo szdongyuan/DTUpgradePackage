@@ -33,51 +33,133 @@ def get_current_version():
         print(f"获取当前版本失败: {e}")
 
 
-if __name__ == "__main__":
-    logger = LogManager.set_log_handler("core")
-    result_backup = DataBaseManager.backup_db()
-    current_version = get_current_version()
-    if not result_backup:
-        os.system("pause")
-        sys.exit(1)
-    db = DataBaseManager(DATABASE_PATH)
-    config_manager = ConfigManager(logger, current_version)
+class _UpgradeStageFailed(Exception):
+    pass
 
-    result_db = db.upgrade()
-    result_config = config_manager.update_config_file()
-    result_ui = True
-    result_exe = False
-    result_program = False
-    if result_db and result_config and result_ui:
-        exe_manager = ExeUpgradeManager(logger, config_manager.upgrade_version_list)
-        result_exe = exe_manager.run()
-    if result_db and result_config and result_ui and result_exe:
-        result_program = update_version_program(logger)[0]
-    if result_program:
-        print("更新成功!")
-        print("删除备份数据库")
-        backup_path = os.path.join(BACKUP_DIR, "audio_data_backup.db")
 
-        if os.path.exists(backup_path):
-            os.remove(backup_path)
-            update_manager = DataBaseManager(get_version_database_path())
-            update_manager.update_version()
-            print("删除备份配置文件")
-            config_manager.delete_backup_file()
-            os.system("pause")
-            sys.exit(0)
-    else:
-        print("更新失败，用备份的数据替换")
-        logger.error("更新失败，用备份的数据替换")
+def _log_safely(logger, level, message):
+    try:
+        getattr(logger, level)(message)
+    except Exception:
+        pass
+
+
+def _require_success(result, stage_name):
+    if not result:
+        raise _UpgradeStageFailed(f"{stage_name}失败")
+
+
+def _restore_after_failure(logger, config_manager):
+    print("更新失败，用备份的数据替换")
+    _log_safely(logger, "error", "更新失败，用备份的数据替换")
+
+    try:
         print("正在恢复数据库...")
-        DataBaseManager.restore_db()
-        print("数据库恢复成功")
-        backup_path = os.path.join(BACKUP_DIR, "audio_data_backup.db")
-        if os.path.exists(backup_path):
-            print("删除数据库备份文件...")
-            os.remove(backup_path)
+        database_restored = DataBaseManager.restore_db()
+        if database_restored is False:
+            _log_safely(logger, "error", "数据库恢复失败，保留数据库备份")
+    except Exception as e:
+        _log_safely(logger, "error", f"数据库恢复异常，保留数据库备份: {e}")
 
+    if config_manager is None:
+        _log_safely(logger, "error", "配置管理器未初始化，无法恢复配置文件")
+        return
+
+    try:
         print("正在恢复配置文件...")
-        config_manager.restore_config()
+        config_restored = config_manager.restore_config()
+        if config_restored is False:
+            _log_safely(logger, "error", "配置文件恢复失败，保留配置备份")
+    except Exception as e:
+        _log_safely(logger, "error", f"配置文件恢复异常，保留配置备份: {e}")
 
-        os.system("pause")
+
+def _cleanup_database_backup(logger):
+    backup_path = os.path.join(BACKUP_DIR, "audio_data_backup.db")
+    try:
+        if not os.path.exists(backup_path):
+            return True
+        removed = os.remove(backup_path)
+        if removed is False:
+            _log_safely(
+                logger,
+                "warning",
+                f"数据库备份删除失败，保留备份: {backup_path}",
+            )
+            return False
+        return True
+    except Exception as e:
+        _log_safely(
+            logger,
+            "warning",
+            f"数据库备份删除异常，保留备份: {backup_path}, 错误: {e}",
+        )
+        return False
+
+
+def _cleanup_config_backups(logger, config_manager):
+    try:
+        deleted = config_manager.delete_backup_file()
+        if deleted is False:
+            _log_safely(logger, "warning", "配置备份删除失败，保留未删除的备份")
+            return False
+        return True
+    except Exception as e:
+        _log_safely(
+            logger,
+            "warning",
+            f"配置备份删除异常，保留未删除的备份: {e}",
+        )
+        return False
+
+
+def run_upgrade(logger=None):
+    if logger is None:
+        logger = LogManager.set_log_handler("core")
+
+    try:
+        result_backup = DataBaseManager.backup_db()
+    except Exception as e:
+        _log_safely(logger, "error", f"数据库备份异常: {e}")
+        return False
+    if not result_backup:
+        _log_safely(logger, "error", "数据库备份失败")
+        return False
+
+    config_manager = None
+    try:
+        current_version = get_current_version()
+        config_manager = ConfigManager(logger, current_version)
+        db = DataBaseManager(DATABASE_PATH)
+
+        _require_success(db.upgrade(), "数据库升级")
+        _require_success(config_manager.update_config_file(), "配置文件升级")
+
+        exe_manager = ExeUpgradeManager(
+            logger,
+            config_manager.upgrade_version_list,
+        )
+        _require_success(exe_manager.run(), "可执行程序升级")
+
+        result_program = update_version_program(logger)[0]
+        _require_success(result_program, "主程序升级")
+
+        update_manager = DataBaseManager(get_version_database_path())
+        _require_success(update_manager.update_version(), "数据库版本持久化")
+    except Exception as e:
+        _log_safely(logger, "error", f"升级流程失败: {e}")
+        _restore_after_failure(logger, config_manager)
+        return False
+
+    print("更新成功!")
+    print("删除备份数据库")
+    _cleanup_database_backup(logger)
+    print("删除备份配置文件")
+    _cleanup_config_backups(logger, config_manager)
+    return True
+
+
+if __name__ == "__main__":
+    upgrade_succeeded = run_upgrade()
+    os.system("pause")
+    sys.exit(0 if upgrade_succeeded else 1)
