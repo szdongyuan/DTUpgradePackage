@@ -522,13 +522,19 @@ class ConfigManager(object):
                         file_name = config_file_path.split("/")[-1]
                         new_config_file_path = CONFIG_DIR + file_name
                         target_file_path = DEFAULT_TARGET_DIR + config_file_path
-                        if self.smart_remove(target_file_path):
-                            if self.smart_copy(new_config_file_path, target_file_path):
-                                print("配置文件升级成功")
-                                self.logger.info("配置文件升级成功")
-                            else:
-                                print("配置文件升级失败")
-                                self.logger.error("配置文件备份错误")
+                        if not self.smart_remove(target_file_path):
+                            print("配置文件删除失败")
+                            self.logger.error("配置文件删除失败")
+                            return False
+                        if not self.smart_copy(
+                            new_config_file_path,
+                            target_file_path,
+                        ):
+                            print("配置文件升级失败")
+                            self.logger.error("配置文件升级失败")
+                            return False
+                        print("配置文件升级成功")
+                        self.logger.info("配置文件升级成功")
                 else:
                     print("配置文件备份错误")
                     self.logger.error("配置文件备份错误")

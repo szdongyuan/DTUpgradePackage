@@ -602,6 +602,191 @@ def test_existing_config_actions_run_before_json_merge_actions(
     assert events[3][1] == (merge_relative,)
 
 
+def test_ordinary_config_remove_failure_stops_before_merges_and_keeps_backup(
+    configured_tree,
+    monkeypatch,
+):
+    config_relative = "ui/ui_config/ordinary.json"
+    merge_relative = "ui/ui_config/merged.json"
+    target = write_json(
+        configured_tree.roots["ui_config"] / "ordinary.json",
+        {"state": "original"},
+    )
+    source = write_json(
+        configured_tree.config_dir / "ordinary.json",
+        {"state": "replacement"},
+    )
+    write_json(
+        configured_tree.roots["ui_config"] / "merged.json",
+        {"target": True},
+    )
+    write_json(configured_tree.config_dir / "patch.json", {"source": True})
+    manager = configure_manifest_manager(
+        configured_tree,
+        [
+            (
+                "1.0",
+                {
+                    "config": [config_relative],
+                    "json_merge": [
+                        {
+                            "target": merge_relative,
+                            "source": "resources/config/patch.json",
+                        }
+                    ],
+                },
+            ),
+            (
+                "2.0",
+                {
+                    "config": [],
+                    "json_merge": [
+                        {
+                            "target": merge_relative,
+                            "source": "resources/config/patch.json",
+                        }
+                    ],
+                },
+            ),
+        ],
+    )
+    original_target_bytes = target.read_bytes()
+    original_source_bytes = source.read_bytes()
+    real_smart_remove = manager.smart_remove
+    real_apply_json_merges = manager._apply_json_merges
+    phase_calls = []
+    helper_calls = []
+
+    def fail_target_remove(path):
+        if Path(path) == target:
+            return False
+        return real_smart_remove(path)
+
+    def track_phase(entries, config_entries):
+        phase_calls.append((entries, config_entries))
+        return real_apply_json_merges(entries, config_entries)
+
+    def track_helper(*args):
+        helper_calls.append(args)
+        return True, "ok"
+
+    monkeypatch.setattr(manager, "smart_remove", fail_target_remove)
+    monkeypatch.setattr(manager, "_apply_json_merges", track_phase)
+    monkeypatch.setattr(
+        upgrade_config,
+        "merge_json_files_with_reason",
+        track_helper,
+    )
+
+    assert manager.update_config_file() is False
+
+    assert phase_calls == []
+    assert helper_calls == []
+    assert target.read_bytes() == original_target_bytes
+    assert source.read_bytes() == original_source_bytes
+    assert (
+        configured_tree.backups["ui_config"] / "ordinary.json"
+    ).read_bytes() == original_target_bytes
+    assert any(
+        "配置文件删除失败" in message
+        for message in logged_messages(manager, "error")
+    )
+
+
+def test_ordinary_config_copy_failure_stops_before_merges_and_can_restore(
+    configured_tree,
+    monkeypatch,
+):
+    config_relative = "ui/ui_config/ordinary.json"
+    merge_relative = "ui/ui_config/merged.json"
+    target = write_json(
+        configured_tree.roots["ui_config"] / "ordinary.json",
+        {"state": "original"},
+    )
+    source = write_json(
+        configured_tree.config_dir / "ordinary.json",
+        {"state": "replacement"},
+    )
+    write_json(
+        configured_tree.roots["ui_config"] / "merged.json",
+        {"target": True},
+    )
+    write_json(configured_tree.config_dir / "patch.json", {"source": True})
+    manager = configure_manifest_manager(
+        configured_tree,
+        [
+            (
+                "1.0",
+                {
+                    "config": [config_relative],
+                    "json_merge": [
+                        {
+                            "target": merge_relative,
+                            "source": "resources/config/patch.json",
+                        }
+                    ],
+                },
+            ),
+            (
+                "2.0",
+                {
+                    "config": [],
+                    "json_merge": [
+                        {
+                            "target": merge_relative,
+                            "source": "resources/config/patch.json",
+                        }
+                    ],
+                },
+            ),
+        ],
+    )
+    original_target_bytes = target.read_bytes()
+    original_source_bytes = source.read_bytes()
+    real_smart_copy = manager.smart_copy
+    real_apply_json_merges = manager._apply_json_merges
+    phase_calls = []
+    helper_calls = []
+
+    def fail_ordinary_copy(source_path, target_path):
+        if Path(source_path) == source and Path(target_path) == target:
+            return False
+        return real_smart_copy(source_path, target_path)
+
+    def track_phase(entries, config_entries):
+        phase_calls.append((entries, config_entries))
+        return real_apply_json_merges(entries, config_entries)
+
+    def track_helper(*args):
+        helper_calls.append(args)
+        return True, "ok"
+
+    monkeypatch.setattr(manager, "smart_copy", fail_ordinary_copy)
+    monkeypatch.setattr(manager, "_apply_json_merges", track_phase)
+    monkeypatch.setattr(
+        upgrade_config,
+        "merge_json_files_with_reason",
+        track_helper,
+    )
+
+    assert manager.update_config_file() is False
+
+    assert phase_calls == []
+    assert helper_calls == []
+    assert not target.exists()
+    assert source.read_bytes() == original_source_bytes
+    assert (
+        configured_tree.backups["ui_config"] / "ordinary.json"
+    ).read_bytes() == original_target_bytes
+    assert any(
+        "配置文件升级失败" in message
+        for message in logged_messages(manager, "error")
+    )
+
+    assert manager.restore_config() is True
+    assert target.read_bytes() == original_target_bytes
+
+
 @pytest.mark.parametrize(
     ("raw_section", "schema_category"),
     [
