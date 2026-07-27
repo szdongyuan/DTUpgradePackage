@@ -1,6 +1,7 @@
-import sys
+import ntpath
 import os
 import shutil
+import sys
 import tempfile
 
 from base.json_merge import merge_json_files_with_reason
@@ -227,6 +228,65 @@ class ConfigManager(object):
 
         self.logger.info(f"升级版本列表：{self.upgrade_version_list}")
 
+    def _ordinary_config_path_error(self, relative_path):
+        if not isinstance(relative_path, str):
+            return "non_string_path"
+        if not relative_path.strip():
+            return "empty_path"
+        if "\x00" in relative_path:
+            return "nul_path"
+        if relative_path.startswith(("/", "\\")):
+            return "rooted_path"
+        if ntpath.splitdrive(relative_path)[0]:
+            return "drive_qualified_path"
+        if os.path.isabs(relative_path):
+            return "absolute_path"
+        return None
+
+    def _destination_entry_state(self, path):
+        try:
+            path_lexists = os.path.lexists(path)
+        except (OSError, ValueError):
+            return None, "identity_check_failed"
+
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            if path_lexists:
+                return None, "identity_check_failed"
+            return False, None
+        except (OSError, ValueError):
+            return None, "identity_check_failed"
+
+        try:
+            if not os.path.exists(path):
+                return None, "dangling_link"
+        except (OSError, ValueError):
+            return None, "identity_check_failed"
+        return True, None
+
+    def _resolve_ordinary_config_destination(self, relative_path):
+        path_error = self._ordinary_config_path_error(relative_path)
+        if path_error is not None:
+            return None, path_error
+
+        try:
+            destination_path = os.path.abspath(
+                os.path.join(DEFAULT_TARGET_DIR, relative_path)
+            )
+        except (OSError, ValueError):
+            return None, "invalid_path"
+
+        _, state_error = self._destination_entry_state(destination_path)
+        if state_error is not None:
+            return None, state_error
+        return destination_path, None
+
+    def _report_ordinary_config_destination_error(self, error):
+        message = f"ordinary_config error: destination_path:{error}"
+        print(message)
+        self.logger.error(message)
+
     def backup_config_file(self, config_file_source_path):
         managed_roots = (
             (
@@ -252,7 +312,12 @@ class ConfigManager(object):
         )
 
         for file_path in config_file_source_path:
-            file_path = DEFAULT_TARGET_DIR + file_path
+            file_path, path_error = self._resolve_ordinary_config_destination(
+                file_path
+            )
+            if path_error is not None:
+                self._report_ordinary_config_destination_error(path_error)
+                return False
             managed_root = next(
                 (
                     (backup_source_path, backup_path, flag_name)
@@ -419,24 +484,10 @@ class ConfigManager(object):
         except (OSError, ValueError):
             return None
 
-    def _ordinary_config_manifest_path_key(self, relative_path):
-        if not isinstance(relative_path, str) or not relative_path.strip():
-            return None
-        try:
-            return os.path.normcase(
-                os.path.normpath(
-                    os.path.abspath(
-                        os.path.join(DEFAULT_TARGET_DIR, relative_path)
-                    )
-                )
-            )
-        except (OSError, ValueError):
-            return None
-
-    def _destination_identity_key(self, path):
+    def _destination_identity_key(self, path, path_exists):
         try:
             absolute_path = os.path.abspath(path)
-            if os.path.exists(absolute_path):
+            if path_exists:
                 resolved_path = os.path.realpath(absolute_path)
             else:
                 resolved_parent = os.path.realpath(
@@ -446,50 +497,82 @@ class ConfigManager(object):
                     resolved_parent,
                     os.path.basename(absolute_path),
                 )
-            return os.path.normcase(os.path.normpath(resolved_path))
+            return os.path.normcase(os.path.normpath(resolved_path)), None
         except (OSError, ValueError):
-            return None
+            return None, "identity_check_failed"
 
     def _destination_paths_are_aliases(self, first_path, second_path):
-        try:
-            if os.path.exists(first_path) and os.path.exists(second_path):
-                if os.path.samefile(first_path, second_path):
-                    return True
-        except OSError:
-            pass
+        first_exists, first_state_error = self._destination_entry_state(first_path)
+        if first_state_error is not None:
+            return False, first_state_error
+        second_exists, second_state_error = self._destination_entry_state(second_path)
+        if second_state_error is not None:
+            return False, second_state_error
 
-        first_key = self._destination_identity_key(first_path)
-        second_key = self._destination_identity_key(second_path)
+        try:
+            if first_exists and second_exists:
+                if os.path.samefile(first_path, second_path):
+                    return True, None
+        except (OSError, ValueError):
+            return False, "identity_check_failed"
+
+        first_key, first_key_error = self._destination_identity_key(
+            first_path,
+            first_exists,
+        )
+        if first_key_error is not None:
+            return False, first_key_error
+        second_key, second_key_error = self._destination_identity_key(
+            second_path,
+            second_exists,
+        )
+        if second_key_error is not None:
+            return False, second_key_error
         return (
             first_key is not None
             and second_key is not None
             and first_key == second_key
-        )
+        ), None
 
     def _report_json_merge(self, level, message):
         print(message)
         getattr(self.logger, level)(message)
 
     def _preflight_json_merge_conflicts(self, entries, config_entries):
-        config_target_paths = [
-            target_path
-            for target_path in (
-                self._ordinary_config_manifest_path_key(config_entry)
-                for config_entry in config_entries
+        config_target_paths = []
+        for config_entry in config_entries:
+            target_path, path_error = (
+                self._resolve_ordinary_config_destination(config_entry)
             )
-            if target_path is not None
-        ]
+            if path_error is not None:
+                self._report_ordinary_config_destination_error(path_error)
+                return False
+            config_target_paths.append(target_path)
+
         for entry in entries:
             target_path = self._json_merge_manifest_path_key(entry["target"])
             if target_path is None:
                 continue
-            if any(
-                self._destination_paths_are_aliases(
-                    target_path,
-                    config_target_path,
+            for config_target_path in config_target_paths:
+                paths_are_aliases, identity_error = (
+                    self._destination_paths_are_aliases(
+                        target_path,
+                        config_target_path,
+                    )
                 )
-                for config_target_path in config_target_paths
-            ):
+                if identity_error is not None:
+                    error_category = (
+                        "destination_alias_dangling_link"
+                        if identity_error == "dangling_link"
+                        else "destination_identity_check_failed"
+                    )
+                    self._report_json_merge(
+                        "error",
+                        f"json_merge error: {error_category}",
+                    )
+                    return False
+                if not paths_are_aliases:
+                    continue
                 self._report_json_merge(
                     "error",
                     "json_merge error: target_conflicts_with_config",
@@ -497,7 +580,7 @@ class ConfigManager(object):
                 return False
         return True
 
-    def _apply_json_merges(self, entries, config_entries):
+    def _apply_json_merges(self, entries):
         for entry in entries:
             target_relative_path = entry["target"]
             source_relative_path = entry["source"]
@@ -596,7 +679,16 @@ class ConfigManager(object):
                         self.logger.info(f"更新配置文件: {config_file_path}")
                         file_name = config_file_path.split("/")[-1]
                         new_config_file_path = CONFIG_DIR + file_name
-                        target_file_path = DEFAULT_TARGET_DIR + config_file_path
+                        target_file_path, path_error = (
+                            self._resolve_ordinary_config_destination(
+                                config_file_path
+                            )
+                        )
+                        if path_error is not None:
+                            self._report_ordinary_config_destination_error(
+                                path_error
+                            )
+                            return False
                         if not self.smart_remove(target_file_path):
                             print("配置文件删除失败")
                             self.logger.error("配置文件删除失败")
@@ -615,10 +707,7 @@ class ConfigManager(object):
                     self.logger.error("配置文件备份错误")
                     return False
 
-                if not self._apply_json_merges(
-                    json_merge_entries,
-                    config_file_source_path,
-                ):
+                if not self._apply_json_merges(json_merge_entries):
                     return False
             return True
         except Exception as e:

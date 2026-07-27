@@ -164,6 +164,33 @@ def json_merge_messages(manager, level=None):
     ]
 
 
+def track_config_update_mutations(manager, monkeypatch):
+    mutation_calls = []
+    monkeypatch.setattr(
+        manager,
+        "backup_config_file",
+        lambda paths: mutation_calls.append(("backup", tuple(paths))) or True,
+    )
+    monkeypatch.setattr(
+        manager,
+        "smart_remove",
+        lambda path: mutation_calls.append(("remove", path)) or True,
+    )
+    monkeypatch.setattr(
+        manager,
+        "smart_copy",
+        lambda source, target: (
+            mutation_calls.append(("copy", source, target)) or True
+        ),
+    )
+    monkeypatch.setattr(
+        upgrade_config,
+        "merge_json_files_with_reason",
+        lambda *args: mutation_calls.append(("merge", args)) or (True, "ok"),
+    )
+    return mutation_calls
+
+
 def test_successful_managed_root_backup_changes_only_matching_flag(configured_tree):
     manager = make_manager()
 
@@ -600,6 +627,11 @@ def test_existing_config_actions_run_before_json_merge_actions(
     event_names = [event[0] for event in events]
     assert event_names == ["backup", "remove", "copy", "backup", "merge"]
     assert events[0][1] == (replacement_relative,)
+    expected_replacement_target = os.path.abspath(
+        os.path.join(upgrade_config.DEFAULT_TARGET_DIR, replacement_relative)
+    )
+    assert events[1] == ("remove", expected_replacement_target)
+    assert events[2][2] == expected_replacement_target
     assert events[3][1] == (merge_relative,)
 
 
@@ -663,9 +695,9 @@ def test_ordinary_config_remove_failure_stops_before_merges_and_keeps_backup(
             return False
         return real_smart_remove(path)
 
-    def track_phase(entries, config_entries):
-        phase_calls.append((entries, config_entries))
-        return real_apply_json_merges(entries, config_entries)
+    def track_phase(entries):
+        phase_calls.append(entries)
+        return real_apply_json_merges(entries)
 
     def track_helper(*args):
         helper_calls.append(args)
@@ -754,9 +786,9 @@ def test_ordinary_config_copy_failure_stops_before_merges_and_can_restore(
             return False
         return real_smart_copy(source_path, target_path)
 
-    def track_phase(entries, config_entries):
-        phase_calls.append((entries, config_entries))
-        return real_apply_json_merges(entries, config_entries)
+    def track_phase(entries):
+        phase_calls.append(entries)
+        return real_apply_json_merges(entries)
 
     def track_helper(*args):
         helper_calls.append(args)
@@ -967,6 +999,196 @@ def test_config_path_alias_conflicts_with_json_merge_target_before_merge_write(
     }
     assert any(
         "target_conflicts_with_config" in message
+        for message in json_merge_messages(manager, "error")
+    )
+
+
+@pytest.mark.parametrize(
+    ("case_name", "expected_category"),
+    [
+        ("non_string", "non_string_path"),
+        ("empty", "empty_path"),
+        ("whitespace", "empty_path"),
+        (
+            "absolute",
+            "drive_qualified_path" if os.name == "nt" else "rooted_path",
+        ),
+        ("leading_forward_separator", "rooted_path"),
+        ("leading_back_separator", "rooted_path"),
+        ("drive_relative", "drive_qualified_path"),
+        ("drive_rooted", "drive_qualified_path"),
+        ("nul", "nul_path"),
+    ],
+)
+def test_invalid_ordinary_config_destinations_fail_before_backup_or_writes(
+    configured_tree,
+    monkeypatch,
+    case_name,
+    expected_category,
+):
+    merge_target = write_json(
+        configured_tree.roots["ui_config"] / "same.json",
+        {"state": "pre-upgrade"},
+    )
+    write_json(configured_tree.config_dir / "patch.json", {"added": True})
+
+    invalid_config_entry = {
+        "non_string": 42,
+        "empty": "",
+        "whitespace": "   ",
+        "absolute": str(configured_tree.target_dir / "outside.json"),
+        "leading_forward_separator": "/ui/ui_config/same.json",
+        "leading_back_separator": r"\ui\ui_config\same.json",
+        "drive_relative": r"C:ui\ui_config\same.json",
+        "drive_rooted": r"C:\ui\ui_config\same.json",
+        "nul": "ui/ui_config/\x00same.json",
+    }[case_name]
+    manager = configure_manifest_manager(
+        configured_tree,
+        [
+            (
+                "1.0",
+                {
+                    "config": [invalid_config_entry],
+                    "json_merge": [
+                        {
+                            "target": "ui/ui_config/same.json",
+                            "source": "resources/config/patch.json",
+                        }
+                    ],
+                },
+            )
+        ],
+    )
+    original_target_bytes = merge_target.read_bytes()
+    mutation_calls = track_config_update_mutations(manager, monkeypatch)
+
+    assert manager.update_config_file() is False
+
+    assert mutation_calls == []
+    assert merge_target.read_bytes() == original_target_bytes
+    errors = "\n".join(logged_messages(manager, "error"))
+    assert f"ordinary_config error: destination_path:{expected_category}" in errors
+
+
+def test_backup_rejects_invalid_ordinary_destination_before_snapshot(
+    configured_tree,
+    monkeypatch,
+):
+    manager = make_manager()
+    snapshot_calls = []
+    monkeypatch.setattr(
+        manager,
+        "_replace_with_staged_snapshot",
+        lambda source, destination: (
+            snapshot_calls.append((source, destination)) or True
+        ),
+    )
+
+    assert manager.backup_config_file(["/ui/ui_config/same.json"]) is False
+
+    assert snapshot_calls == []
+    assert any(
+        "ordinary_config error: destination_path:rooted_path" in message
+        for message in logged_messages(manager, "error")
+    )
+
+
+def test_dangling_ordinary_config_destination_fails_before_backup_or_writes(
+    configured_tree,
+    monkeypatch,
+):
+    dangling_target = configured_tree.roots["ui_config"] / "dangling.json"
+    create_symlink_or_skip(
+        configured_tree.roots["ui_config"] / "missing.json",
+        dangling_target,
+    )
+    merge_target = write_json(
+        configured_tree.roots["ui_config"] / "merged.json",
+        {"state": "pre-upgrade"},
+    )
+    write_json(configured_tree.config_dir / "dangling.json", {"replacement": True})
+    write_json(configured_tree.config_dir / "patch.json", {"added": True})
+    manager = configure_manifest_manager(
+        configured_tree,
+        [
+            (
+                "1.0",
+                {
+                    "config": ["ui/ui_config/dangling.json"],
+                    "json_merge": [
+                        {
+                            "target": "ui/ui_config/merged.json",
+                            "source": "resources/config/patch.json",
+                        }
+                    ],
+                },
+            )
+        ],
+    )
+    original_merge_target_bytes = merge_target.read_bytes()
+    mutation_calls = track_config_update_mutations(manager, monkeypatch)
+
+    assert manager.update_config_file() is False
+
+    assert mutation_calls == []
+    assert os.path.lexists(dangling_target)
+    assert not dangling_target.exists()
+    assert merge_target.read_bytes() == original_merge_target_bytes
+    assert any(
+        "ordinary_config error: destination_path:dangling_link" in message
+        for message in logged_messages(manager, "error")
+    )
+
+
+def test_samefile_error_fails_conflict_preflight_before_backup_or_writes(
+    configured_tree,
+    monkeypatch,
+):
+    ordinary_target = write_json(
+        configured_tree.roots["ui_config"] / "ordinary.json",
+        {"state": "pre-upgrade"},
+    )
+    merge_target = write_json(
+        configured_tree.roots["ui_config"] / "merged.json",
+        {"state": "pre-upgrade"},
+    )
+    write_json(configured_tree.config_dir / "ordinary.json", {"replacement": True})
+    write_json(configured_tree.config_dir / "patch.json", {"added": True})
+    manager = configure_manifest_manager(
+        configured_tree,
+        [
+            (
+                "1.0",
+                {
+                    "config": ["ui/ui_config/ordinary.json"],
+                    "json_merge": [
+                        {
+                            "target": "ui/ui_config/merged.json",
+                            "source": "resources/config/patch.json",
+                        }
+                    ],
+                },
+            )
+        ],
+    )
+    original_ordinary_bytes = ordinary_target.read_bytes()
+    original_merge_bytes = merge_target.read_bytes()
+    mutation_calls = track_config_update_mutations(manager, monkeypatch)
+
+    monkeypatch.setattr(
+        upgrade_config.os.path,
+        "samefile",
+        lambda *_paths: (_ for _ in ()).throw(OSError("injected samefile error")),
+    )
+
+    assert manager.update_config_file() is False
+
+    assert mutation_calls == []
+    assert ordinary_target.read_bytes() == original_ordinary_bytes
+    assert merge_target.read_bytes() == original_merge_bytes
+    assert any(
+        "json_merge error: destination_identity_check_failed" in message
         for message in json_merge_messages(manager, "error")
     )
 
