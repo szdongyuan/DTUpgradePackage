@@ -434,6 +434,124 @@ def test_restore_swap_failure_rolls_back_live_target_and_retains_backup(
     assert swap_artifacts(target_root) == []
 
 
+@pytest.mark.parametrize("interruption_type", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize(
+    "interruption_transition",
+    [
+        "after_destination_move",
+        "after_staging_install",
+        "before_rollback_restore",
+        "after_rollback_restore",
+    ],
+)
+def test_staged_snapshot_swap_interruption_preserves_exact_recovery_data(
+    tmp_path,
+    monkeypatch,
+    interruption_type,
+    interruption_transition,
+):
+    manager = make_manager()
+    source = tmp_path / "snapshot-source"
+    destination = tmp_path / "live-destination"
+    source.joinpath("nested").mkdir(parents=True)
+    destination.joinpath("nested").mkdir(parents=True)
+    source.joinpath("snapshot.bin").write_bytes(b"\x00snapshot-data\xff")
+    source.joinpath("nested", "state.txt").write_bytes(b"snapshot state")
+    destination.joinpath("live.bin").write_bytes(b"\x00live-data\xff")
+    destination.joinpath("nested", "state.txt").write_bytes(b"live state")
+    expected_source = snapshot_tree(source)
+    expected_destination = snapshot_tree(destination)
+    real_replace = os.replace
+    staging_install_failed = False
+
+    def interrupt_replace(source_path, destination_path):
+        nonlocal staging_install_failed
+        source_path = Path(source_path)
+        destination_path = Path(destination_path)
+        is_destination_move = (
+            source_path == destination
+            and destination_path.name.startswith(
+                f".{destination.name}.old-"
+            )
+        )
+        is_staging_install = (
+            destination_path == destination
+            and source_path.name.startswith(
+                f".{destination.name}.staging-"
+            )
+        )
+        is_rollback_restore = (
+            destination_path == destination
+            and source_path.name.startswith(
+                f".{destination.name}.old-"
+            )
+        )
+
+        if (
+            interruption_transition
+            in {"before_rollback_restore", "after_rollback_restore"}
+            and is_staging_install
+            and not staging_install_failed
+        ):
+            staging_install_failed = True
+            raise OSError("injected staging installation failure")
+        if (
+            interruption_transition == "before_rollback_restore"
+            and is_rollback_restore
+        ):
+            raise interruption_type("injected rollback interruption")
+
+        result = real_replace(source_path, destination_path)
+        if (
+            interruption_transition == "after_destination_move"
+            and is_destination_move
+        ):
+            raise interruption_type("injected destination move interruption")
+        if (
+            interruption_transition == "after_staging_install"
+            and is_staging_install
+        ):
+            raise interruption_type("injected staging install interruption")
+        if (
+            interruption_transition == "after_rollback_restore"
+            and is_rollback_restore
+        ):
+            raise interruption_type("injected rollback restore interruption")
+        return result
+
+    monkeypatch.setattr(
+        upgrade_config.os,
+        "replace",
+        interrupt_replace,
+    )
+
+    with pytest.raises(interruption_type):
+        manager._replace_with_staged_snapshot(source, destination)
+
+    old_artifacts = [
+        path
+        for path in tmp_path.iterdir()
+        if path.name.startswith(f".{destination.name}.old-")
+    ]
+    destination_tree = (
+        snapshot_tree(destination) if destination.exists() else None
+    )
+    recovery_trees = [snapshot_tree(path) for path in old_artifacts]
+
+    if interruption_transition == "after_staging_install":
+        assert (
+            destination_tree == expected_source
+            or expected_destination in recovery_trees
+        )
+    else:
+        assert (
+            destination_tree == expected_destination
+            or expected_destination in recovery_trees
+        )
+    if not destination.exists():
+        assert expected_destination in recovery_trees
+
+
 def test_restore_failure_attempts_all_selected_roots_and_retains_backups(
     configured_tree,
     monkeypatch,
@@ -534,6 +652,130 @@ def test_restore_returns_false_when_cleanup_partially_fails_and_attempts_all_del
     assert not any(
         "ai模型配置备份文件已删除" in message for message in logged_messages(manager, "info")
     )
+
+
+@pytest.mark.parametrize("failing_reporter", ["print", "logger"])
+def test_restore_reporting_failure_does_not_stop_later_selected_roots(
+    configured_tree,
+    monkeypatch,
+    failing_reporter,
+):
+    manager = make_manager()
+    manager.ui_pic_flag = False
+    manager.ai_model_config_flag = False
+    restore_calls = []
+    cleanup_calls = []
+    report_failure = {"raised": False}
+
+    monkeypatch.setattr(
+        manager,
+        "_replace_with_staged_snapshot",
+        lambda source, destination, **_kwargs: (
+            restore_calls.append((source, destination)) or True
+        ),
+    )
+    monkeypatch.setattr(
+        manager,
+        "delete_backup_file",
+        lambda: cleanup_calls.append(True) or True,
+    )
+
+    if failing_reporter == "print":
+        real_print = print
+
+        def fail_first_root_print(*args, **kwargs):
+            message = " ".join(str(arg) for arg in args)
+            if (
+                "ui图片配置文件已恢复" in message
+                and not report_failure["raised"]
+            ):
+                report_failure["raised"] = True
+                raise RuntimeError("injected restore print failure")
+            return real_print(*args, **kwargs)
+
+        monkeypatch.setattr("builtins.print", fail_first_root_print)
+    else:
+        real_info = manager.logger.info
+
+        def fail_first_root_log(message):
+            if (
+                "ui图片配置文件已恢复" in message
+                and not report_failure["raised"]
+            ):
+                report_failure["raised"] = True
+                raise RuntimeError("injected restore logger failure")
+            return real_info(message)
+
+        monkeypatch.setattr(manager.logger, "info", fail_first_root_log)
+
+    assert manager.restore_config() is True
+
+    assert report_failure["raised"] is True
+    assert restore_calls == [
+        (
+            upgrade_config.BACKUP_UI_PIC_PATH,
+            upgrade_config.UI_PIC_PATH,
+        ),
+        (
+            upgrade_config.BACKUP_AI_MODEL_CONFIG_PATH,
+            upgrade_config.AI_MODEL_CONFIG_PATH,
+        ),
+    ]
+    assert cleanup_calls == [True]
+
+
+@pytest.mark.parametrize("failing_reporter", ["print", "logger"])
+def test_delete_reporting_failure_does_not_stop_later_selected_roots(
+    configured_tree,
+    monkeypatch,
+    failing_reporter,
+):
+    manager = make_manager()
+    manager.ui_pic_flag = False
+    manager.ai_model_config_flag = False
+    remove_calls = []
+    report_failure = {"raised": False}
+    monkeypatch.setattr(
+        manager,
+        "smart_remove",
+        lambda path: remove_calls.append(path) or True,
+    )
+
+    if failing_reporter == "print":
+        real_print = print
+
+        def fail_first_root_print(*args, **kwargs):
+            message = " ".join(str(arg) for arg in args)
+            if (
+                "ui图片配置备份文件已删除" in message
+                and not report_failure["raised"]
+            ):
+                report_failure["raised"] = True
+                raise RuntimeError("injected delete print failure")
+            return real_print(*args, **kwargs)
+
+        monkeypatch.setattr("builtins.print", fail_first_root_print)
+    else:
+        real_info = manager.logger.info
+
+        def fail_first_root_log(message):
+            if (
+                "ui图片配置备份文件已删除" in message
+                and not report_failure["raised"]
+            ):
+                report_failure["raised"] = True
+                raise RuntimeError("injected delete logger failure")
+            return real_info(message)
+
+        monkeypatch.setattr(manager.logger, "info", fail_first_root_log)
+
+    assert manager.delete_backup_file() is True
+
+    assert report_failure["raised"] is True
+    assert remove_calls == [
+        upgrade_config.BACKUP_UI_PIC_PATH,
+        upgrade_config.BACKUP_AI_MODEL_CONFIG_PATH,
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1351,6 +1593,185 @@ def test_backup_rejects_external_junction_before_snapshot_writes(
     assert not configured_tree.backups["ui_config"].exists()
     assert os.path.samefile(junction, external_root)
     assert external_file.read_bytes() == b"\x00external-secret\xff"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction regression")
+@pytest.mark.parametrize(
+    "escape_location",
+    ["backup_dir", "backup_parent", "managed_root_ancestor"],
+)
+def test_backup_rejects_external_ancestor_junction_without_victim_mutation(
+    configured_tree,
+    monkeypatch,
+    escape_location,
+):
+    manager = make_manager()
+    external_root = (
+        configured_tree.target_dir.parent
+        / f"external-ancestor-{escape_location}"
+    )
+    external_root.mkdir()
+    external_root.joinpath("victim.bin").write_bytes(
+        b"\x00external-ancestor-victim\xff"
+    )
+
+    if escape_location == "backup_dir":
+        create_windows_junction(
+            external_root,
+            configured_tree.backup_dir,
+        )
+    elif escape_location == "backup_parent":
+        backup_parent = configured_tree.package_dir / "backup-parent"
+        backup_dir = backup_parent / "backup"
+        backup_path = backup_dir / "ui_config"
+        monkeypatch.setattr(
+            upgrade_config,
+            "BACKUP_DIR",
+            directory_path(backup_dir),
+        )
+        monkeypatch.setattr(
+            upgrade_config,
+            "BACKUP_UI_CONFIG_PATH",
+            directory_path(backup_path),
+        )
+        create_windows_junction(external_root, backup_parent)
+    else:
+        managed_parent = configured_tree.roots["ui_config"].parent
+        external_managed_parent = external_root / "ui"
+        os.replace(managed_parent, external_managed_parent)
+        create_windows_junction(
+            external_managed_parent,
+            managed_parent,
+        )
+
+    expected_external_tree = snapshot_tree(external_root)
+
+    backup_result = manager.backup_config_file(
+        ["ui/ui_config/settings.json"]
+    )
+
+    assert snapshot_tree(external_root) == expected_external_tree
+    assert backup_result is False
+    assert manager.ui_config_flag is True
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction regression")
+@pytest.mark.parametrize(
+    "escape_moment",
+    ["immediately_before_staging", "immediately_before_replacement"],
+)
+def test_backup_revalidates_destination_ancestors_at_swap_boundaries(
+    configured_tree,
+    monkeypatch,
+    escape_moment,
+):
+    manager = make_manager()
+    backup_dir = configured_tree.backup_dir
+    displaced_backup_dir = (
+        configured_tree.package_dir
+        / f"displaced-backup-{escape_moment}"
+    )
+    external_root = (
+        configured_tree.target_dir.parent
+        / f"external-race-{escape_moment}"
+    )
+    external_root.mkdir()
+    external_root.joinpath("victim.bin").write_bytes(
+        b"\x00external-race-victim\xff"
+    )
+    expected_external_tree = snapshot_tree(external_root)
+    race_triggered = {"value": False}
+
+    def install_external_backup_junction():
+        os.replace(backup_dir, displaced_backup_dir)
+        create_windows_junction(external_root, backup_dir)
+        race_triggered["value"] = True
+
+    if escape_moment == "immediately_before_staging":
+        real_makedirs = os.makedirs
+        backup_makedirs_calls = {"count": 0}
+
+        def race_after_second_backup_makedirs(path, *args, **kwargs):
+            result = real_makedirs(path, *args, **kwargs)
+            if Path(path) == backup_dir:
+                backup_makedirs_calls["count"] += 1
+                if backup_makedirs_calls["count"] == 2:
+                    install_external_backup_junction()
+            return result
+
+        monkeypatch.setattr(
+            upgrade_config.os,
+            "makedirs",
+            race_after_second_backup_makedirs,
+        )
+    else:
+        real_smart_copy = manager.smart_copy
+
+        def race_after_staging_copy(source, destination):
+            result = real_smart_copy(source, destination)
+            install_external_backup_junction()
+            return result
+
+        monkeypatch.setattr(
+            manager,
+            "smart_copy",
+            race_after_staging_copy,
+        )
+
+    backup_result = manager.backup_config_file(
+        ["ui/ui_config/settings.json"]
+    )
+
+    assert race_triggered["value"] is True
+    assert snapshot_tree(external_root) == expected_external_tree
+    assert backup_result is False
+    assert manager.ui_config_flag is True
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction regression")
+@pytest.mark.parametrize("upgrade_uses_alias", [True, False])
+def test_contained_junction_backup_and_restore_preserve_snapshot_and_alias(
+    configured_tree,
+    upgrade_uses_alias,
+):
+    manager = make_manager()
+    managed_root = configured_tree.roots["ui_config"]
+    actual_directory = managed_root / "actual"
+    actual_directory.mkdir()
+    actual_marker = actual_directory / "alias-marker.bin"
+    actual_marker.write_bytes(b"\x00original-alias-data\xff")
+    alias_directory = managed_root / "alias"
+    create_windows_junction(actual_directory, alias_directory)
+
+    if upgrade_uses_alias:
+        target = actual_directory / "settings.json"
+        target_relative = "ui/ui_config/alias/settings.json"
+    else:
+        target = managed_root / "settings.json"
+        target_relative = "ui/ui_config/settings.json"
+    target.write_bytes(b'{"state":"original"}')
+
+    assert manager.backup_config_file([target_relative]) is True
+    assert os.path.isjunction(alias_directory)
+    assert os.path.samefile(alias_directory, actual_directory)
+
+    if upgrade_uses_alias:
+        alias_directory.joinpath("settings.json").write_bytes(
+            b'{"state":"changed-through-alias"}'
+        )
+    else:
+        target.write_bytes(b'{"state":"changed-directly"}')
+        alias_directory.joinpath("alias-marker.bin").write_bytes(
+            b"changed unrelated alias data"
+        )
+
+    assert manager.restore_config() is True
+
+    assert target.read_bytes() == b'{"state":"original"}'
+    assert actual_marker.read_bytes() == b"\x00original-alias-data\xff"
+    assert os.path.isjunction(alias_directory)
+    assert os.path.samefile(alias_directory, actual_directory)
+    assert not configured_tree.backups["ui_config"].exists()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows junction regression")

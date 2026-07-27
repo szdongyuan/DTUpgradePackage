@@ -2,6 +2,7 @@ import ntpath
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 
@@ -30,6 +31,22 @@ class ConfigManager(object):
 
         self.init_upgrade_version_list()
 
+    def _report_best_effort(
+        self,
+        level,
+        message,
+        include_print=True,
+    ):
+        if include_print:
+            try:
+                print(message)
+            except Exception:
+                pass
+        try:
+            getattr(self.logger, level)(message)
+        except Exception:
+            pass
+
     def is_parent_path_os(self, parent_path, child_path):
         """
         使用os.path判断parent_path是否为child_path的父路径
@@ -50,7 +67,11 @@ class ConfigManager(object):
         """
         try:
             if not os.path.exists(src_path):
-                self.logger.error(f"源路径不存在: {src_path}")
+                self._report_best_effort(
+                    "error",
+                    f"源路径不存在: {src_path}",
+                    include_print=False,
+                )
                 return False
 
             # 处理源路径是目录的情况
@@ -67,8 +88,10 @@ class ConfigManager(object):
                             if os.path.exists(dst_item):
                                 shutil.rmtree(dst_item)
                             shutil.copytree(src_item, dst_item)
-                    self.logger.info(f"目录内容复制成功: {src_path} -> {dst_path}")
-                    print(f"目录内容复制成功: {src_path} -> {dst_path}")
+                    self._report_best_effort(
+                        "info",
+                        f"目录内容复制成功: {src_path} -> {dst_path}",
+                    )
                 else:
                     # 目标是文件路径或不存在，复制整个目录
                     if os.path.exists(dst_path):
@@ -77,8 +100,10 @@ class ConfigManager(object):
                         else:
                             shutil.rmtree(dst_path)
                     shutil.copytree(src_path, dst_path)
-                    self.logger.info(f"目录复制成功: {src_path} -> {dst_path}")
-                    print(f"目录复制成功: {src_path} -> {dst_path}")
+                    self._report_best_effort(
+                        "info",
+                        f"目录复制成功: {src_path} -> {dst_path}",
+                    )
 
             # 处理源路径是文件的情况
             elif os.path.isfile(src_path):
@@ -88,14 +113,18 @@ class ConfigManager(object):
                     os.makedirs(dst_dir)
 
                 shutil.copy2(src_path, dst_path)
-                self.logger.info(f"文件复制成功: {src_path} -> {dst_path}")
-                print(f"文件复制成功: {src_path} -> {dst_path}")
+                self._report_best_effort(
+                    "info",
+                    f"文件复制成功: {src_path} -> {dst_path}",
+                )
 
             return True
 
         except Exception as e:
-            self.logger.error(f"复制失败 {src_path} -> {dst_path}: {e}")
-            print(f"复制失败 {src_path} -> {dst_path}: {e}")
+            self._report_best_effort(
+                "error",
+                f"复制失败 {src_path} -> {dst_path}: {e}",
+            )
             return False
 
     @staticmethod
@@ -110,42 +139,297 @@ class ConfigManager(object):
             file_attributes & reparse_flag
         )
 
-    def _snapshot_path_is_safe(self, root_path):
+    def _snapshot_ancestor_chain_is_safe(self, path, trusted_anchor):
         try:
-            pending_directories = [os.path.abspath(root_path)]
+            absolute_path = os.path.abspath(path)
+            absolute_anchor = os.path.abspath(trusted_anchor)
+            if not self._path_is_contained(
+                absolute_path,
+                absolute_anchor,
+            ):
+                raise ValueError("path is outside its trusted anchor")
+
+            resolved_anchor = os.path.realpath(absolute_anchor)
+            anchor_stat = os.stat(absolute_anchor)
+            visited_identities = {
+                (anchor_stat.st_dev, anchor_stat.st_ino)
+            }
+            relative_path = os.path.relpath(
+                absolute_path,
+                absolute_anchor,
+            )
         except (OSError, TypeError, ValueError) as e:
-            self.logger.error(f"快照安全检查失败 {root_path}: {e}")
+            self.logger.error(
+                f"快照祖先安全检查失败 {path}: {e}"
+            )
             return False
 
-        while pending_directories:
-            current_path = pending_directories.pop()
-            try:
-                current_stat = os.lstat(current_path)
-            except (OSError, ValueError) as e:
-                self.logger.error(f"快照安全检查失败 {current_path}: {e}")
-                return False
+        if relative_path == os.curdir:
+            return True
 
-            if self._snapshot_entry_is_link_or_reparse(current_stat):
+        current_path = absolute_anchor
+        for path_component in relative_path.split(os.sep):
+            current_path = os.path.join(current_path, path_component)
+            try:
+                os.lstat(current_path)
+            except FileNotFoundError:
+                break
+            except (OSError, ValueError) as e:
                 self.logger.error(
-                    f"快照拒绝链接或重解析点: {current_path}"
+                    f"快照祖先安全检查失败 {current_path}: {e}"
                 )
                 return False
-            if not stat.S_ISDIR(current_stat.st_mode):
-                continue
 
             try:
-                with os.scandir(current_path) as entries:
-                    for entry in entries:
-                        entry_stat = entry.stat(follow_symlinks=False)
-                        if self._snapshot_entry_is_link_or_reparse(entry_stat):
-                            self.logger.error(
-                                f"快照拒绝链接或重解析点: {entry.path}"
-                            )
-                            return False
-                        if stat.S_ISDIR(entry_stat.st_mode):
-                            pending_directories.append(entry.path)
+                resolved_path = os.path.realpath(current_path)
+                if not self._path_is_contained(
+                    resolved_path,
+                    resolved_anchor,
+                ):
+                    self.logger.error(
+                        f"快照祖先逃逸可信目录: {current_path}"
+                    )
+                    return False
+
+                followed_stat = os.stat(current_path)
+                identity = (
+                    followed_stat.st_dev,
+                    followed_stat.st_ino,
+                )
             except (OSError, ValueError) as e:
-                self.logger.error(f"快照安全检查失败 {current_path}: {e}")
+                self.logger.error(
+                    f"快照祖先安全检查失败 {current_path}: {e}"
+                )
+                return False
+
+            if identity in visited_identities:
+                self.logger.error(
+                    f"快照祖先循环链接: {current_path}"
+                )
+                return False
+            visited_identities.add(identity)
+
+        return True
+
+    def _inspect_snapshot_path(self, root_path):
+        try:
+            absolute_root = os.path.abspath(root_path)
+            resolved_root = os.path.realpath(absolute_root)
+            root_stat = os.stat(absolute_root)
+        except (OSError, TypeError, ValueError) as e:
+            self.logger.error(f"快照安全检查失败 {root_path}: {e}")
+            return False, ()
+
+        if not stat.S_ISDIR(root_stat.st_mode):
+            return True, ()
+
+        root_identity = (root_stat.st_dev, root_stat.st_ino)
+        pending_directories = [
+            (absolute_root, frozenset((root_identity,)))
+        ]
+        visited_directory_identities = {root_identity}
+        aliases = []
+
+        while pending_directories:
+            current_path, ancestor_identities = (
+                pending_directories.pop()
+            )
+            try:
+                with os.scandir(current_path) as directory_entries:
+                    entries = list(directory_entries)
+            except (OSError, ValueError) as e:
+                self.logger.error(
+                    f"快照安全检查失败 {current_path}: {e}"
+                )
+                return False, ()
+
+            for entry in entries:
+                try:
+                    entry_stat = entry.stat(follow_symlinks=False)
+                except (OSError, ValueError) as e:
+                    self.logger.error(
+                        f"快照安全检查失败 {entry.path}: {e}"
+                    )
+                    return False, ()
+
+                if self._snapshot_entry_is_link_or_reparse(entry_stat):
+                    is_junction = bool(
+                        os.name == "nt"
+                        and (
+                            getattr(
+                                os.path,
+                                "isjunction",
+                                lambda _path: False,
+                            )(entry.path)
+                            or getattr(entry_stat, "st_reparse_tag", None)
+                            == getattr(
+                                stat,
+                                "IO_REPARSE_TAG_MOUNT_POINT",
+                                0xA0000003,
+                            )
+                        )
+                    )
+                    if not is_junction and not entry.is_symlink():
+                        self.logger.error(
+                            f"快照拒绝不支持的重解析点: {entry.path}"
+                        )
+                        return False, ()
+
+                    try:
+                        resolved_target = os.path.realpath(entry.path)
+                        if not self._path_is_contained(
+                            resolved_target,
+                            resolved_root,
+                        ):
+                            self.logger.error(
+                                f"快照拒绝外部链接或重解析点: {entry.path}"
+                            )
+                            return False, ()
+
+                        followed_stat = os.stat(entry.path)
+                        target_identity = (
+                            followed_stat.st_dev,
+                            followed_stat.st_ino,
+                        )
+                    except (OSError, ValueError) as e:
+                        self.logger.error(
+                            f"快照链接安全检查失败 {entry.path}: {e}"
+                        )
+                        return False, ()
+
+                    target_is_directory = stat.S_ISDIR(
+                        followed_stat.st_mode
+                    )
+                    if (
+                        target_is_directory
+                        and target_identity in ancestor_identities
+                    ):
+                        self.logger.error(
+                            f"快照拒绝循环链接或重解析点: {entry.path}"
+                        )
+                        return False, ()
+
+                    try:
+                        relative_entry = os.path.relpath(
+                            entry.path,
+                            absolute_root,
+                        )
+                        relative_target = os.path.relpath(
+                            resolved_target,
+                            resolved_root,
+                        )
+                        link_target = (
+                            None
+                            if is_junction
+                            else os.readlink(entry.path)
+                        )
+                    except (OSError, ValueError) as e:
+                        self.logger.error(
+                            f"快照链接安全检查失败 {entry.path}: {e}"
+                        )
+                        return False, ()
+
+                    aliases.append(
+                        (
+                            relative_entry,
+                            relative_target,
+                            "junction" if is_junction else "symlink",
+                            link_target,
+                            target_is_directory,
+                        )
+                    )
+                    continue
+
+                if not stat.S_ISDIR(entry_stat.st_mode):
+                    continue
+
+                identity = (entry_stat.st_dev, entry_stat.st_ino)
+                if identity in ancestor_identities:
+                    self.logger.error(
+                        f"快照拒绝目录循环: {entry.path}"
+                    )
+                    return False, ()
+                if identity in visited_directory_identities:
+                    continue
+                visited_directory_identities.add(identity)
+                pending_directories.append(
+                    (
+                        entry.path,
+                        ancestor_identities | frozenset((identity,)),
+                    )
+                )
+
+        aliases.sort(key=lambda alias: alias[0])
+        return True, tuple(aliases)
+
+    def _snapshot_path_is_safe(self, root_path):
+        path_is_safe, _aliases = self._inspect_snapshot_path(root_path)
+        return path_is_safe
+
+    def _recreate_snapshot_aliases(
+        self,
+        staging_path,
+        destination_path,
+        aliases,
+    ):
+        for (
+            relative_entry,
+            relative_target,
+            alias_kind,
+            link_target,
+            target_is_directory,
+        ) in sorted(
+            aliases,
+            key=lambda alias: alias[0].count(os.sep),
+            reverse=True,
+        ):
+            staged_alias = os.path.join(staging_path, relative_entry)
+            try:
+                if os.path.isdir(staged_alias):
+                    shutil.rmtree(staged_alias)
+                elif os.path.lexists(staged_alias):
+                    os.remove(staged_alias)
+
+                if alias_kind == "junction":
+                    future_target = os.path.join(
+                        destination_path,
+                        relative_target,
+                    )
+                    result = subprocess.run(
+                        [
+                            "cmd.exe",
+                            "/d",
+                            "/c",
+                            "mklink",
+                            "/J",
+                            staged_alias,
+                            future_target,
+                        ],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    if result.returncode != 0:
+                        raise OSError(
+                            result.stderr.strip()
+                            or result.stdout.strip()
+                            or "junction creation failed"
+                        )
+                else:
+                    if os.path.isabs(link_target):
+                        link_target = os.path.join(
+                            destination_path,
+                            relative_target,
+                        )
+                    os.symlink(
+                        link_target,
+                        staged_alias,
+                        target_is_directory=target_is_directory,
+                    )
+            except (OSError, TypeError, ValueError) as e:
+                self.logger.error(
+                    f"快照链接重建失败 {relative_entry}: {e}"
+                )
                 return False
 
         return True
@@ -158,21 +442,111 @@ class ConfigManager(object):
             if self.smart_remove(path):
                 return True
         except Exception as e:
-            self.logger.error(f"快照临时路径清理失败 {path}: {e}")
+            self._report_best_effort(
+                "error",
+                f"快照临时路径清理失败 {path}: {e}",
+                include_print=False,
+            )
             return False
 
-        self.logger.error(f"快照临时路径清理失败: {path}")
+        self._report_best_effort(
+            "error",
+            f"快照临时路径清理失败: {path}",
+            include_print=False,
+        )
         return False
 
-    def _replace_with_staged_snapshot(self, src_path, dst_path):
+    @staticmethod
+    def _snapshot_path_lexists(path):
+        try:
+            return os.path.lexists(path)
+        except (OSError, ValueError):
+            return None
+
+    def _recover_old_snapshot_destination(
+        self,
+        old_path,
+        destination_path,
+    ):
+        if old_path is None:
+            return None, False, None
+
+        old_exists = self._snapshot_path_lexists(old_path)
+        destination_exists = self._snapshot_path_lexists(
+            destination_path
+        )
+        if not old_exists:
+            return None, False, None
+        if destination_exists:
+            return old_path, True, None
+        if destination_exists is None:
+            return old_path, True, None
+
+        try:
+            os.replace(old_path, destination_path)
+        except BaseException as recovery_error:
+            old_exists = self._snapshot_path_lexists(old_path)
+            destination_exists = self._snapshot_path_lexists(
+                destination_path
+            )
+            if destination_exists and not old_exists:
+                return None, False, recovery_error
+            return old_path, True, recovery_error
+
+        return None, False, None
+
+    def _replace_with_staged_snapshot(
+        self,
+        src_path,
+        dst_path,
+        source_anchor=None,
+        destination_anchor=None,
+    ):
         destination_path = os.path.normpath(dst_path)
         parent_path = os.path.dirname(destination_path) or os.curdir
         destination_name = os.path.basename(destination_path)
         staging_path = None
         old_path = None
         preserve_old_path = False
+        source_aliases = ()
 
-        if not self._snapshot_path_is_safe(src_path):
+        if source_anchor is None and destination_anchor is None:
+            if (
+                self._path_is_contained(src_path, DEFAULT_TARGET_DIR)
+                and self._path_is_contained(parent_path, DEFAULT_DIR)
+            ):
+                source_anchor = DEFAULT_TARGET_DIR
+                destination_anchor = DEFAULT_DIR
+            elif (
+                self._path_is_contained(src_path, DEFAULT_DIR)
+                and self._path_is_contained(
+                    parent_path,
+                    DEFAULT_TARGET_DIR,
+                )
+            ):
+                source_anchor = DEFAULT_DIR
+                destination_anchor = DEFAULT_TARGET_DIR
+
+        if (
+            source_anchor is not None
+            and not self._snapshot_ancestor_chain_is_safe(
+                src_path,
+                source_anchor,
+            )
+        ):
+            return False
+        if (
+            destination_anchor is not None
+            and not self._snapshot_ancestor_chain_is_safe(
+                parent_path,
+                destination_anchor,
+            )
+        ):
+            return False
+        source_is_safe, source_aliases = self._inspect_snapshot_path(
+            src_path
+        )
+        if not source_is_safe:
             return False
         try:
             destination_exists = os.path.lexists(destination_path)
@@ -189,6 +563,27 @@ class ConfigManager(object):
 
         try:
             os.makedirs(parent_path, exist_ok=True)
+            if (
+                source_anchor is not None
+                and not self._snapshot_ancestor_chain_is_safe(
+                    src_path,
+                    source_anchor,
+                )
+            ):
+                return False
+            if (
+                destination_anchor is not None
+                and not self._snapshot_ancestor_chain_is_safe(
+                    parent_path,
+                    destination_anchor,
+                )
+            ):
+                return False
+            source_is_safe, source_aliases = self._inspect_snapshot_path(
+                src_path
+            )
+            if not source_is_safe:
+                return False
             staging_path = tempfile.mkdtemp(
                 prefix=f".{destination_name}.staging-",
                 dir=parent_path,
@@ -199,6 +594,51 @@ class ConfigManager(object):
                 )
                 return False
 
+            source_is_safe, current_source_aliases = (
+                self._inspect_snapshot_path(src_path)
+            )
+            if (
+                not source_is_safe
+                or current_source_aliases != source_aliases
+            ):
+                return False
+            if not self._recreate_snapshot_aliases(
+                staging_path,
+                destination_path,
+                source_aliases,
+            ):
+                return False
+
+            if (
+                source_anchor is not None
+                and not self._snapshot_ancestor_chain_is_safe(
+                    src_path,
+                    source_anchor,
+                )
+            ):
+                return False
+            if (
+                destination_anchor is not None
+                and not self._snapshot_ancestor_chain_is_safe(
+                    parent_path,
+                    destination_anchor,
+                )
+            ):
+                return False
+            source_is_safe, current_source_aliases = (
+                self._inspect_snapshot_path(src_path)
+            )
+            if (
+                not source_is_safe
+                or current_source_aliases != source_aliases
+            ):
+                return False
+            if (
+                os.path.lexists(destination_path)
+                and not self._snapshot_path_is_safe(destination_path)
+            ):
+                return False
+
             if os.path.exists(destination_path):
                 old_path = tempfile.mkdtemp(
                     prefix=f".{destination_name}.old-",
@@ -207,25 +647,8 @@ class ConfigManager(object):
                 os.rmdir(old_path)
                 os.replace(destination_path, old_path)
 
-            try:
-                os.replace(staging_path, destination_path)
-                staging_path = None
-            except Exception as swap_error:
-                if old_path is not None:
-                    try:
-                        os.replace(old_path, destination_path)
-                        old_path = None
-                    except Exception as rollback_error:
-                        preserve_old_path = True
-                        self.logger.error(
-                            "快照替换回滚失败，旧目标保留在 "
-                            f"{old_path}: {rollback_error}"
-                        )
-                self.logger.error(
-                    f"快照替换失败 {staging_path} -> {destination_path}: "
-                    f"{swap_error}"
-                )
-                return False
+            os.replace(staging_path, destination_path)
+            staging_path = None
 
             if old_path is not None:
                 if not self._cleanup_snapshot_artifact(old_path):
@@ -235,13 +658,49 @@ class ConfigManager(object):
 
             return True
         except Exception as e:
-            self.logger.error(
-                f"快照替换失败 {src_path} -> {destination_path}: {e}"
+            (
+                old_path,
+                preserve_old_path,
+                recovery_error,
+            ) = self._recover_old_snapshot_destination(
+                old_path,
+                destination_path,
+            )
+            if (
+                recovery_error is not None
+                and not isinstance(recovery_error, Exception)
+            ):
+                raise recovery_error
+            if recovery_error is not None:
+                self._report_best_effort(
+                    "error",
+                    "快照替换回滚失败，旧目标保留在 "
+                    f"{old_path}: {recovery_error}",
+                    include_print=False,
+                )
+            self._report_best_effort(
+                "error",
+                f"快照替换失败 {src_path} -> {destination_path}: {e}",
+                include_print=False,
             )
             return False
+        except BaseException:
+            (
+                old_path,
+                preserve_old_path,
+                _recovery_error,
+            ) = self._recover_old_snapshot_destination(
+                old_path,
+                destination_path,
+            )
+            raise
         finally:
             self._cleanup_snapshot_artifact(staging_path)
-            if not preserve_old_path:
+            if (
+                old_path is not None
+                and not preserve_old_path
+                and self._snapshot_path_lexists(destination_path)
+            ):
                 self._cleanup_snapshot_artifact(old_path)
 
     def smart_remove(self, path):
@@ -256,32 +715,48 @@ class ConfigManager(object):
         """
         try:
             if not os.path.exists(path):
-                self.logger.warning(f"路径不存在: {path}")
+                self._report_best_effort(
+                    "warning",
+                    f"路径不存在: {path}",
+                    include_print=False,
+                )
                 return True  # 不存在也算"删除成功"
 
             if os.path.isfile(path):
                 # 删除文件
                 os.remove(path)
-                self.logger.info(f"文件删除成功: {path}")
-                print(f"文件删除成功: {path}")
+                self._report_best_effort(
+                    "info",
+                    f"文件删除成功: {path}",
+                )
             elif os.path.isdir(path):
                 # 删除目录及其内容
                 shutil.rmtree(path)
-                self.logger.info(f"目录删除成功: {path}")
-                print(f"目录删除成功: {path}")
+                self._report_best_effort(
+                    "info",
+                    f"目录删除成功: {path}",
+                )
             else:
-                self.logger.warning(f"未知的路径类型: {path}")
+                self._report_best_effort(
+                    "warning",
+                    f"未知的路径类型: {path}",
+                    include_print=False,
+                )
                 return False
 
             return True
 
         except PermissionError as e:
-            self.logger.error(f"权限错误，无法删除 {path}: {e}")
-            print(f"权限错误，无法删除 {path}: {e}")
+            self._report_best_effort(
+                "error",
+                f"权限错误，无法删除 {path}: {e}",
+            )
             return False
         except Exception as e:
-            self.logger.error(f"删除失败 {path}: {e}")
-            print(f"删除失败 {path}: {e}")
+            self._report_best_effort(
+                "error",
+                f"删除失败 {path}: {e}",
+            )
             return False
 
     def init_upgrade_version_list(self):
@@ -439,6 +914,28 @@ class ConfigManager(object):
             if getattr(self, flag_name) is False:
                 continue
 
+            if not self._snapshot_ancestor_chain_is_safe(
+                backup_source_path,
+                DEFAULT_TARGET_DIR,
+            ):
+                message = (
+                    "配置文件备份安全检查失败: "
+                    f"{backup_source_path}"
+                )
+                print(message)
+                self.logger.error(message)
+                return False
+            if not self._snapshot_ancestor_chain_is_safe(
+                os.path.dirname(os.path.normpath(backup_path)),
+                DEFAULT_DIR,
+            ):
+                message = (
+                    "配置文件备份目标安全检查失败: "
+                    f"{backup_path}"
+                )
+                print(message)
+                self.logger.error(message)
+                return False
             if not self._snapshot_path_is_safe(backup_source_path):
                 message = (
                     "配置文件备份安全检查失败: "
@@ -867,27 +1364,33 @@ class ConfigManager(object):
                 )
             except Exception as e:
                 copy_succeeded = False
-                self.logger.error(f"{display_name}恢复失败: {e}")
+                self._report_best_effort(
+                    "error",
+                    f"{display_name}恢复失败: {e}",
+                )
 
             if copy_succeeded:
-                print(f"{display_name}已恢复")
-                self.logger.info(f"{display_name}已恢复")
+                self._report_best_effort(
+                    "info",
+                    f"{display_name}已恢复",
+                )
             else:
                 restore_succeeded = False
                 message = f"{display_name}恢复失败: {backup_path} -> {target_path}"
-                print(message)
-                self.logger.error(message)
+                self._report_best_effort("error", message)
 
         if not restore_succeeded:
-            print("配置文件恢复失败，保留备份文件")
+            self._report_best_effort(
+                "error",
+                "配置文件恢复失败，保留备份文件",
+            )
             return False
 
-        print("配置文件已恢复")
+        self._report_best_effort("info", "配置文件已恢复")
         return self.delete_backup_file()
 
     def delete_backup_file(self):
-        self.logger.info("正在删除备份文件...")
-        print("正在删除备份文件...")
+        self._report_best_effort("info", "正在删除备份文件...")
         backup_targets = (
             ("ui_pic_flag", BACKUP_UI_PIC_PATH, "ui图片配置备份文件"),
             (
@@ -912,16 +1415,20 @@ class ConfigManager(object):
                 removed = self.smart_remove(backup_path)
             except Exception as e:
                 removed = False
-                self.logger.error(f"{display_name}删除失败: {e}")
+                self._report_best_effort(
+                    "error",
+                    f"{display_name}删除失败: {e}",
+                )
 
             if removed:
-                print(f"{display_name}已删除")
-                self.logger.info(f"{display_name}已删除")
+                self._report_best_effort(
+                    "info",
+                    f"{display_name}已删除",
+                )
             else:
                 delete_succeeded = False
                 message = f"{display_name}删除失败，保留备份: {backup_path}"
-                print(message)
-                self.logger.error(message)
+                self._report_best_effort("error", message)
 
         return delete_succeeded
 
