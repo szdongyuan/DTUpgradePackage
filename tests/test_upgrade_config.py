@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -888,7 +889,9 @@ def test_config_and_json_merge_target_conflict_fails_before_merge_write(
     assert manager.update_config_file() is False
 
     assert helper_calls == []
-    assert json.loads(target.read_text(encoding="utf-8")) == {"state": "replacement"}
+    assert json.loads(target.read_text(encoding="utf-8")) == {
+        "state": "pre-upgrade"
+    }
     assert any(
         "target_conflicts_with_config" in message
         for message in json_merge_messages(manager, "error")
@@ -960,7 +963,7 @@ def test_config_path_alias_conflicts_with_json_merge_target_before_merge_write(
 
     assert helper_calls == []
     assert json.loads(target.read_text(encoding="utf-8")) == {
-        "state": "replacement"
+        "state": "pre-upgrade"
     }
     assert any(
         "target_conflicts_with_config" in message
@@ -1070,6 +1073,149 @@ def create_symlink_or_skip(source, link, target_is_directory=False):
         os.symlink(source, link, target_is_directory=target_is_directory)
     except (NotImplementedError, OSError) as exc:
         pytest.skip(f"symbolic links are unavailable: {exc}")
+
+
+def create_junction_or_skip(source, link):
+    if os.name != "nt":
+        pytest.skip("directory junctions are only available on Windows")
+
+    result = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(source)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        pytest.skip(f"directory junctions are unavailable: {result.stderr}")
+
+
+def assert_config_parent_alias_conflict_is_preflighted(
+    configured_tree,
+    monkeypatch,
+    create_parent_alias,
+    target_exists=True,
+):
+    actual_parent = configured_tree.roots["ui_config"] / "actual"
+    actual_parent.mkdir()
+    actual_target = actual_parent / "same.json"
+    if target_exists:
+        write_json(actual_target, {"state": "pre-upgrade"})
+    alias_parent = configured_tree.roots["ui_config"] / "link"
+    create_parent_alias(actual_parent, alias_parent)
+    write_json(
+        configured_tree.config_dir / "same.json",
+        {"state": "replacement"},
+    )
+    write_json(configured_tree.config_dir / "patch.json", {"added": True})
+    original_target_bytes = (
+        actual_target.read_bytes() if target_exists else None
+    )
+    manager = configure_manifest_manager(
+        configured_tree,
+        [
+            (
+                "1.0",
+                {
+                    "config": ["ui/ui_config/link/same.json"],
+                    "json_merge": [
+                        {
+                            "target": "ui/ui_config/actual/same.json",
+                            "source": "resources/config/patch.json",
+                        }
+                    ],
+                },
+            )
+        ],
+    )
+    ordinary_write_calls = []
+    helper_calls = []
+
+    monkeypatch.setattr(manager, "backup_config_file", lambda _paths: True)
+    monkeypatch.setattr(
+        manager,
+        "smart_remove",
+        lambda path: ordinary_write_calls.append(("remove", path)) or True,
+    )
+    monkeypatch.setattr(
+        manager,
+        "smart_copy",
+        lambda source, target: (
+            ordinary_write_calls.append(("copy", source, target)) or True
+        ),
+    )
+    monkeypatch.setattr(
+        upgrade_config,
+        "merge_json_files_with_reason",
+        lambda *args: helper_calls.append(args) or (True, "ok"),
+        raising=False,
+    )
+
+    assert manager.update_config_file() is False
+
+    assert ordinary_write_calls == []
+    assert helper_calls == []
+    if target_exists:
+        assert actual_target.read_bytes() == original_target_bytes
+    else:
+        assert not actual_target.exists()
+    assert any(
+        "target_conflicts_with_config" in message
+        for message in json_merge_messages(manager, "error")
+    )
+
+
+def test_config_symlinked_parent_alias_conflicts_before_ordinary_replacement(
+    configured_tree,
+    monkeypatch,
+):
+    assert_config_parent_alias_conflict_is_preflighted(
+        configured_tree,
+        monkeypatch,
+        lambda source, link: create_symlink_or_skip(
+            source,
+            link,
+            target_is_directory=True,
+        ),
+    )
+
+
+def test_config_junction_parent_alias_conflicts_before_ordinary_replacement(
+    configured_tree,
+    monkeypatch,
+):
+    assert_config_parent_alias_conflict_is_preflighted(
+        configured_tree,
+        monkeypatch,
+        create_junction_or_skip,
+    )
+
+
+def test_config_symlinked_parent_alias_conflicts_for_nonexistent_leaf(
+    configured_tree,
+    monkeypatch,
+):
+    assert_config_parent_alias_conflict_is_preflighted(
+        configured_tree,
+        monkeypatch,
+        lambda source, link: create_symlink_or_skip(
+            source,
+            link,
+            target_is_directory=True,
+        ),
+        target_exists=False,
+    )
+
+
+def test_config_junction_parent_alias_conflicts_for_nonexistent_leaf(
+    configured_tree,
+    monkeypatch,
+):
+    assert_config_parent_alias_conflict_is_preflighted(
+        configured_tree,
+        monkeypatch,
+        create_junction_or_skip,
+        target_exists=False,
+    )
 
 
 @pytest.mark.parametrize("escape_kind", ["target", "source"])

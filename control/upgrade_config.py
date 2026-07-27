@@ -433,28 +433,71 @@ class ConfigManager(object):
         except (OSError, ValueError):
             return None
 
+    def _destination_identity_key(self, path):
+        try:
+            absolute_path = os.path.abspath(path)
+            if os.path.exists(absolute_path):
+                resolved_path = os.path.realpath(absolute_path)
+            else:
+                resolved_parent = os.path.realpath(
+                    os.path.dirname(absolute_path)
+                )
+                resolved_path = os.path.join(
+                    resolved_parent,
+                    os.path.basename(absolute_path),
+                )
+            return os.path.normcase(os.path.normpath(resolved_path))
+        except (OSError, ValueError):
+            return None
+
+    def _destination_paths_are_aliases(self, first_path, second_path):
+        try:
+            if os.path.exists(first_path) and os.path.exists(second_path):
+                if os.path.samefile(first_path, second_path):
+                    return True
+        except OSError:
+            pass
+
+        first_key = self._destination_identity_key(first_path)
+        second_key = self._destination_identity_key(second_path)
+        return (
+            first_key is not None
+            and second_key is not None
+            and first_key == second_key
+        )
+
     def _report_json_merge(self, level, message):
         print(message)
         getattr(self.logger, level)(message)
 
-    def _apply_json_merges(self, entries, config_entries):
-        config_target_keys = {
-            target_key
-            for target_key in (
+    def _preflight_json_merge_conflicts(self, entries, config_entries):
+        config_target_paths = [
+            target_path
+            for target_path in (
                 self._ordinary_config_manifest_path_key(config_entry)
                 for config_entry in config_entries
             )
-            if target_key is not None
-        }
+            if target_path is not None
+        ]
         for entry in entries:
-            target_key = self._json_merge_manifest_path_key(entry["target"])
-            if target_key is not None and target_key in config_target_keys:
+            target_path = self._json_merge_manifest_path_key(entry["target"])
+            if target_path is None:
+                continue
+            if any(
+                self._destination_paths_are_aliases(
+                    target_path,
+                    config_target_path,
+                )
+                for config_target_path in config_target_paths
+            ):
                 self._report_json_merge(
                     "error",
                     "json_merge error: target_conflicts_with_config",
                 )
                 return False
+        return True
 
+    def _apply_json_merges(self, entries, config_entries):
         for entry in entries:
             target_relative_path = entry["target"]
             source_relative_path = entry["source"]
@@ -529,6 +572,24 @@ class ConfigManager(object):
                 target_version_path = DEFAULT_DIR + f"resources/version_{upgrade_version}.yml"
                 data = Readyml.load_yaml(target_version_path)
                 config_file_source_path = data["config"]
+
+                json_merge_entries, schema_error = (
+                    self._normalize_json_merge_entries(
+                        data.get("json_merge", [])
+                    )
+                )
+                if schema_error is not None:
+                    self._report_json_merge(
+                        "error",
+                        f"json_merge schema error: {schema_error}",
+                    )
+                    return False
+                if not self._preflight_json_merge_conflicts(
+                    json_merge_entries,
+                    config_file_source_path,
+                ):
+                    return False
+
                 if self.backup_config_file(config_file_source_path):
                     for config_file_path in config_file_source_path:
                         print(f"更新配置文件: {config_file_path}")
@@ -554,17 +615,6 @@ class ConfigManager(object):
                     self.logger.error("配置文件备份错误")
                     return False
 
-                json_merge_entries, schema_error = (
-                    self._normalize_json_merge_entries(
-                        data.get("json_merge", [])
-                    )
-                )
-                if schema_error is not None:
-                    self._report_json_merge(
-                        "error",
-                        f"json_merge schema error: {schema_error}",
-                    )
-                    return False
                 if not self._apply_json_merges(
                     json_merge_entries,
                     config_file_source_path,
