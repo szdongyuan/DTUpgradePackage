@@ -130,16 +130,23 @@ class DataBaseManager:
         try:
             cur = self.conn.execute("SELECT value FROM system_info_table WHERE name = 'current_version';")
             result = cur.fetchone()
-            if result:
-                return result[0]
-            else:
-                print("无版本号")
-                self.logger.error("无版本号")
-                return None
-        except Exception as e:
-            print("查询报错")
-            self.logger.error("查询报错")
+        except sqlite3.Error:
+            self._report_safely("查询报错", "error")
             return None
+        if result:
+            return result[0]
+        self._report_safely("无版本号", "error")
+        return None
+
+    def _report_safely(self, message, log_method):
+        try:
+            print(message)
+        except Exception:
+            pass
+        try:
+            getattr(self.logger, log_method)(message)
+        except Exception:
+            pass
 
     def create_system_info_table(self):
         create_table_sql = """
@@ -238,15 +245,17 @@ class DataBaseManager:
             self.conn.commit()
             committed = True
         except sqlite3.Error as exc:
-            self.conn.rollback()
-            self.logger.error(f"更新数据库版本信息失败: {exc}")
-            return False
+            try:
+                self.conn.rollback()
+            except Exception as rollback_exc:
+                self._report_safely(f"数据库版本信息事务回滚失败: {rollback_exc}", "error")
+            self._report_safely(f"更新数据库版本信息失败: {exc}", "error")
         finally:
-            self.conn.close()
+            try:
+                self.conn.close()
+            except Exception as close_exc:
+                self._report_safely(f"关闭数据库版本信息连接失败: {close_exc}", "error")
 
-        try:
-            print(f"数据库版本信息已更新到 {TARGET_VERSION}")
-            self.logger.info(f"数据库版本信息已更新到 {TARGET_VERSION}")
-        except Exception:
-            pass
+        if committed:
+            self._report_safely(f"数据库版本信息已更新到 {TARGET_VERSION}", "info")
         return committed

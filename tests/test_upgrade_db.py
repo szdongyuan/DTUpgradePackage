@@ -22,12 +22,27 @@ class RaisingInfoLogger(DummyLogger):
         raise RuntimeError("logger failed after commit")
 
 
+class RaisingErrorLogger(DummyLogger):
+    def error(self, message):
+        raise RuntimeError("logger failed while reporting transaction failure")
+
+
 class ConnectionProxy:
-    def __init__(self, connection, fail_select=False, fail_update=None, fail_commit=False):
+    def __init__(
+        self,
+        connection,
+        fail_select=False,
+        fail_update=None,
+        fail_commit=False,
+        fail_rollback=False,
+        fail_close=False,
+    ):
         self.connection = connection
         self.fail_select = fail_select
         self.fail_update = fail_update
         self.fail_commit = fail_commit
+        self.fail_rollback = fail_rollback
+        self.fail_close = fail_close
         self.rollback_called = False
         self.closed = False
 
@@ -49,11 +64,17 @@ class ConnectionProxy:
 
     def rollback(self):
         self.rollback_called = True
-        return self.connection.rollback()
+        result = self.connection.rollback()
+        if self.fail_rollback:
+            raise sqlite3.OperationalError("simulated rollback failure")
+        return result
 
     def close(self):
         self.closed = True
-        return self.connection.close()
+        result = self.connection.close()
+        if self.fail_close:
+            raise sqlite3.OperationalError("simulated close failure")
+        return result
 
 
 @pytest.fixture
@@ -224,6 +245,158 @@ def test_update_version_rolls_back_when_required_metadata_row_is_missing(
     assert connection_proxy.rollback_called is True
     assert connection_proxy.closed is True
     assert read_version_metadata(database_path) == metadata_before
+
+
+@pytest.mark.parametrize(
+    "database_name",
+    ["audio_data.db", "system_data.db"],
+    ids=["legacy-audio-database", "split-system-database"],
+)
+@pytest.mark.parametrize(
+    ("failure", "include_current_version", "proxy_options"),
+    [
+        ("missing-current-version", False, {}),
+        ("select", True, {"fail_select": True}),
+        ("update", True, {"fail_update": "current_version"}),
+        ("commit", True, {"fail_commit": True}),
+    ],
+)
+def test_update_version_error_logger_failure_cannot_mask_database_failure(
+    monkeypatch,
+    local_tmp_path,
+    database_name,
+    failure,
+    include_current_version,
+    proxy_options,
+):
+    database_path = local_tmp_path / database_name
+    create_version_db(database_path, "0.26.02.01", include_current_version=include_current_version)
+    metadata_before = read_version_metadata(database_path)
+    monkeypatch.setattr(upgrade_db, "TARGET_VERSION", "0.26.06.01")
+    monkeypatch.setattr(
+        upgrade_db.LogManager,
+        "set_log_handler",
+        staticmethod(lambda _name: RaisingErrorLogger()),
+    )
+    manager = DataBaseManager(str(database_path))
+    connection_proxy = ConnectionProxy(manager.conn, **proxy_options)
+    manager.conn = connection_proxy
+
+    assert manager.update_version() is False, failure
+    assert connection_proxy.rollback_called is True
+    assert connection_proxy.closed is True
+    assert read_version_metadata(database_path) == metadata_before
+
+
+@pytest.mark.parametrize(
+    "database_name",
+    ["audio_data.db", "system_data.db"],
+    ids=["legacy-audio-database", "split-system-database"],
+)
+@pytest.mark.parametrize(
+    ("failure", "include_current_version", "proxy_options"),
+    [
+        ("missing-current-version", False, {}),
+        ("select", True, {"fail_select": True}),
+    ],
+)
+def test_update_version_console_failure_cannot_mask_current_version_read_failure(
+    monkeypatch,
+    local_tmp_path,
+    database_name,
+    failure,
+    include_current_version,
+    proxy_options,
+):
+    database_path = local_tmp_path / database_name
+    create_version_db(database_path, "0.26.02.01", include_current_version=include_current_version)
+    metadata_before = read_version_metadata(database_path)
+    monkeypatch.setattr(upgrade_db, "TARGET_VERSION", "0.26.06.01")
+    monkeypatch.setattr(upgrade_db.LogManager, "set_log_handler", staticmethod(lambda _name: DummyLogger()))
+    manager = DataBaseManager(str(database_path))
+    connection_proxy = ConnectionProxy(manager.conn, **proxy_options)
+    manager.conn = connection_proxy
+
+    with monkeypatch.context() as reporting_context:
+        reporting_context.setattr(
+            "builtins.print",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("console failed while reporting transaction failure")
+            ),
+        )
+        result = manager.update_version()
+
+    assert result is False, failure
+    assert connection_proxy.rollback_called is True
+    assert connection_proxy.closed is True
+    assert read_version_metadata(database_path) == metadata_before
+
+
+def test_update_version_rollback_close_and_diagnostic_failures_are_isolated(
+    monkeypatch, local_tmp_path
+):
+    database_path = local_tmp_path / "system_data.db"
+    create_version_db(database_path, "0.26.02.01")
+    metadata_before = read_version_metadata(database_path)
+    monkeypatch.setattr(upgrade_db, "TARGET_VERSION", "0.26.06.01")
+    monkeypatch.setattr(
+        upgrade_db.LogManager,
+        "set_log_handler",
+        staticmethod(lambda _name: RaisingErrorLogger()),
+    )
+    manager = DataBaseManager(str(database_path))
+    connection_proxy = ConnectionProxy(
+        manager.conn,
+        fail_commit=True,
+        fail_rollback=True,
+        fail_close=True,
+    )
+    manager.conn = connection_proxy
+
+    with monkeypatch.context() as reporting_context:
+        reporting_context.setattr(
+            "builtins.print",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("console failed while reporting cleanup failure")
+            ),
+        )
+        result = manager.update_version()
+
+    assert result is False
+    assert connection_proxy.rollback_called is True
+    assert connection_proxy.closed is True
+    assert read_version_metadata(database_path) == metadata_before
+
+
+def test_update_version_close_and_reporting_failures_after_commit_keep_success(
+    monkeypatch, local_tmp_path
+):
+    database_path = local_tmp_path / "system_data.db"
+    create_version_db(database_path, "0.26.02.01")
+    monkeypatch.setattr(upgrade_db, "TARGET_VERSION", "0.26.06.01")
+    monkeypatch.setattr(
+        upgrade_db.LogManager,
+        "set_log_handler",
+        staticmethod(lambda _name: RaisingInfoLogger()),
+    )
+    manager = DataBaseManager(str(database_path))
+    connection_proxy = ConnectionProxy(manager.conn, fail_close=True)
+    manager.conn = connection_proxy
+
+    with monkeypatch.context() as reporting_context:
+        reporting_context.setattr(
+            "builtins.print",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("console failed after commit")
+            ),
+        )
+        result = manager.update_version()
+
+    assert result is True
+    assert connection_proxy.closed is True
+    assert read_version_value(database_path, "last_running_version") == "0.26.02.01"
+    assert read_version_value(database_path, "current_version") == "0.26.06.01"
+    assert read_version_value(database_path, "update_time") != "2000-01-01 00:00:00"
 
 
 @pytest.mark.parametrize("reporting_failure", ["logger", "print"])
