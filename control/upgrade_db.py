@@ -217,18 +217,24 @@ class DataBaseManager:
             if db_current_version is None:
                 raise sqlite3.OperationalError("current version is unavailable")
             now_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            self.conn.execute(
+            cursor = self.conn.execute(
                 "UPDATE system_info_table SET value = ? WHERE name = 'last_running_version';",
                 (db_current_version,),
             )
-            self.conn.execute(
+            if cursor.rowcount != 1:
+                raise sqlite3.OperationalError("last_running_version update did not affect exactly one row")
+            cursor = self.conn.execute(
                 "UPDATE system_info_table SET value = ? WHERE name = 'current_version';",
                 (TARGET_VERSION,),
             )
-            self.conn.execute(
+            if cursor.rowcount != 1:
+                raise sqlite3.OperationalError("current_version update did not affect exactly one row")
+            cursor = self.conn.execute(
                 "UPDATE system_info_table SET value = ? WHERE name = 'update_time';",
                 (now_time,),
             )
+            if cursor.rowcount != 1:
+                raise sqlite3.OperationalError("update_time update did not affect exactly one row")
             self.conn.commit()
             committed = True
         except sqlite3.Error as exc:

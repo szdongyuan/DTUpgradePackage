@@ -111,6 +111,15 @@ def read_version_metadata(path):
         conn.close()
 
 
+def delete_version_metadata(path, name):
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("DELETE FROM system_info_table WHERE name = ?", (name,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def test_version_database_path_uses_audio_database_for_legacy_single_db(monkeypatch, local_tmp_path):
     audio_path = local_tmp_path / "audio_data.db"
     system_path = local_tmp_path / "system_data.db"
@@ -187,6 +196,31 @@ def test_update_version_rolls_back_and_closes_on_transaction_failure(
     manager.conn = connection_proxy
 
     assert manager.update_version() is False, failure
+    assert connection_proxy.rollback_called is True
+    assert connection_proxy.closed is True
+    assert read_version_metadata(database_path) == metadata_before
+
+
+@pytest.mark.parametrize(
+    "database_name",
+    ["audio_data.db", "system_data.db"],
+    ids=["legacy-audio-database", "split-system-database"],
+)
+@pytest.mark.parametrize("missing_name", ["last_running_version", "update_time"])
+def test_update_version_rolls_back_when_required_metadata_row_is_missing(
+    monkeypatch, local_tmp_path, database_name, missing_name
+):
+    database_path = local_tmp_path / database_name
+    create_version_db(database_path, "0.26.02.01")
+    delete_version_metadata(database_path, missing_name)
+    metadata_before = read_version_metadata(database_path)
+    monkeypatch.setattr(upgrade_db, "TARGET_VERSION", "0.26.06.01")
+    monkeypatch.setattr(upgrade_db.LogManager, "set_log_handler", staticmethod(lambda _name: DummyLogger()))
+    manager = DataBaseManager(str(database_path))
+    connection_proxy = ConnectionProxy(manager.conn)
+    manager.conn = connection_proxy
+
+    assert manager.update_version() is False
     assert connection_proxy.rollback_called is True
     assert connection_proxy.closed is True
     assert read_version_metadata(database_path) == metadata_before
