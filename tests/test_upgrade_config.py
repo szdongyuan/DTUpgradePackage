@@ -128,6 +128,31 @@ def test_failed_managed_root_backup_keeps_flag_and_reports_failure(configured_tr
     assert any("备份" in message for message in logged_messages(manager, "error"))
 
 
+def test_failed_backup_destination_preparation_keeps_existing_data_and_flag(
+    configured_tree,
+    monkeypatch,
+):
+    manager = make_manager()
+    backup_root = configured_tree.backups["ui_config"]
+    stale_backup_file = backup_root / "stale.txt"
+    backup_root.mkdir(parents=True)
+    stale_backup_file.write_text("recovery data", encoding="utf-8")
+    copy_calls = []
+
+    monkeypatch.setattr(manager, "smart_remove", lambda _path: False)
+    monkeypatch.setattr(
+        manager,
+        "smart_copy",
+        lambda source, destination: copy_calls.append((source, destination)) or True,
+    )
+
+    assert manager.backup_config_file(["ui/ui_config/settings.json"]) is False
+
+    assert manager.ui_config_flag is True
+    assert stale_backup_file.read_text(encoding="utf-8") == "recovery data"
+    assert copy_calls == []
+
+
 def test_managed_root_is_backed_up_only_once_for_multiple_files(configured_tree, monkeypatch):
     manager = make_manager()
     copy_calls = []
@@ -154,6 +179,28 @@ def test_managed_root_is_backed_up_only_once_for_multiple_files(configured_tree,
     assert manager.ui_config_flag is False
 
 
+def test_managed_root_backup_replaces_stale_preexisting_snapshot(configured_tree):
+    manager = make_manager()
+    backup_root = configured_tree.backups["ui_config"]
+    target_root = configured_tree.roots["ui_config"]
+    stale_backup_file = backup_root / "stale.txt"
+
+    backup_root.mkdir(parents=True)
+    stale_backup_file.write_text("stale backup data", encoding="utf-8")
+
+    assert manager.backup_config_file(["ui/ui_config/settings.json"]) is True
+
+    assert not stale_backup_file.exists()
+    target_root.joinpath("marker.txt").write_text("changed", encoding="utf-8")
+
+    assert manager.restore_config() is True
+
+    assert not target_root.joinpath("stale.txt").exists()
+    assert target_root.joinpath("marker.txt").read_text(encoding="utf-8") == (
+        "original ui_config"
+    )
+
+
 def test_successful_restore_returns_true_and_deletes_backup(configured_tree):
     manager = make_manager()
     target_marker = configured_tree.roots["ui_config"] / "marker.txt"
@@ -165,6 +212,61 @@ def test_successful_restore_returns_true_and_deletes_backup(configured_tree):
 
     assert target_marker.read_text(encoding="utf-8") == "original ui_config"
     assert not configured_tree.backups["ui_config"].exists()
+
+
+def test_successful_restore_removes_upgrade_created_target_only_file(configured_tree):
+    manager = make_manager()
+    target_root = configured_tree.roots["ui_config"]
+    upgrade_created_file = target_root / "upgrade-created.txt"
+
+    assert manager.backup_config_file(["ui/ui_config/settings.json"]) is True
+    upgrade_created_file.write_text("created during upgrade", encoding="utf-8")
+
+    assert manager.restore_config() is True
+
+    assert not upgrade_created_file.exists()
+    assert target_root.joinpath("marker.txt").read_text(encoding="utf-8") == (
+        "original ui_config"
+    )
+    assert not configured_tree.backups["ui_config"].exists()
+
+
+def test_restore_preparation_failure_retains_backup_and_skips_copy(
+    configured_tree,
+    monkeypatch,
+):
+    manager = make_manager()
+    target_root = configured_tree.roots["ui_config"]
+    backup_root = configured_tree.backups["ui_config"]
+
+    assert manager.backup_config_file(["ui/ui_config/settings.json"]) is True
+    target_root.joinpath("upgrade-created.txt").write_text(
+        "created during upgrade",
+        encoding="utf-8",
+    )
+
+    real_smart_remove = manager.smart_remove
+    copy_calls = []
+
+    def fail_target_preparation(path):
+        if path == upgrade_config.UI_CONFIG_PATH:
+            return False
+        return real_smart_remove(path)
+
+    monkeypatch.setattr(manager, "smart_remove", fail_target_preparation)
+    monkeypatch.setattr(
+        manager,
+        "smart_copy",
+        lambda source, destination: copy_calls.append((source, destination)) or True,
+    )
+
+    assert manager.restore_config() is False
+
+    assert copy_calls == []
+    assert backup_root.joinpath("marker.txt").read_text(encoding="utf-8") == (
+        "original ui_config"
+    )
+    assert target_root.joinpath("upgrade-created.txt").exists()
 
 
 def test_restore_failure_attempts_all_selected_roots_and_retains_backups(
@@ -235,7 +337,11 @@ def test_restore_returns_false_when_cleanup_partially_fails_and_attempts_all_del
     monkeypatch.setattr(manager, "smart_copy", lambda _source, _destination: True)
 
     def remove_with_ai_failure(path):
-        remove_calls.append(path)
+        if path in (
+            upgrade_config.BACKUP_AI_MODEL_CONFIG_PATH,
+            upgrade_config.BACKUP_UI_CONFIG_PATH,
+        ):
+            remove_calls.append(path)
         if path == upgrade_config.BACKUP_AI_MODEL_CONFIG_PATH:
             return False
         return real_smart_remove(path)

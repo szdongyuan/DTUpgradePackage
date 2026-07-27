@@ -191,6 +191,11 @@ class ConfigManager(object):
 
             try:
                 os.makedirs(BACKUP_DIR, exist_ok=True)
+                if os.path.exists(backup_path) and not self.smart_remove(backup_path):
+                    message = f"配置文件备份目录准备失败: {backup_path}"
+                    print(message)
+                    self.logger.error(message)
+                    return False
                 if not self.smart_copy(backup_source_path, backup_path):
                     message = f"配置文件备份失败: {backup_source_path} -> {backup_path}"
                     print(message)
@@ -271,7 +276,13 @@ class ConfigManager(object):
                 continue
 
             try:
-                copy_succeeded = self.smart_copy(backup_path, target_path)
+                target_prepared = not os.path.exists(target_path) or self.smart_remove(
+                    target_path
+                )
+                copy_succeeded = target_prepared and self.smart_copy(
+                    backup_path,
+                    target_path,
+                )
             except Exception as e:
                 copy_succeeded = False
                 self.logger.error(f"{display_name}恢复失败: {e}")
