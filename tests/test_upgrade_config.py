@@ -91,6 +91,27 @@ def create_backup_roots(configured_tree, names):
         (backup / "marker.txt").write_text(f"backup {name}", encoding="utf-8")
 
 
+def snapshot_tree(root):
+    return {
+        path.relative_to(root).as_posix(): (
+            "directory" if path.is_dir() else path.read_bytes()
+        )
+        for path in sorted(root.rglob("*"))
+    }
+
+
+def swap_artifacts(destination):
+    prefixes = (
+        f".{destination.name}.staging-",
+        f".{destination.name}.old-",
+    )
+    return sorted(
+        path.name
+        for path in destination.parent.iterdir()
+        if path.name.startswith(prefixes)
+    )
+
+
 def test_successful_managed_root_backup_changes_only_matching_flag(configured_tree):
     manager = make_manager()
 
@@ -117,40 +138,74 @@ def test_failed_managed_root_backup_keeps_flag_and_reports_failure(configured_tr
 
     assert manager.backup_config_file(["configs/aimodel_config/model.json"]) is False
 
-    assert copy_calls == [
-        (
-            upgrade_config.AI_MODEL_CONFIG_PATH,
-            upgrade_config.BACKUP_AI_MODEL_CONFIG_PATH,
-        )
-    ]
+    assert len(copy_calls) == 1
+    assert copy_calls[0][0] == upgrade_config.AI_MODEL_CONFIG_PATH
+    assert Path(copy_calls[0][1]).parent == configured_tree.backup_dir
+    assert Path(copy_calls[0][1]).name.startswith(".ai_model_config.staging-")
     assert manager.ai_model_config_flag is True
+    assert swap_artifacts(configured_tree.backups["ai_model_config"]) == []
     assert not any("配置文件备份已保存到" in message for message in logged_messages(manager))
     assert any("备份" in message for message in logged_messages(manager, "error"))
 
 
-def test_failed_backup_destination_preparation_keeps_existing_data_and_flag(
+def test_backup_first_swap_move_failure_preserves_existing_data_and_flag(
     configured_tree,
     monkeypatch,
 ):
     manager = make_manager()
     backup_root = configured_tree.backups["ui_config"]
-    stale_backup_file = backup_root / "stale.txt"
-    backup_root.mkdir(parents=True)
-    stale_backup_file.write_text("recovery data", encoding="utf-8")
-    copy_calls = []
+    backup_root.joinpath("nested").mkdir(parents=True)
+    backup_root.joinpath("stale.txt").write_bytes(b"recovery data")
+    backup_root.joinpath("nested", "retained.bin").write_bytes(b"\x00\xffrecovery")
+    expected_backup = snapshot_tree(backup_root)
+    real_replace = os.replace
 
-    monkeypatch.setattr(manager, "smart_remove", lambda _path: False)
-    monkeypatch.setattr(
-        manager,
-        "smart_copy",
-        lambda source, destination: copy_calls.append((source, destination)) or True,
-    )
+    def fail_existing_destination_move(source, destination):
+        if (
+            Path(source) == backup_root
+            and Path(destination).name.startswith(f".{backup_root.name}.old-")
+        ):
+            raise OSError("injected existing destination move failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(upgrade_config.os, "replace", fail_existing_destination_move)
 
     assert manager.backup_config_file(["ui/ui_config/settings.json"]) is False
 
     assert manager.ui_config_flag is True
-    assert stale_backup_file.read_text(encoding="utf-8") == "recovery data"
-    assert copy_calls == []
+    assert snapshot_tree(backup_root) == expected_backup
+    assert swap_artifacts(backup_root) == []
+
+
+def test_backup_copy_failure_preserves_preexisting_snapshot_and_flag(
+    configured_tree,
+    monkeypatch,
+):
+    manager = make_manager()
+    backup_root = configured_tree.backups["ui_config"]
+    backup_root.joinpath("nested").mkdir(parents=True)
+    backup_root.joinpath("marker.txt").write_bytes(b"prior recovery bytes")
+    backup_root.joinpath("nested", "retained.bin").write_bytes(b"\x00\xffrecovery")
+    expected_backup = snapshot_tree(backup_root)
+    copy_calls = []
+
+    def partially_fail_copy(source, destination):
+        copy_calls.append((source, destination))
+        Path(destination).mkdir(parents=True, exist_ok=True)
+        Path(destination).joinpath("partial.bin").write_bytes(b"partial")
+        return False
+
+    monkeypatch.setattr(manager, "smart_copy", partially_fail_copy)
+
+    assert manager.backup_config_file(["ui/ui_config/settings.json"]) is False
+
+    assert manager.ui_config_flag is True
+    assert len(copy_calls) == 1
+    assert copy_calls[0][0] == upgrade_config.UI_CONFIG_PATH
+    assert Path(copy_calls[0][1]).parent == backup_root.parent
+    assert Path(copy_calls[0][1]) != backup_root
+    assert snapshot_tree(backup_root) == expected_backup
+    assert swap_artifacts(backup_root) == []
 
 
 def test_managed_root_is_backed_up_only_once_for_multiple_files(configured_tree, monkeypatch):
@@ -170,12 +225,10 @@ def test_managed_root_is_backed_up_only_once_for_multiple_files(configured_tree,
         ]
     ) is True
 
-    assert copy_calls == [
-        (
-            upgrade_config.UI_CONFIG_PATH,
-            upgrade_config.BACKUP_UI_CONFIG_PATH,
-        )
-    ]
+    assert len(copy_calls) == 1
+    assert copy_calls[0][0] == upgrade_config.UI_CONFIG_PATH
+    assert Path(copy_calls[0][1]).parent == configured_tree.backup_dir
+    assert Path(copy_calls[0][1]).name.startswith(".ui_config.staging-")
     assert manager.ui_config_flag is False
 
 
@@ -231,42 +284,75 @@ def test_successful_restore_removes_upgrade_created_target_only_file(configured_
     assert not configured_tree.backups["ui_config"].exists()
 
 
-def test_restore_preparation_failure_retains_backup_and_skips_copy(
+def test_restore_copy_failure_preserves_live_target_and_backup(
     configured_tree,
     monkeypatch,
 ):
     manager = make_manager()
     target_root = configured_tree.roots["ui_config"]
     backup_root = configured_tree.backups["ui_config"]
-
-    assert manager.backup_config_file(["ui/ui_config/settings.json"]) is True
-    target_root.joinpath("upgrade-created.txt").write_text(
-        "created during upgrade",
-        encoding="utf-8",
-    )
-
-    real_smart_remove = manager.smart_remove
+    create_backup_roots(configured_tree, ["ui_config"])
+    manager.ui_config_flag = False
+    target_root.joinpath("marker.txt").write_bytes(b"current live bytes")
+    target_root.joinpath("upgrade-created.bin").write_bytes(b"\x00live")
+    backup_root.joinpath("recovery-only.bin").write_bytes(b"\xffbackup")
+    expected_target = snapshot_tree(target_root)
+    expected_backup = snapshot_tree(backup_root)
     copy_calls = []
 
-    def fail_target_preparation(path):
-        if path == upgrade_config.UI_CONFIG_PATH:
-            return False
-        return real_smart_remove(path)
+    def partially_fail_copy(source, destination):
+        copy_calls.append((source, destination))
+        Path(destination).mkdir(parents=True, exist_ok=True)
+        Path(destination).joinpath("partial.bin").write_bytes(b"partial")
+        return False
 
-    monkeypatch.setattr(manager, "smart_remove", fail_target_preparation)
-    monkeypatch.setattr(
-        manager,
-        "smart_copy",
-        lambda source, destination: copy_calls.append((source, destination)) or True,
-    )
+    monkeypatch.setattr(manager, "smart_copy", partially_fail_copy)
 
     assert manager.restore_config() is False
 
-    assert copy_calls == []
-    assert backup_root.joinpath("marker.txt").read_text(encoding="utf-8") == (
-        "original ui_config"
-    )
-    assert target_root.joinpath("upgrade-created.txt").exists()
+    assert len(copy_calls) == 1
+    assert copy_calls[0][0] == upgrade_config.BACKUP_UI_CONFIG_PATH
+    assert Path(copy_calls[0][1]).parent == target_root.parent
+    assert Path(copy_calls[0][1]) != target_root
+    assert snapshot_tree(target_root) == expected_target
+    assert snapshot_tree(backup_root) == expected_backup
+    assert swap_artifacts(target_root) == []
+
+
+def test_restore_swap_failure_rolls_back_live_target_and_retains_backup(
+    configured_tree,
+    monkeypatch,
+):
+    manager = make_manager()
+    target_root = configured_tree.roots["ui_config"]
+    backup_root = configured_tree.backups["ui_config"]
+    create_backup_roots(configured_tree, ["ui_config"])
+    manager.ui_config_flag = False
+    target_root.joinpath("marker.txt").write_bytes(b"current live bytes")
+    target_root.joinpath("upgrade-created.bin").write_bytes(b"\x00live")
+    backup_root.joinpath("recovery-only.bin").write_bytes(b"\xffbackup")
+    expected_target = snapshot_tree(target_root)
+    expected_backup = snapshot_tree(backup_root)
+    real_replace = os.replace
+    replace_calls = []
+
+    def fail_staging_install(source, destination):
+        replace_calls.append((Path(source), Path(destination)))
+        if (
+            Path(destination) == target_root
+            and Path(source).name.startswith(f".{target_root.name}.staging-")
+        ):
+            raise OSError("injected staging install failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(upgrade_config.os, "replace", fail_staging_install)
+
+    assert manager.restore_config() is False
+
+    assert len(replace_calls) == 3
+    assert snapshot_tree(target_root) == expected_target
+    assert snapshot_tree(backup_root) == expected_backup
+    assert swap_artifacts(target_root) == []
 
 
 def test_restore_failure_attempts_all_selected_roots_and_retains_backups(
@@ -315,7 +401,17 @@ def test_restore_failure_attempts_all_selected_roots_and_retains_backups(
 
     assert manager.restore_config() is False
 
-    assert copy_calls == [(source, destination) for _name, _flag, source, destination in selected]
+    assert [source for source, _staging in copy_calls] == [
+        source for _name, _flag, source, _destination in selected
+    ]
+    for (
+        (_name, _flag, _source, destination),
+        (_copied_source, staging),
+    ) in zip(selected, copy_calls):
+        destination = Path(destination)
+        staging = Path(staging)
+        assert staging.parent == destination.parent
+        assert staging.name.startswith(f".{destination.name}.staging-")
     assert delete_calls == []
     assert all(configured_tree.backups[name].exists() for name, *_rest in selected)
     assert any("恢复" in message for message in logged_messages(manager, "error"))

@@ -1,6 +1,7 @@
 import sys
 import os
 import shutil
+import tempfile
 
 from consts.program_config import BACKUP_DIR, DEFAULT_DIR, TARGET_VERSION, ALL_VERSIONS, BACKUP_UI_PIC_PATH, CONFIG_DIR
 from consts.program_config import AI_MODEL_CONFIG_PATH, SCANNER_BARCODE_CONFIG_PATH, UI_CONFIG_PATH, UI_PIC_PATH
@@ -92,6 +93,85 @@ class ConfigManager(object):
             self.logger.error(f"复制失败 {src_path} -> {dst_path}: {e}")
             print(f"复制失败 {src_path} -> {dst_path}: {e}")
             return False
+
+    def _cleanup_snapshot_artifact(self, path):
+        if not path or not os.path.exists(path):
+            return True
+
+        try:
+            if self.smart_remove(path):
+                return True
+        except Exception as e:
+            self.logger.error(f"快照临时路径清理失败 {path}: {e}")
+            return False
+
+        self.logger.error(f"快照临时路径清理失败: {path}")
+        return False
+
+    def _replace_with_staged_snapshot(self, src_path, dst_path):
+        destination_path = os.path.normpath(dst_path)
+        parent_path = os.path.dirname(destination_path) or os.curdir
+        destination_name = os.path.basename(destination_path)
+        staging_path = None
+        old_path = None
+        preserve_old_path = False
+
+        try:
+            os.makedirs(parent_path, exist_ok=True)
+            staging_path = tempfile.mkdtemp(
+                prefix=f".{destination_name}.staging-",
+                dir=parent_path,
+            )
+            if not self.smart_copy(src_path, staging_path):
+                self.logger.error(
+                    f"快照暂存复制失败: {src_path} -> {staging_path}"
+                )
+                return False
+
+            if os.path.exists(destination_path):
+                old_path = tempfile.mkdtemp(
+                    prefix=f".{destination_name}.old-",
+                    dir=parent_path,
+                )
+                os.rmdir(old_path)
+                os.replace(destination_path, old_path)
+
+            try:
+                os.replace(staging_path, destination_path)
+                staging_path = None
+            except Exception as swap_error:
+                if old_path is not None:
+                    try:
+                        os.replace(old_path, destination_path)
+                        old_path = None
+                    except Exception as rollback_error:
+                        preserve_old_path = True
+                        self.logger.error(
+                            "快照替换回滚失败，旧目标保留在 "
+                            f"{old_path}: {rollback_error}"
+                        )
+                self.logger.error(
+                    f"快照替换失败 {staging_path} -> {destination_path}: "
+                    f"{swap_error}"
+                )
+                return False
+
+            if old_path is not None:
+                if not self._cleanup_snapshot_artifact(old_path):
+                    preserve_old_path = True
+                    return False
+                old_path = None
+
+            return True
+        except Exception as e:
+            self.logger.error(
+                f"快照替换失败 {src_path} -> {destination_path}: {e}"
+            )
+            return False
+        finally:
+            self._cleanup_snapshot_artifact(staging_path)
+            if not preserve_old_path:
+                self._cleanup_snapshot_artifact(old_path)
 
     def smart_remove(self, path):
         """
@@ -191,12 +271,10 @@ class ConfigManager(object):
 
             try:
                 os.makedirs(BACKUP_DIR, exist_ok=True)
-                if os.path.exists(backup_path) and not self.smart_remove(backup_path):
-                    message = f"配置文件备份目录准备失败: {backup_path}"
-                    print(message)
-                    self.logger.error(message)
-                    return False
-                if not self.smart_copy(backup_source_path, backup_path):
+                if not self._replace_with_staged_snapshot(
+                    backup_source_path,
+                    backup_path,
+                ):
                     message = f"配置文件备份失败: {backup_source_path} -> {backup_path}"
                     print(message)
                     self.logger.error(message)
@@ -276,10 +354,7 @@ class ConfigManager(object):
                 continue
 
             try:
-                target_prepared = not os.path.exists(target_path) or self.smart_remove(
-                    target_path
-                )
-                copy_succeeded = target_prepared and self.smart_copy(
+                copy_succeeded = self._replace_with_staged_snapshot(
                     backup_path,
                     target_path,
                 )
