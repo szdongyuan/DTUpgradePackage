@@ -419,6 +419,20 @@ class ConfigManager(object):
         except (OSError, ValueError):
             return None
 
+    def _ordinary_config_manifest_path_key(self, relative_path):
+        if not isinstance(relative_path, str) or not relative_path.strip():
+            return None
+        try:
+            return os.path.normcase(
+                os.path.normpath(
+                    os.path.abspath(
+                        os.path.join(DEFAULT_TARGET_DIR, relative_path)
+                    )
+                )
+            )
+        except (OSError, ValueError):
+            return None
+
     def _report_json_merge(self, level, message):
         print(message)
         getattr(self.logger, level)(message)
@@ -427,7 +441,7 @@ class ConfigManager(object):
         config_target_keys = {
             target_key
             for target_key in (
-                self._json_merge_manifest_path_key(config_entry)
+                self._ordinary_config_manifest_path_key(config_entry)
                 for config_entry in config_entries
             )
             if target_key is not None

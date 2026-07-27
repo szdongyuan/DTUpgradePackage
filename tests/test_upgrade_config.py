@@ -896,6 +896,79 @@ def test_config_and_json_merge_target_conflict_fails_before_merge_write(
 
 
 @pytest.mark.parametrize(
+    "config_target",
+    [
+        pytest.param("ui/ui_config/./same.json", id="current-directory"),
+        pytest.param(
+            "ui/ui_config/sub/../same.json",
+            id="parent-directory",
+        ),
+        pytest.param(
+            r"ui\ui_config\same.json",
+            id="windows-versus-forward-separators",
+        ),
+    ],
+)
+def test_config_path_alias_conflicts_with_json_merge_target_before_merge_write(
+    configured_tree,
+    monkeypatch,
+    config_target,
+):
+    merge_target = "ui/ui_config/same.json"
+    target = write_json(
+        configured_tree.roots["ui_config"] / "same.json",
+        {"state": "pre-upgrade"},
+    )
+    (target.parent / "sub").mkdir()
+    replacement_name = config_target.split("/")[-1]
+    write_json(
+        configured_tree.config_dir / replacement_name,
+        {"state": "replacement"},
+    )
+    write_json(configured_tree.config_dir / "patch.json", {"added": True})
+    helper_calls = []
+    manager = configure_manifest_manager(
+        configured_tree,
+        [
+            (
+                "1.0",
+                {
+                    "config": [config_target],
+                    "json_merge": [
+                        {
+                            "target": merge_target,
+                            "source": "resources/config/patch.json",
+                        }
+                    ],
+                },
+            )
+        ],
+    )
+
+    def unexpected_merge(*args):
+        helper_calls.append(args)
+        return True, "ok"
+
+    monkeypatch.setattr(
+        upgrade_config,
+        "merge_json_files_with_reason",
+        unexpected_merge,
+        raising=False,
+    )
+
+    assert manager.update_config_file() is False
+
+    assert helper_calls == []
+    assert json.loads(target.read_text(encoding="utf-8")) == {
+        "state": "replacement"
+    }
+    assert any(
+        "target_conflicts_with_config" in message
+        for message in json_merge_messages(manager, "error")
+    )
+
+
+@pytest.mark.parametrize(
     ("case_name", "expected_category"),
     [
         ("absolute_target", "target_path:absolute_path"),
