@@ -272,6 +272,86 @@ def test_post_commit_reporting_failures_do_not_block_either_cleanup(
     assert "config_restore" not in scenario.events
 
 
+@pytest.mark.parametrize("failing_reporter", ["success_print", "success_logger"])
+def test_successful_program_copy_reporting_failure_still_commits_and_cleans_up(
+    tmp_path,
+    monkeypatch,
+    failing_reporter,
+):
+    real_update_version_program = upgrade_main.update_version_program
+    real_copy2 = upgrade_main.shutil.copy2
+    scenario = install_fake_upgrade(monkeypatch)
+    package_dir = tmp_path / "package"
+    target_dir = tmp_path / "target"
+    source_program = package_dir / "resources" / "DiTing.exe"
+    target_program = target_dir / "DiTing.exe"
+    source_bytes = b"new executable bytes"
+    original_target_bytes = b"old executable bytes"
+    source_program.parent.mkdir(parents=True)
+    target_dir.mkdir()
+    source_program.write_bytes(source_bytes)
+    target_program.write_bytes(original_target_bytes)
+
+    monkeypatch.setattr(upgrade_main, "DEFAULT_DIR", _directory_path(package_dir))
+    monkeypatch.setattr(
+        upgrade_main,
+        "DEFAULT_TARGET_DIR",
+        _directory_path(target_dir),
+    )
+    monkeypatch.setattr(
+        upgrade_main,
+        "update_version_program",
+        real_update_version_program,
+    )
+
+    def recording_copy2(source, destination):
+        scenario.events.append("program_copy")
+        return real_copy2(source, destination)
+
+    monkeypatch.setattr(upgrade_main.shutil, "copy2", recording_copy2)
+
+    if failing_reporter == "success_print":
+        def failing_print(message):
+            if message == "更新主程序成功":
+                raise RuntimeError("success print failed")
+
+        monkeypatch.setattr(upgrade_main, "print", failing_print, raising=False)
+    else:
+        original_info = scenario.logger.info
+
+        def failing_info(message):
+            if message == "更新主程序成功":
+                raise RuntimeError("success logger failed")
+            original_info(message)
+
+        monkeypatch.setattr(scenario.logger, "info", failing_info)
+
+    assert real_update_version_program(scenario.logger) == (
+        True,
+        "更新主程序成功",
+    )
+    assert target_program.read_bytes() == source_bytes
+
+    target_program.write_bytes(original_target_bytes)
+    scenario.events.clear()
+
+    assert upgrade_main.run_upgrade(scenario.logger) is True
+
+    assert target_program.read_bytes() == source_bytes
+    assert scenario.events == [
+        "backup_db",
+        "db_upgrade",
+        "config_update",
+        "exe_run",
+        "program_copy",
+        "version_update",
+        "database_backup_cleanup",
+        "config_backup_cleanup",
+    ]
+    assert "database_restore" not in scenario.events
+    assert "config_restore" not in scenario.events
+
+
 @pytest.mark.parametrize(
     "failure_stage",
     [

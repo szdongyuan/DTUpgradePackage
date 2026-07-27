@@ -12,18 +12,20 @@ from consts.program_config import DEFAULT_DIR, DEFAULT_TARGET_DIR, DATABASE_PATH
 def update_version_program(
     logger,
 ):  # local_program_path: 异音软件可执行程序位置     targer_program_path：目标版本可执行程序位置
+    _print_safely("正在更新主程序...")
+    _log_safely(logger, "info", "正在更新主程序...")
     try:
-        print("正在更新主程序...")
-        logger.info("正在更新主程序...")
         targer_program_path = DEFAULT_DIR + "resources/DiTing.exe"
         local_program_path = DEFAULT_TARGET_DIR + "DiTing.exe"
         shutil.copy2(targer_program_path, local_program_path)
-        print("更新主程序成功")
-        logger.info("更新主程序成功")
-        return True, "更新主程序成功"
     except Exception as e:
-        logger.error(f"更新主程序失败: {e}")
-        return False, f"更新主程序失败: {e}"
+        failure_message = f"更新主程序失败: {e}"
+        _log_safely(logger, "error", failure_message)
+        return False, failure_message
+
+    _print_safely("更新主程序成功")
+    _log_safely(logger, "info", "更新主程序成功")
+    return True, "更新主程序成功"
 
 
 def get_current_version():
