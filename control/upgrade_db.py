@@ -211,14 +211,36 @@ class DataBaseManager:
             self.logger.info("数据库连接已关闭")
 
     def update_version(self):
-        db_current_version = self.get_current_version()
-        now_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.conn.execute(
-            "UPDATE system_info_table SET value = ? WHERE name = 'last_running_version';", (db_current_version,)
-        )
-        self.conn.execute("UPDATE system_info_table SET value = ? WHERE name = 'current_version';", (TARGET_VERSION,))
-        self.conn.execute("UPDATE system_info_table SET value = ? WHERE name = 'update_time';", (now_time,))
-        self.conn.commit()
-        self.conn.close()
-        print(f"数据库版本信息已更新到 {TARGET_VERSION}")
-        self.logger.info(f"数据库版本信息已更新到 {TARGET_VERSION}")
+        committed = False
+        try:
+            db_current_version = self.get_current_version()
+            if db_current_version is None:
+                raise sqlite3.OperationalError("current version is unavailable")
+            now_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.conn.execute(
+                "UPDATE system_info_table SET value = ? WHERE name = 'last_running_version';",
+                (db_current_version,),
+            )
+            self.conn.execute(
+                "UPDATE system_info_table SET value = ? WHERE name = 'current_version';",
+                (TARGET_VERSION,),
+            )
+            self.conn.execute(
+                "UPDATE system_info_table SET value = ? WHERE name = 'update_time';",
+                (now_time,),
+            )
+            self.conn.commit()
+            committed = True
+        except sqlite3.Error as exc:
+            self.conn.rollback()
+            self.logger.error(f"更新数据库版本信息失败: {exc}")
+            return False
+        finally:
+            self.conn.close()
+
+        try:
+            print(f"数据库版本信息已更新到 {TARGET_VERSION}")
+            self.logger.info(f"数据库版本信息已更新到 {TARGET_VERSION}")
+        except Exception:
+            pass
+        return committed
