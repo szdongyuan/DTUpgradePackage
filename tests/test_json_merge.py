@@ -20,6 +20,11 @@ class BytesPath:
         return b"unsupported.json"
 
 
+class OSErrorPath:
+    def __fspath__(self):
+        raise OSError("simulated path conversion failure")
+
+
 class FailingFile:
     def __init__(self, wrapped, operation):
         self.wrapped = wrapped
@@ -136,15 +141,27 @@ def test_merge_json_files_with_reason_reports_ok(tmp_path):
 
 @pytest.mark.parametrize(
     "bad_path",
-    [None, "", b"unsupported.json", 7, object(), EmptyPath(), BytesPath()],
+    [
+        None,
+        "",
+        "bad\x00path",
+        b"unsupported.json",
+        7,
+        object(),
+        EmptyPath(),
+        BytesPath(),
+        OSErrorPath(),
+    ],
     ids=[
         "none",
         "empty-string",
+        "embedded-null",
         "bytes",
         "integer",
         "object",
         "empty-pathlike",
         "bytes-pathlike",
+        "pathlike-oserror",
     ],
 )
 @pytest.mark.parametrize("argument", ["target", "source"])

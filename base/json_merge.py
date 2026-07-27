@@ -42,9 +42,13 @@ def merge_json_files_with_reason(first_json_path, second_json_path):
 def _lexical_absolute_path(path):
     try:
         filesystem_path = os.fspath(path)
-    except (TypeError, ValueError):
+    except (OSError, TypeError, ValueError):
         return None
-    if not isinstance(filesystem_path, str) or not filesystem_path:
+    if (
+        not isinstance(filesystem_path, str)
+        or not filesystem_path
+        or "\x00" in filesystem_path
+    ):
         return None
     try:
         return os.path.abspath(filesystem_path)
