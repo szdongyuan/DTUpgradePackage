@@ -274,12 +274,47 @@ class ConfigManager(object):
             destination_path = os.path.abspath(
                 os.path.join(DEFAULT_TARGET_DIR, relative_path)
             )
+            lexical_roots = tuple(
+                os.path.abspath(root)
+                for root in (
+                    UI_CONFIG_PATH,
+                    UI_PIC_PATH,
+                    AI_MODEL_CONFIG_PATH,
+                    SCANNER_BARCODE_CONFIG_PATH,
+                )
+            )
         except (OSError, ValueError):
             return None, "invalid_path"
+
+        lexical_root = next(
+            (
+                root
+                for root in lexical_roots
+                if self._path_is_contained(destination_path, root)
+            ),
+            None,
+        )
+        if lexical_root is None:
+            return None, "outside_allowed_root"
 
         _, state_error = self._destination_entry_state(destination_path)
         if state_error is not None:
             return None, state_error
+
+        try:
+            resolved_root = os.path.realpath(lexical_root)
+            resolved_destination = os.path.realpath(destination_path)
+            resolved_parent = os.path.realpath(
+                os.path.dirname(destination_path)
+            )
+        except (OSError, ValueError):
+            return None, "invalid_path"
+
+        if (
+            not self._path_is_contained(resolved_destination, resolved_root)
+            or not self._path_is_contained(resolved_parent, resolved_root)
+        ):
+            return None, "symlink_escape"
         return destination_path, None
 
     def _report_ordinary_config_destination_error(self, error):

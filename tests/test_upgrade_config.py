@@ -1440,6 +1440,84 @@ def test_config_junction_parent_alias_conflicts_for_nonexistent_leaf(
     )
 
 
+def assert_ordinary_config_parent_escape_is_rejected(
+    configured_tree,
+    create_parent_alias,
+):
+    external_root = configured_tree.target_dir.parent / "external"
+    external_root.mkdir()
+    external_target = external_root / "ordinary.json"
+    external_target.write_bytes(b"external original bytes")
+    unrelated_external_file = external_root / "unrelated.bin"
+    unrelated_external_file.write_bytes(b"\x00unrelated external data\xff")
+    escaped_parent = configured_tree.roots["ui_config"] / "escape"
+    create_parent_alias(external_root, escaped_parent)
+    write_json(
+        configured_tree.config_dir / "ordinary.json",
+        {"state": "replacement"},
+    )
+    manager = configure_manifest_manager(
+        configured_tree,
+        [
+            (
+                "1.0",
+                {
+                    "config": ["ui/ui_config/escape/ordinary.json"],
+                    "json_merge": [],
+                },
+            )
+        ],
+    )
+    original_external_bytes = external_target.read_bytes()
+    original_unrelated_bytes = unrelated_external_file.read_bytes()
+
+    update_result = manager.update_config_file()
+    flags_after_update = (
+        manager.ui_pic_flag,
+        manager.ui_config_flag,
+        manager.ai_model_config_flag,
+        manager.scannre_barcode_config_flag,
+    )
+    backup_was_written = configured_tree.backups["ui_config"].exists()
+    external_bytes_after_update = external_target.read_bytes()
+    restore_result = manager.restore_config()
+
+    assert update_result is False
+    assert flags_after_update == (True, True, True, True)
+    assert backup_was_written is False
+    assert external_bytes_after_update == original_external_bytes
+    assert restore_result is True
+    assert external_target.read_bytes() == original_external_bytes
+    assert unrelated_external_file.read_bytes() == original_unrelated_bytes
+    assert os.path.samefile(escaped_parent, external_root)
+    assert any(
+        "ordinary_config error: destination_path:symlink_escape" in message
+        for message in logged_messages(manager, "error")
+    )
+
+
+def test_ordinary_config_rejects_symlinked_parent_escape_before_backup_or_write(
+    configured_tree,
+):
+    assert_ordinary_config_parent_escape_is_rejected(
+        configured_tree,
+        lambda source, link: create_symlink_or_skip(
+            source,
+            link,
+            target_is_directory=True,
+        ),
+    )
+
+
+def test_ordinary_config_rejects_junction_parent_escape_before_backup_or_write(
+    configured_tree,
+):
+    assert_ordinary_config_parent_escape_is_rejected(
+        configured_tree,
+        create_junction_or_skip,
+    )
+
+
 @pytest.mark.parametrize("escape_kind", ["target", "source"])
 def test_json_merge_rejects_symlinks_that_resolve_outside_allowed_root(
     configured_tree,
