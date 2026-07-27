@@ -1,6 +1,7 @@
 import ntpath
 import os
 import shutil
+import stat
 import sys
 import tempfile
 
@@ -97,6 +98,58 @@ class ConfigManager(object):
             print(f"复制失败 {src_path} -> {dst_path}: {e}")
             return False
 
+    @staticmethod
+    def _snapshot_entry_is_link_or_reparse(entry_stat):
+        reparse_flag = getattr(
+            stat,
+            "FILE_ATTRIBUTE_REPARSE_POINT",
+            0x400,
+        )
+        file_attributes = getattr(entry_stat, "st_file_attributes", 0)
+        return stat.S_ISLNK(entry_stat.st_mode) or bool(
+            file_attributes & reparse_flag
+        )
+
+    def _snapshot_path_is_safe(self, root_path):
+        try:
+            pending_directories = [os.path.abspath(root_path)]
+        except (OSError, TypeError, ValueError) as e:
+            self.logger.error(f"快照安全检查失败 {root_path}: {e}")
+            return False
+
+        while pending_directories:
+            current_path = pending_directories.pop()
+            try:
+                current_stat = os.lstat(current_path)
+            except (OSError, ValueError) as e:
+                self.logger.error(f"快照安全检查失败 {current_path}: {e}")
+                return False
+
+            if self._snapshot_entry_is_link_or_reparse(current_stat):
+                self.logger.error(
+                    f"快照拒绝链接或重解析点: {current_path}"
+                )
+                return False
+            if not stat.S_ISDIR(current_stat.st_mode):
+                continue
+
+            try:
+                with os.scandir(current_path) as entries:
+                    for entry in entries:
+                        entry_stat = entry.stat(follow_symlinks=False)
+                        if self._snapshot_entry_is_link_or_reparse(entry_stat):
+                            self.logger.error(
+                                f"快照拒绝链接或重解析点: {entry.path}"
+                            )
+                            return False
+                        if stat.S_ISDIR(entry_stat.st_mode):
+                            pending_directories.append(entry.path)
+            except (OSError, ValueError) as e:
+                self.logger.error(f"快照安全检查失败 {current_path}: {e}")
+                return False
+
+        return True
+
     def _cleanup_snapshot_artifact(self, path):
         if not path or not os.path.exists(path):
             return True
@@ -118,6 +171,21 @@ class ConfigManager(object):
         staging_path = None
         old_path = None
         preserve_old_path = False
+
+        if not self._snapshot_path_is_safe(src_path):
+            return False
+        try:
+            destination_exists = os.path.lexists(destination_path)
+        except (OSError, ValueError) as e:
+            self.logger.error(
+                f"快照目标安全检查失败 {destination_path}: {e}"
+            )
+            return False
+        if (
+            destination_exists
+            and not self._snapshot_path_is_safe(destination_path)
+        ):
+            return False
 
         try:
             os.makedirs(parent_path, exist_ok=True)
@@ -370,6 +438,15 @@ class ConfigManager(object):
             backup_source_path, backup_path, flag_name = managed_root
             if getattr(self, flag_name) is False:
                 continue
+
+            if not self._snapshot_path_is_safe(backup_source_path):
+                message = (
+                    "配置文件备份安全检查失败: "
+                    f"{backup_source_path}"
+                )
+                print(message)
+                self.logger.error(message)
+                return False
 
             try:
                 os.makedirs(BACKUP_DIR, exist_ok=True)

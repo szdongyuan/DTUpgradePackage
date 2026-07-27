@@ -1,11 +1,12 @@
 import os
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
 import yaml
 
 import main as upgrade_main
-from control import upgrade_config
+from control import upgrade_config, upgrade_db
 
 
 class RecordingLogger:
@@ -188,6 +189,162 @@ def test_run_upgrade_uses_default_logger_and_orders_commit_before_cleanup(monkey
         "database_backup_cleanup",
         "config_backup_cleanup",
     ]
+
+
+def create_orchestration_version_db(
+    path,
+    *,
+    include_table=True,
+    include_current_version=True,
+):
+    connection = sqlite3.connect(path)
+    try:
+        if not include_table:
+            return
+        connection.execute(
+            "CREATE TABLE system_info_table (name TEXT PRIMARY KEY, value TEXT)"
+        )
+        if include_current_version:
+            connection.execute(
+                "INSERT INTO system_info_table (name, value) "
+                "VALUES ('current_version', '0.25.12.01')"
+            )
+        connection.execute(
+            "INSERT INTO system_info_table (name, value) "
+            "VALUES ('last_running_version', 'previous')"
+        )
+        connection.execute(
+            "INSERT INTO system_info_table (name, value) "
+            "VALUES ('update_time', '2000-01-01 00:00:00')"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def read_orchestration_version(path):
+    connection = sqlite3.connect(path)
+    try:
+        row = connection.execute(
+            "SELECT value FROM system_info_table "
+            "WHERE name = 'current_version'"
+        ).fetchone()
+        return row[0] if row else None
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    "invalid_system_state",
+    ["missing-current-version", "missing-table", "invalid-database"],
+)
+def test_existing_invalid_split_database_fails_final_persistence_and_rolls_back(
+    monkeypatch,
+    tmp_path,
+    invalid_system_state,
+):
+    audio_path = tmp_path / "audio_data.db"
+    system_path = tmp_path / "system_data.db"
+    backup_dir = tmp_path / "backup"
+    create_orchestration_version_db(audio_path)
+    if invalid_system_state == "missing-current-version":
+        create_orchestration_version_db(
+            system_path,
+            include_current_version=False,
+        )
+    elif invalid_system_state == "missing-table":
+        create_orchestration_version_db(system_path, include_table=False)
+    else:
+        system_path.write_bytes(b"not a sqlite database")
+
+    events = []
+
+    class SplitSelectionDataBaseManager:
+        def __init__(self, path):
+            self.path = path
+
+        @staticmethod
+        def backup_db():
+            events.append("backup_db")
+            return True
+
+        @staticmethod
+        def restore_db():
+            events.append("database_restore")
+            return True
+
+        def upgrade(self):
+            events.append("db_upgrade")
+            return True
+
+        def update_version(self):
+            events.append(("version_update", self.path))
+            return upgrade_db.DataBaseManager(self.path).update_version()
+
+    class SuccessfulConfigManager:
+        def __init__(self, _logger, _current_version):
+            self.upgrade_version_list = []
+
+        def update_config_file(self):
+            events.append("config_update")
+            return True
+
+        def restore_config(self):
+            events.append("config_restore")
+            return True
+
+        def delete_backup_file(self):
+            events.append("config_cleanup")
+            return True
+
+    class SuccessfulExeManager:
+        def __init__(self, _logger, _versions):
+            pass
+
+        def run(self):
+            events.append("exe_run")
+            return True
+
+    monkeypatch.setattr(upgrade_db, "DATABASE_PATH", str(audio_path))
+    monkeypatch.setattr(
+        upgrade_db,
+        "SYSTEM_DATABASE_PATH",
+        str(system_path),
+    )
+    monkeypatch.setattr(upgrade_db, "TARGET_VERSION", "0.26.07.01")
+    monkeypatch.setattr(
+        upgrade_db.LogManager,
+        "set_log_handler",
+        staticmethod(lambda _name: RecordingLogger()),
+    )
+    monkeypatch.setattr(
+        upgrade_main,
+        "DataBaseManager",
+        SplitSelectionDataBaseManager,
+    )
+    monkeypatch.setattr(upgrade_main, "ConfigManager", SuccessfulConfigManager)
+    monkeypatch.setattr(upgrade_main, "ExeUpgradeManager", SuccessfulExeManager)
+    monkeypatch.setattr(
+        upgrade_main,
+        "update_version_program",
+        lambda _logger: (events.append("program_update") or True, "ok"),
+    )
+    monkeypatch.setattr(upgrade_main, "get_current_version", lambda: "0.25.12.01")
+    monkeypatch.setattr(
+        upgrade_main,
+        "get_version_database_path",
+        upgrade_db.get_version_database_path,
+    )
+    monkeypatch.setattr(upgrade_main, "DATABASE_PATH", str(audio_path))
+    monkeypatch.setattr(upgrade_main, "BACKUP_DIR", str(backup_dir))
+
+    assert upgrade_main.run_upgrade(RecordingLogger()) is False
+
+    assert read_orchestration_version(audio_path) == "0.25.12.01"
+    assert ("version_update", str(system_path)) in events
+    assert "database_restore" in events
+    assert "config_restore" in events
+    assert "config_cleanup" not in events
 
 
 def test_default_logger_construction_failure_returns_false_before_backup(monkeypatch):

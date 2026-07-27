@@ -23,7 +23,7 @@ def read_current_version_from_db(db_path):
 
 
 def get_version_database_path():
-    if read_current_version_from_db(SYSTEM_DATABASE_PATH) is not None:
+    if os.path.lexists(SYSTEM_DATABASE_PATH):
         return SYSTEM_DATABASE_PATH
     return DATABASE_PATH
 

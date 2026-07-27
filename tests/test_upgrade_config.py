@@ -1311,6 +1311,146 @@ def create_junction_or_skip(source, link):
         pytest.skip(f"directory junctions are unavailable: {result.stderr}")
 
 
+def create_windows_junction(source, link):
+    result = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(source)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction regression")
+def test_backup_rejects_external_junction_before_snapshot_writes(
+    configured_tree,
+    monkeypatch,
+):
+    manager = make_manager()
+    managed_root = configured_tree.roots["ui_config"]
+    external_root = configured_tree.target_dir.parent / "external-data"
+    external_root.mkdir()
+    external_file = external_root / "secret.bin"
+    external_file.write_bytes(b"\x00external-secret\xff")
+    junction = managed_root / "external-junction"
+    create_windows_junction(external_root, junction)
+    copy_calls = []
+    monkeypatch.setattr(
+        manager,
+        "smart_copy",
+        lambda source, destination: (
+            copy_calls.append((source, destination)) or True
+        ),
+    )
+
+    assert manager.backup_config_file(["ui/ui_config/settings.json"]) is False
+
+    assert manager.ui_config_flag is True
+    assert copy_calls == []
+    assert not configured_tree.backup_dir.exists()
+    assert not configured_tree.backups["ui_config"].exists()
+    assert os.path.samefile(junction, external_root)
+    assert external_file.read_bytes() == b"\x00external-secret\xff"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction regression")
+def test_backup_rejects_junction_cycle_without_traversing_it(
+    configured_tree,
+    monkeypatch,
+):
+    manager = make_manager()
+    managed_root = configured_tree.roots["ui_config"]
+    original_marker = managed_root.joinpath("marker.txt").read_bytes()
+    cycle = managed_root / "cycle"
+    create_windows_junction(managed_root, cycle)
+    copy_calls = []
+    monkeypatch.setattr(
+        manager,
+        "smart_copy",
+        lambda source, destination: (
+            copy_calls.append((source, destination)) or True
+        ),
+    )
+
+    assert manager.backup_config_file(["ui/ui_config/settings.json"]) is False
+
+    assert manager.ui_config_flag is True
+    assert copy_calls == []
+    assert not configured_tree.backup_dir.exists()
+    assert not configured_tree.backups["ui_config"].exists()
+    assert os.path.samefile(cycle, managed_root)
+    assert managed_root.joinpath("marker.txt").read_bytes() == original_marker
+
+
+def test_backup_rejects_external_directory_symlink_when_available(
+    configured_tree,
+    monkeypatch,
+):
+    manager = make_manager()
+    managed_root = configured_tree.roots["ui_config"]
+    external_root = configured_tree.target_dir.parent / "external-symlink-data"
+    external_root.mkdir()
+    external_file = external_root / "secret.bin"
+    external_file.write_bytes(b"external symlink bytes")
+    link = managed_root / "external-symlink"
+    create_symlink_or_skip(
+        external_root,
+        link,
+        target_is_directory=True,
+    )
+    copy_calls = []
+    monkeypatch.setattr(
+        manager,
+        "smart_copy",
+        lambda source, destination: (
+            copy_calls.append((source, destination)) or True
+        ),
+    )
+
+    assert manager.backup_config_file(["ui/ui_config/settings.json"]) is False
+
+    assert manager.ui_config_flag is True
+    assert copy_calls == []
+    assert not configured_tree.backup_dir.exists()
+    assert os.path.samefile(link, external_root)
+    assert external_file.read_bytes() == b"external symlink bytes"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction regression")
+def test_restore_preserves_external_junction_instead_of_replacing_it(
+    configured_tree,
+    monkeypatch,
+):
+    manager = make_manager()
+    managed_root = configured_tree.roots["ui_config"]
+    linked_path = managed_root / "linked"
+    linked_path.mkdir()
+    linked_path.joinpath("local.txt").write_bytes(b"snapshot-local-data")
+    assert manager.backup_config_file(["ui/ui_config/settings.json"]) is True
+
+    os.replace(linked_path, managed_root / "original-linked-directory")
+    external_root = configured_tree.target_dir.parent / "restore-external"
+    external_root.mkdir()
+    external_file = external_root / "external.txt"
+    external_file.write_bytes(b"external restore data")
+    create_windows_junction(external_root, linked_path)
+    copy_calls = []
+    monkeypatch.setattr(
+        manager,
+        "smart_copy",
+        lambda source, destination: (
+            copy_calls.append((source, destination)) or True
+        ),
+    )
+
+    assert manager.restore_config() is False
+
+    assert copy_calls == []
+    assert configured_tree.backups["ui_config"].exists()
+    assert os.path.samefile(linked_path, external_root)
+    assert external_file.read_bytes() == b"external restore data"
+
+
 def assert_config_parent_alias_conflict_is_preflighted(
     configured_tree,
     monkeypatch,

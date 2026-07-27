@@ -26,10 +26,10 @@ def merge_json_files_with_reason(first_json_path, second_json_path):
             first_data = json.load(first_file)
         with open(second_path, "r", encoding="utf-8-sig") as second_file:
             second_data = json.load(second_file)
-    except json.JSONDecodeError:
-        return False, "invalid_json"
     except (OSError, UnicodeError):
         return False, "unreadable_file"
+    except (ValueError, RecursionError):
+        return False, "invalid_json"
 
     if not isinstance(first_data, dict) or not isinstance(second_data, dict):
         return False, "non_object_root"
@@ -83,7 +83,7 @@ def _replace_with_json(target_path, data):
         os.replace(temporary_path, target_path)
         committed = True
         return True, "ok"
-    except (OSError, UnicodeError):
+    except (OSError, UnicodeError, ValueError, RecursionError, OverflowError):
         return False, "write_failed"
     finally:
         if file_descriptor is not None:

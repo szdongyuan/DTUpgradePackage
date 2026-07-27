@@ -2,6 +2,7 @@ import builtins
 import json
 import math
 import os
+import sys
 
 import pytest
 
@@ -270,6 +271,51 @@ def test_invalid_json_in_either_file_leaves_both_unchanged(
     assert_snapshot_unchanged(original)
 
 
+@pytest.mark.parametrize("invalid_argument", ["target", "source"])
+def test_oversized_integer_parser_limit_is_invalid_json_for_both_apis(
+    tmp_path,
+    invalid_argument,
+):
+    integer_limit = sys.get_int_max_str_digits()
+    if integer_limit == 0:
+        pytest.skip("Python integer string conversion limit is disabled")
+
+    target, source = write_json_pair(tmp_path)
+    invalid_path = target if invalid_argument == "target" else source
+    invalid_path.write_text(
+        '{"oversized": ' + ("1" * (integer_limit + 1)) + "}",
+        encoding="utf-8",
+    )
+    original = snapshot_files(target, source)
+
+    result = merge_json_files_with_reason(target, source)
+
+    assert_detailed_failure(result, "invalid_json", target, source)
+    assert merge_json_files(target, source) is False
+    assert_snapshot_unchanged(original)
+
+
+@pytest.mark.parametrize("invalid_argument", ["target", "source"])
+def test_deep_nesting_parser_limit_is_invalid_json_for_both_apis(
+    tmp_path,
+    invalid_argument,
+):
+    target, source = write_json_pair(tmp_path)
+    invalid_path = target if invalid_argument == "target" else source
+    nesting_depth = max(sys.getrecursionlimit() * 5, 5000)
+    invalid_path.write_text(
+        ("[" * nesting_depth) + "0" + ("]" * nesting_depth),
+        encoding="utf-8",
+    )
+    original = snapshot_files(target, source)
+
+    result = merge_json_files_with_reason(target, source)
+
+    assert_detailed_failure(result, "invalid_json", target, source)
+    assert merge_json_files(target, source) is False
+    assert_snapshot_unchanged(original)
+
+
 @pytest.mark.parametrize("root", [[], 42, "scalar"], ids=["list", "number", "string"])
 @pytest.mark.parametrize("invalid_argument", ["target", "source"])
 def test_non_object_root_in_either_file_leaves_both_unchanged(
@@ -468,6 +514,33 @@ def test_atomic_write_failures_leave_inputs_unchanged_and_remove_temp_files(
     result = merge_json_files_with_reason(target, source)
 
     assert_detailed_failure(result, "write_failed", target, source)
+    assert_snapshot_unchanged(original)
+    assert {path.name for path in tmp_path.iterdir()} == original_directory_entries
+
+
+@pytest.mark.parametrize(
+    "exception_type",
+    [RecursionError, ValueError, OverflowError],
+    ids=["recursion", "value", "overflow"],
+)
+def test_serialization_limit_failures_are_atomic_write_failures_for_both_apis(
+    tmp_path,
+    monkeypatch,
+    exception_type,
+):
+    target, source = write_json_pair(tmp_path)
+    original = snapshot_files(target, source)
+    original_directory_entries = {path.name for path in tmp_path.iterdir()}
+
+    def fail_dump(*_args, **_kwargs):
+        raise exception_type("simulated serialization limit failure")
+
+    monkeypatch.setattr(json_merge.json, "dump", fail_dump)
+
+    result = merge_json_files_with_reason(target, source)
+
+    assert_detailed_failure(result, "write_failed", target, source)
+    assert merge_json_files(target, source) is False
     assert_snapshot_unchanged(original)
     assert {path.name for path in tmp_path.iterdir()} == original_directory_entries
 

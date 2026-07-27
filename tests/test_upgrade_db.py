@@ -165,6 +165,62 @@ def test_version_database_path_prefers_system_database_after_split(monkeypatch, 
 
 
 @pytest.mark.parametrize(
+    "invalid_system_state",
+    ["missing-current-version", "missing-table", "invalid-database"],
+)
+def test_version_database_path_selects_existing_invalid_split_database(
+    monkeypatch,
+    local_tmp_path,
+    invalid_system_state,
+):
+    audio_path = local_tmp_path / "audio_data.db"
+    system_path = local_tmp_path / "system_data.db"
+    create_version_db(audio_path, "0.25.12.01")
+
+    if invalid_system_state == "missing-current-version":
+        create_version_db(
+            system_path,
+            "unused",
+            include_current_version=False,
+        )
+    elif invalid_system_state == "missing-table":
+        sqlite3.connect(system_path).close()
+    else:
+        system_path.write_bytes(b"not a sqlite database")
+
+    monkeypatch.setattr(upgrade_db, "DATABASE_PATH", str(audio_path))
+    monkeypatch.setattr(upgrade_db, "SYSTEM_DATABASE_PATH", str(system_path))
+
+    assert upgrade_db.get_version_database_path() == str(system_path)
+
+
+def test_version_database_path_does_not_query_existing_split_database(
+    monkeypatch,
+    local_tmp_path,
+):
+    audio_path = local_tmp_path / "audio_data.db"
+    system_path = local_tmp_path / "system_data.db"
+    create_version_db(audio_path, "0.25.12.01")
+    system_path.write_bytes(b"unreadable contents")
+    reader_calls = []
+
+    def fail_if_queried(path):
+        reader_calls.append(path)
+        raise sqlite3.OperationalError("simulated selection query failure")
+
+    monkeypatch.setattr(upgrade_db, "DATABASE_PATH", str(audio_path))
+    monkeypatch.setattr(upgrade_db, "SYSTEM_DATABASE_PATH", str(system_path))
+    monkeypatch.setattr(
+        upgrade_db,
+        "read_current_version_from_db",
+        fail_if_queried,
+    )
+
+    assert upgrade_db.get_version_database_path() == str(system_path)
+    assert reader_calls == []
+
+
+@pytest.mark.parametrize(
     "database_name",
     ["audio_data.db", "system_data.db"],
     ids=["legacy-audio-database", "split-system-database"],
