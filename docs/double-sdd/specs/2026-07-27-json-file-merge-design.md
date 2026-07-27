@@ -70,6 +70,28 @@ Return value:
 
 Expected filesystem and JSON errors are converted to `False`.
 
+The module also exposes an integration helper:
+
+```python
+merge_json_files_with_reason(first_json_path, second_json_path) -> tuple[bool, str]
+```
+
+The Boolean wrapper delegates to this detailed helper. The reason-code contract
+is exhaustive:
+
+- Success: `(True, "ok")`
+- Invalid/empty/unsupported path argument: `(False, "invalid_path")`
+- Missing path or path that is not a regular file: `(False, "missing_file")`
+- Read/open/decode filesystem failure: `(False, "unreadable_file")`
+- Both arguments identify the same underlying file: `(False, "same_file")`
+- JSON syntax failure: `(False, "invalid_json")`
+- Either JSON root is not an object: `(False, "non_object_root")`
+- Temporary-file, write, flush, sync, or replacement failure:
+  `(False, "write_failed")`
+
+Reason codes never contain path values or JSON data. `ConfigManager` uses this
+detailed result for logging without duplicating parsing or write logic.
+
 ## YML Schema
 
 Each version manifest may contain an optional top-level `json_merge` list:
@@ -113,9 +135,14 @@ configs/aimodel_config/
 configs/scanner_barcode_config/
 ```
 
-The resolved target must remain inside one of those roots. Absolute paths,
-parent traversal, and symbolic-link resolution outside the managed root are
+The resolved target must remain inside one of those roots. Absolute paths, any
+original `..` path component (including traversal that would normalize back
+inside the root), and symbolic-link resolution outside the managed root are
 rejected.
+
+Both the lexical absolute target path and its resolved `realpath` must remain
+inside the same allowed target root. A lexical path outside a root is rejected
+even if a symlink resolves inward.
 
 `source` is resolved against `DEFAULT_DIR` and must remain inside:
 
@@ -123,8 +150,12 @@ rejected.
 resources/config/
 ```
 
-Absolute paths, parent traversal, and symbolic-link resolution outside this
-source root are rejected.
+Absolute paths, any original `..` path component (including traversal that
+would normalize back inside `resources/config`), and symbolic-link resolution
+outside this source root are rejected.
+
+Both the lexical absolute source path and its resolved `realpath` must remain
+inside `resources/config`.
 
 Both resolved paths must already exist as readable files. The target and source
 must not identify the same underlying file.
@@ -185,7 +216,14 @@ unchanged.
 Atomic replacement applies to the target directory entry. A symbolic-link
 target entry is replaced without overwriting its former link target. Replacing
 a hardlink target entry separates that path from other aliases, which retain
-their prior contents.
+their prior contents. Path-containment checks may use the resolved real path,
+but the lexical target path supplied by the caller must be retained for the
+final `os.replace` operation so these semantics are preserved.
+
+Rollback guarantees JSON content at the configured target path, not filesystem
+link topology. If a target was a symbolic link or hardlink before the upgrade,
+restoration may leave a regular file with the original JSON bytes at that path;
+recreating the prior link relationship is out of scope.
 
 ## Backup And Rollback
 
@@ -231,6 +269,21 @@ configuration backup.
 The current final database-version update must be moved inside the common
 success/failure decision in `main.py`.
 
+The testable orchestration API is:
+
+```python
+run_upgrade(logger=None) -> bool
+```
+
+It performs no pause and does not call `sys.exit`. It returns `True` after final
+version persistence succeeds, including when only best-effort post-commit
+cleanup fails. It returns `False` for initial backup failure or any pre-commit
+upgrade/persistence failure after attempting the required restoration.
+
+The `if __name__ == "__main__"` wrapper calls `run_upgrade`, preserves the
+existing Windows pause behavior, and exits with code `0` for `True` or `1` for
+`False`.
+
 Required ordering:
 
 1. Create database and configuration backups.
@@ -248,16 +301,25 @@ Configuration restoration is attempted even if database restoration fails.
 Failures from either restore are logged and produce a failed process result;
 recovery files that could not be applied are retained.
 
-The orchestration must not remove `audio_data_backup.db` or configuration
-backup directories before final database-version persistence succeeds.
+On the normal success path, orchestration must not remove
+`audio_data_backup.db` or configuration backup directories before final
+database-version persistence succeeds.
+
+On a failed-upgrade path, successful restoration consumes the corresponding
+backup and may delete it afterward. If any required restoration fails, recovery
+backups are retained. This failure-path cleanup does not conflict with the
+success-path rule above because final persistence will not be retried in that
+run.
 
 `DataBaseManager.update_version` may target either `audio_data.db` or
 `system_data.db` through `get_version_database_path`. It must provide its own
 transactional guarantee instead of relying on the legacy audio-only backup:
 
+- A missing/unreadable current-version value is a transaction failure; metadata
+  updates must not begin with a `None` previous version.
 - The three version metadata updates execute in one SQLite transaction.
 - The method returns `True` only after `commit()` succeeds.
-- A database error before or during commit triggers `rollback()` and returns
+- A read, SQL execution, or commit error triggers `rollback()` and returns
   `False`, leaving the selected version database's previous metadata intact.
 - Connection cleanup always runs.
 - Console or logger failures after a successful commit are non-fatal and cannot
@@ -267,6 +329,12 @@ Because a reported failure cannot occur after a successful metadata commit,
 the selected version database does not require a second file-level backup for
 this final operation. `main.py` checks the Boolean return value and enters the
 common failure path when it is `False`.
+
+Database and configuration backup cleanup after a successful final commit is
+best-effort housekeeping. A deletion failure is logged, all other cleanup
+targets are still attempted, and `run_upgrade` continues to report success.
+No pre-commit rollback is attempted after version metadata has committed.
+Recovery files whose deletion failed remain available for manual cleanup.
 
 ## Logging
 
@@ -318,11 +386,19 @@ Helper tests cover:
 - Nested objects under a duplicate field are not recursively merged.
 - The supplementary file remains byte-for-byte unchanged.
 - Empty/unsupported paths, missing/unreadable files, invalid JSON, non-object
-  roots, and same-file aliases return `False` without modifying the target.
+  roots, and same-file aliases return `False` without modifying either file.
+- Every detailed-helper outcome returns the documented exhaustive reason code;
+  reason strings contain no JSON or path data.
 - UTF-8 BOM input and Python-supported non-finite numbers follow the documented
   behavior.
-- Simulated atomic replacement failure returns `False` and leaves the target
-  byte-for-byte unchanged.
+- Successful output is UTF-8 without BOM, preserves non-ASCII text, and uses
+  six-space indentation.
+- An in-root symbolic-link target is replaced at the lexical path while its
+  former referent remains unchanged; a hardlink target separates from its alias,
+  whose bytes remain unchanged.
+- Simulated temporary creation, write, flush, sync, and replacement failures
+  return `write_failed`, leave the target byte-for-byte unchanged, and clean up
+  uncommitted temporary files.
 
 Configuration-manager tests cover:
 
@@ -332,11 +408,16 @@ Configuration-manager tests cover:
 - Invalid section/entry shapes and unknown fields fail.
 - Absolute, traversal, and out-of-root paths fail.
 - A target/source symbolic-link escape fails.
+- A lexical path outside an allowed root fails even when its symlink resolves
+  inward.
 - A target also listed in `config` for the same version fails before merge.
 - Backup occurs before the first write and only once per managed root.
 - Backup failure prevents target modification and does not mark the root as
   backed up.
 - Merge failure returns `False` and leaves restoration data available.
+- Backup, restore, unsafe/missing path, merge start/success, merge reason-code,
+  and orchestration restoration failures produce the documented logs without
+  JSON contents.
 - Restore checks copy results; failed restoration returns `False` and retains
   all backup data.
 - Multiple versions and multiple merges roll back to the pre-upgrade state.
@@ -356,10 +437,22 @@ Orchestration tests cover:
 Database-version tests cover both selected database locations:
 
 - Successful metadata persistence commits all three values and returns `True`.
-- A simulated database or commit failure rolls back all metadata changes and
-  returns `False`.
+- Missing/unreadable current-version data, SQL execution failure, and commit
+  failure roll back all metadata changes and return `False`.
 - A post-commit logging failure does not turn a committed update into a reported
   failure.
+- Successful and failing cases exercise both legacy `audio_data.db` and split
+  `system_data.db` version locations.
+
+Post-commit cleanup tests cover:
+
+- Database-backup deletion returning `False` or raising does not trigger
+  rollback and does not prevent configuration-backup cleanup from being
+  attempted.
+- Configuration-backup deletion returning `False` or raising does not trigger
+  rollback.
+- The committed upgrade returns success while failed cleanup targets remain and
+  warnings are logged.
 
 The existing project test suite remains the regression check for unaffected
 upgrade behavior.
