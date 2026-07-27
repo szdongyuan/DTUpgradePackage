@@ -1,9 +1,12 @@
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
+from base.json_merge import merge_json_files_with_reason as real_merge_json_files_with_reason
 from control import upgrade_config
 
 
@@ -28,7 +31,9 @@ def directory_path(path):
 @pytest.fixture
 def configured_tree(tmp_path, monkeypatch):
     target_dir = tmp_path / "target"
-    backup_dir = tmp_path / "package" / "resources" / "backup"
+    package_dir = tmp_path / "package"
+    config_dir = package_dir / "resources" / "config"
+    backup_dir = package_dir / "resources" / "backup"
     roots = {
         "ui_pic": target_dir / "ui" / "ui_pic",
         "ui_config": target_dir / "ui" / "ui_config",
@@ -46,7 +51,10 @@ def configured_tree(tmp_path, monkeypatch):
         root.mkdir(parents=True)
         (root / "marker.txt").write_text(f"original {name}", encoding="utf-8")
 
+    config_dir.mkdir(parents=True)
+    monkeypatch.setattr(upgrade_config, "DEFAULT_DIR", directory_path(package_dir))
     monkeypatch.setattr(upgrade_config, "DEFAULT_TARGET_DIR", directory_path(target_dir))
+    monkeypatch.setattr(upgrade_config, "CONFIG_DIR", directory_path(config_dir))
     monkeypatch.setattr(upgrade_config, "BACKUP_DIR", directory_path(backup_dir))
     monkeypatch.setattr(upgrade_config, "UI_PIC_PATH", directory_path(roots["ui_pic"]))
     monkeypatch.setattr(upgrade_config, "UI_CONFIG_PATH", directory_path(roots["ui_config"]))
@@ -69,7 +77,14 @@ def configured_tree(tmp_path, monkeypatch):
         directory_path(backups["scanner_barcode_config"]),
     )
 
-    return SimpleNamespace(target_dir=target_dir, backup_dir=backup_dir, roots=roots, backups=backups)
+    return SimpleNamespace(
+        package_dir=package_dir,
+        config_dir=config_dir,
+        target_dir=target_dir,
+        backup_dir=backup_dir,
+        roots=roots,
+        backups=backups,
+    )
 
 
 def make_manager():
@@ -110,6 +125,42 @@ def swap_artifacts(destination):
         for path in destination.parent.iterdir()
         if path.name.startswith(prefixes)
     )
+
+
+def write_version_manifest(configured_tree, version, data):
+    version_path = configured_tree.package_dir / "resources" / f"version_{version}.yml"
+    version_path.parent.mkdir(parents=True, exist_ok=True)
+    version_path.write_text(
+        yaml.safe_dump(data, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    return version_path
+
+
+def write_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(data, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return path
+
+
+def configure_manifest_manager(configured_tree, manifests):
+    manager = make_manager()
+    manager.upgrade_version_list = []
+    for version, data in manifests:
+        write_version_manifest(configured_tree, version, data)
+        manager.upgrade_version_list.append(version)
+    return manager
+
+
+def json_merge_messages(manager, level=None):
+    return [
+        message
+        for message in logged_messages(manager, level)
+        if message.startswith("json_merge")
+    ]
 
 
 def test_successful_managed_root_backup_changes_only_matching_flag(configured_tree):
@@ -455,3 +506,799 @@ def test_restore_returns_false_when_cleanup_partially_fails_and_attempts_all_del
     assert not any(
         "ai模型配置备份文件已删除" in message for message in logged_messages(manager, "info")
     )
+
+
+@pytest.mark.parametrize(
+    "manifest",
+    [
+        {"config": []},
+        {"config": [], "json_merge": []},
+    ],
+    ids=["missing-section", "empty-section"],
+)
+def test_missing_or_empty_json_merge_is_a_compatible_noop(
+    configured_tree,
+    monkeypatch,
+    manifest,
+):
+    helper_calls = []
+
+    def unexpected_merge(*args):
+        helper_calls.append(args)
+        return True, "ok"
+
+    monkeypatch.setattr(
+        upgrade_config,
+        "merge_json_files_with_reason",
+        unexpected_merge,
+        raising=False,
+    )
+    manager = configure_manifest_manager(configured_tree, [("1.0", manifest)])
+
+    assert manager.update_config_file() is True
+    assert helper_calls == []
+
+
+def test_existing_config_actions_run_before_json_merge_actions(
+    configured_tree,
+    monkeypatch,
+):
+    replacement_relative = "ui/ui_config/replaced.json"
+    merge_relative = "ui/ui_config/merged.json"
+    write_json(configured_tree.roots["ui_config"] / "replaced.json", {"old": True})
+    write_json(configured_tree.config_dir / "replaced.json", {"new": True})
+    write_json(configured_tree.roots["ui_config"] / "merged.json", {"target": True})
+    write_json(configured_tree.config_dir / "patch.json", {"source": True})
+    manager = configure_manifest_manager(
+        configured_tree,
+        [
+            (
+                "1.0",
+                {
+                    "config": [replacement_relative],
+                    "json_merge": [
+                        {
+                            "target": merge_relative,
+                            "source": "resources/config/patch.json",
+                        }
+                    ],
+                },
+            )
+        ],
+    )
+    events = []
+
+    def track_backup(paths):
+        events.append(("backup", tuple(paths)))
+        return True
+
+    def track_remove(path):
+        events.append(("remove", path))
+        return True
+
+    def track_copy(source, target):
+        events.append(("copy", source, target))
+        return True
+
+    def track_merge(target, source):
+        events.append(("merge", target, source))
+        return True, "ok"
+
+    monkeypatch.setattr(manager, "backup_config_file", track_backup)
+    monkeypatch.setattr(manager, "smart_remove", track_remove)
+    monkeypatch.setattr(manager, "smart_copy", track_copy)
+    monkeypatch.setattr(
+        upgrade_config,
+        "merge_json_files_with_reason",
+        track_merge,
+        raising=False,
+    )
+
+    assert manager.update_config_file() is True
+
+    event_names = [event[0] for event in events]
+    assert event_names == ["backup", "remove", "copy", "backup", "merge"]
+    assert events[0][1] == (replacement_relative,)
+    assert events[3][1] == (merge_relative,)
+
+
+@pytest.mark.parametrize(
+    ("raw_section", "schema_category"),
+    [
+        ("not-a-list", "section_must_be_list"),
+        (None, "section_must_be_list"),
+        ([42], "entry_must_be_object"),
+        ([{"source": "resources/config/patch.json"}], "entry_fields_invalid"),
+        ([{"target": "ui/ui_config/target.json"}], "entry_fields_invalid"),
+        (
+            [
+                {
+                    "target": "ui/ui_config/target.json",
+                    "source": "resources/config/patch.json",
+                    "unexpected": "TOP_SECRET_UNKNOWN_VALUE",
+                }
+            ],
+            "entry_fields_invalid",
+        ),
+        (
+            [{"target": "", "source": "resources/config/patch.json"}],
+            "target_must_be_non_empty_string",
+        ),
+        (
+            [{"target": "   ", "source": "resources/config/patch.json"}],
+            "target_must_be_non_empty_string",
+        ),
+        (
+            [{"target": 7, "source": "resources/config/patch.json"}],
+            "target_must_be_non_empty_string",
+        ),
+        (
+            [{"target": "ui/ui_config/target.json", "source": ""}],
+            "source_must_be_non_empty_string",
+        ),
+        (
+            [{"target": "ui/ui_config/target.json", "source": []}],
+            "source_must_be_non_empty_string",
+        ),
+    ],
+)
+def test_malformed_json_merge_schema_fails_with_non_sensitive_category_log(
+    configured_tree,
+    raw_section,
+    schema_category,
+):
+    manager = configure_manifest_manager(
+        configured_tree,
+        [("1.0", {"config": [], "json_merge": raw_section})],
+    )
+
+    assert manager.update_config_file() is False
+
+    errors = "\n".join(json_merge_messages(manager, "error"))
+    assert schema_category in errors
+    assert "TOP_SECRET_UNKNOWN_VALUE" not in errors
+
+
+def test_config_and_json_merge_target_conflict_fails_before_merge_write(
+    configured_tree,
+    monkeypatch,
+):
+    target_relative = "ui/ui_config/same.json"
+    target = write_json(
+        configured_tree.roots["ui_config"] / "same.json",
+        {"state": "pre-upgrade"},
+    )
+    write_json(configured_tree.config_dir / "same.json", {"state": "replacement"})
+    write_json(configured_tree.config_dir / "patch.json", {"added": True})
+    helper_calls = []
+    manager = configure_manifest_manager(
+        configured_tree,
+        [
+            (
+                "1.0",
+                {
+                    "config": [target_relative],
+                    "json_merge": [
+                        {
+                            "target": target_relative,
+                            "source": "resources/config/patch.json",
+                        }
+                    ],
+                },
+            )
+        ],
+    )
+
+    def unexpected_merge(*args):
+        helper_calls.append(args)
+        return True, "ok"
+
+    monkeypatch.setattr(
+        upgrade_config,
+        "merge_json_files_with_reason",
+        unexpected_merge,
+        raising=False,
+    )
+
+    assert manager.update_config_file() is False
+
+    assert helper_calls == []
+    assert json.loads(target.read_text(encoding="utf-8")) == {"state": "replacement"}
+    assert any(
+        "target_conflicts_with_config" in message
+        for message in json_merge_messages(manager, "error")
+    )
+
+
+@pytest.mark.parametrize(
+    ("case_name", "expected_category"),
+    [
+        ("absolute_target", "target_path:absolute_path"),
+        ("absolute_source", "source_path:absolute_path"),
+        ("target_parent_component", "target_path:parent_reference"),
+        ("source_parent_component", "source_path:parent_reference"),
+        ("target_outside_managed_roots", "target_path:outside_allowed_root"),
+        ("source_outside_config", "source_path:outside_allowed_root"),
+        ("missing_target", "target_path:missing_file"),
+        ("missing_source", "source_path:missing_file"),
+        ("target_is_directory", "target_path:missing_file"),
+        ("source_is_directory", "source_path:missing_file"),
+    ],
+)
+def test_json_merge_rejects_unsafe_missing_and_non_file_paths(
+    configured_tree,
+    case_name,
+    expected_category,
+):
+    target = write_json(
+        configured_tree.roots["ui_config"] / "target.json",
+        {"target": "TOP_SECRET_TARGET"},
+    )
+    source = write_json(
+        configured_tree.config_dir / "patch.json",
+        {"source": "TOP_SECRET_SOURCE"},
+    )
+    (configured_tree.roots["ui_config"] / "sub").mkdir()
+    (configured_tree.config_dir / "sub").mkdir()
+    outside_target = write_json(
+        configured_tree.roots["ui_pic"] / "outside.json",
+        {"outside": True},
+    )
+    outside_source = write_json(
+        configured_tree.package_dir / "resources" / "outside.json",
+        {"outside": True},
+    )
+    target_directory = configured_tree.roots["ui_config"] / "directory"
+    source_directory = configured_tree.config_dir / "directory"
+    target_directory.mkdir()
+    source_directory.mkdir()
+
+    target_relative = "ui/ui_config/target.json"
+    source_relative = "resources/config/patch.json"
+    if case_name == "absolute_target":
+        target_relative = str(target)
+    elif case_name == "absolute_source":
+        source_relative = str(source)
+    elif case_name == "target_parent_component":
+        target_relative = "ui/ui_config/sub/../target.json"
+    elif case_name == "source_parent_component":
+        source_relative = "resources/config/sub/../patch.json"
+    elif case_name == "target_outside_managed_roots":
+        target_relative = "ui/ui_pic/outside.json"
+    elif case_name == "source_outside_config":
+        source_relative = "resources/outside.json"
+    elif case_name == "missing_target":
+        target_relative = "ui/ui_config/missing.json"
+    elif case_name == "missing_source":
+        source_relative = "resources/config/missing.json"
+    elif case_name == "target_is_directory":
+        target_relative = "ui/ui_config/directory"
+    elif case_name == "source_is_directory":
+        source_relative = "resources/config/directory"
+
+    target_bytes = target.read_bytes()
+    source_bytes = source.read_bytes()
+    outside_target_bytes = outside_target.read_bytes()
+    outside_source_bytes = outside_source.read_bytes()
+    manager = configure_manifest_manager(
+        configured_tree,
+        [
+            (
+                "1.0",
+                {
+                    "config": [],
+                    "json_merge": [
+                        {"target": target_relative, "source": source_relative}
+                    ],
+                },
+            )
+        ],
+    )
+
+    assert manager.update_config_file() is False
+
+    assert target.read_bytes() == target_bytes
+    assert source.read_bytes() == source_bytes
+    assert outside_target.read_bytes() == outside_target_bytes
+    assert outside_source.read_bytes() == outside_source_bytes
+    errors = "\n".join(json_merge_messages(manager, "error"))
+    assert expected_category in errors
+    assert "TOP_SECRET_TARGET" not in errors
+    assert "TOP_SECRET_SOURCE" not in errors
+
+
+def create_symlink_or_skip(source, link, target_is_directory=False):
+    try:
+        os.symlink(source, link, target_is_directory=target_is_directory)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"symbolic links are unavailable: {exc}")
+
+
+@pytest.mark.parametrize("escape_kind", ["target", "source"])
+def test_json_merge_rejects_symlinks_that_resolve_outside_allowed_root(
+    configured_tree,
+    escape_kind,
+):
+    target = configured_tree.roots["ui_config"] / "target.json"
+    source = configured_tree.config_dir / "patch.json"
+    target_relative = "ui/ui_config/target.json"
+    source_relative = "resources/config/patch.json"
+
+    if escape_kind == "target":
+        outside = write_json(
+            configured_tree.target_dir.parent / "outside-target.json",
+            {"secret": "TOP_SECRET_OUTSIDE_TARGET"},
+        )
+        create_symlink_or_skip(outside, target)
+    else:
+        write_json(target, {"target": True})
+        outside = write_json(
+            configured_tree.package_dir / "outside-source.json",
+            {"secret": "TOP_SECRET_OUTSIDE_SOURCE"},
+        )
+        create_symlink_or_skip(outside, source)
+
+    if escape_kind == "target":
+        write_json(source, {"source": True})
+
+    outside_bytes = outside.read_bytes()
+    manager = configure_manifest_manager(
+        configured_tree,
+        [
+            (
+                "1.0",
+                {
+                    "config": [],
+                    "json_merge": [
+                        {"target": target_relative, "source": source_relative}
+                    ],
+                },
+            )
+        ],
+    )
+
+    assert manager.update_config_file() is False
+
+    assert outside.read_bytes() == outside_bytes
+    assert any(
+        f"{escape_kind}_path:symlink_escape" in message
+        for message in json_merge_messages(manager, "error")
+    )
+    assert "TOP_SECRET_OUTSIDE" not in "\n".join(
+        json_merge_messages(manager, "error")
+    )
+
+
+@pytest.mark.parametrize("inward_kind", ["target", "source"])
+def test_json_merge_rejects_lexical_paths_outside_roots_even_when_symlink_resolves_inward(
+    configured_tree,
+    inward_kind,
+):
+    target = write_json(
+        configured_tree.roots["ui_config"] / "target.json",
+        {"target": True},
+    )
+    source = write_json(configured_tree.config_dir / "patch.json", {"source": True})
+    target_relative = "ui/ui_config/target.json"
+    source_relative = "resources/config/patch.json"
+
+    if inward_kind == "target":
+        create_symlink_or_skip(
+            configured_tree.roots["ui_config"],
+            configured_tree.target_dir / "ui-config-link",
+            target_is_directory=True,
+        )
+        target_relative = "ui-config-link/target.json"
+    else:
+        create_symlink_or_skip(
+            configured_tree.config_dir,
+            configured_tree.package_dir / "resources" / "config-link",
+            target_is_directory=True,
+        )
+        source_relative = "resources/config-link/patch.json"
+
+    target_bytes = target.read_bytes()
+    source_bytes = source.read_bytes()
+    manager = configure_manifest_manager(
+        configured_tree,
+        [
+            (
+                "1.0",
+                {
+                    "config": [],
+                    "json_merge": [
+                        {"target": target_relative, "source": source_relative}
+                    ],
+                },
+            )
+        ],
+    )
+
+    assert manager.update_config_file() is False
+
+    assert target.read_bytes() == target_bytes
+    assert source.read_bytes() == source_bytes
+    assert any(
+        f"{inward_kind}_path:outside_allowed_root" in message
+        for message in json_merge_messages(manager, "error")
+    )
+
+
+def test_json_merge_rejects_target_source_same_file_alias(
+    configured_tree,
+):
+    target = write_json(
+        configured_tree.roots["ui_config"] / "target.json",
+        {"target": True},
+    )
+    source = configured_tree.config_dir / "patch.json"
+    try:
+        os.link(target, source)
+    except OSError as exc:
+        pytest.skip(f"hard links are unavailable: {exc}")
+    original_bytes = target.read_bytes()
+    manager = configure_manifest_manager(
+        configured_tree,
+        [
+            (
+                "1.0",
+                {
+                    "config": [],
+                    "json_merge": [
+                        {
+                            "target": "ui/ui_config/target.json",
+                            "source": "resources/config/patch.json",
+                        }
+                    ],
+                },
+            )
+        ],
+    )
+
+    assert manager.update_config_file() is False
+
+    assert target.read_bytes() == original_bytes
+    assert source.read_bytes() == original_bytes
+    assert any(
+        "target_source_alias" in message
+        for message in json_merge_messages(manager, "error")
+    )
+
+
+def test_json_merges_run_in_entry_and_version_order_with_one_backup_before_writes(
+    configured_tree,
+    monkeypatch,
+):
+    target_a = write_json(
+        configured_tree.roots["ui_config"] / "a.json",
+        {"shared": {"winner": "target"}, "target_only": 1},
+    )
+    target_b = write_json(
+        configured_tree.roots["ui_config"] / "b.json",
+        {"b_target": True},
+    )
+    source_a1 = write_json(
+        configured_tree.config_dir / "a1.json",
+        {"from_v1": 1, "shared": {"winner": "source", "extra": "not-added"}},
+    )
+    source_b1 = write_json(
+        configured_tree.config_dir / "b1.json",
+        {"b_source": True},
+    )
+    source_a2 = write_json(
+        configured_tree.config_dir / "a2.json",
+        {"from_v2": 2, "from_v1": 999},
+    )
+    source_bytes = {
+        path: path.read_bytes()
+        for path in (source_a1, source_b1, source_a2)
+    }
+    manager = configure_manifest_manager(
+        configured_tree,
+        [
+            (
+                "1.0",
+                {
+                    "config": [],
+                    "json_merge": [
+                        {
+                            "target": "ui/ui_config/a.json",
+                            "source": "resources/config/a1.json",
+                        },
+                        {
+                            "target": "ui/ui_config/b.json",
+                            "source": "resources/config/b1.json",
+                        },
+                    ],
+                },
+            ),
+            (
+                "2.0",
+                {
+                    "config": [],
+                    "json_merge": [
+                        {
+                            "target": "ui/ui_config/a.json",
+                            "source": "resources/config/a2.json",
+                        }
+                    ],
+                },
+            ),
+        ],
+    )
+    events = []
+    real_snapshot = manager._replace_with_staged_snapshot
+
+    def track_snapshot(source, destination):
+        if source == upgrade_config.UI_CONFIG_PATH:
+            events.append("backup")
+        return real_snapshot(source, destination)
+
+    def track_merge(target_path, source_path):
+        events.append(f"merge:{Path(target_path).name}:{Path(source_path).name}")
+        return real_merge_json_files_with_reason(target_path, source_path)
+
+    monkeypatch.setattr(manager, "_replace_with_staged_snapshot", track_snapshot)
+    monkeypatch.setattr(
+        upgrade_config,
+        "merge_json_files_with_reason",
+        track_merge,
+        raising=False,
+    )
+
+    assert manager.update_config_file() is True
+
+    assert events == [
+        "backup",
+        "merge:a.json:a1.json",
+        "merge:b.json:b1.json",
+        "merge:a.json:a2.json",
+    ]
+    assert json.loads(target_a.read_text(encoding="utf-8")) == {
+        "from_v2": 2,
+        "from_v1": 1,
+        "shared": {"winner": "target"},
+        "target_only": 1,
+    }
+    assert json.loads(target_b.read_text(encoding="utf-8")) == {
+        "b_source": True,
+        "b_target": True,
+    }
+    assert all(path.read_bytes() == content for path, content in source_bytes.items())
+    assert manager.ui_config_flag is False
+    assert configured_tree.backups["ui_config"].is_dir()
+
+
+def test_later_invalid_merge_can_restore_exact_pre_upgrade_target_bytes(
+    configured_tree,
+):
+    target = write_json(
+        configured_tree.roots["ui_config"] / "target.json",
+        {"target": "authoritative"},
+    )
+    source = write_json(
+        configured_tree.config_dir / "valid.json",
+        {"added": "first merge"},
+    )
+    invalid_source = configured_tree.config_dir / "invalid.json"
+    invalid_source.write_bytes(b'{"TOP_SECRET_INVALID_JSON": ')
+    original_target_bytes = target.read_bytes()
+    original_source_bytes = source.read_bytes()
+    original_invalid_source_bytes = invalid_source.read_bytes()
+    manager = configure_manifest_manager(
+        configured_tree,
+        [
+            (
+                "1.0",
+                {
+                    "config": [],
+                    "json_merge": [
+                        {
+                            "target": "ui/ui_config/target.json",
+                            "source": "resources/config/valid.json",
+                        }
+                    ],
+                },
+            ),
+            (
+                "2.0",
+                {
+                    "config": [],
+                    "json_merge": [
+                        {
+                            "target": "ui/ui_config/target.json",
+                            "source": "resources/config/invalid.json",
+                        }
+                    ],
+                },
+            ),
+        ],
+    )
+
+    assert manager.update_config_file() is False
+    assert target.read_bytes() != original_target_bytes
+    assert manager.ui_config_flag is False
+    assert configured_tree.backups["ui_config"].is_dir()
+
+    assert manager.restore_config() is True
+
+    assert target.read_bytes() == original_target_bytes
+    assert source.read_bytes() == original_source_bytes
+    assert invalid_source.read_bytes() == original_invalid_source_bytes
+    assert not configured_tree.backups["ui_config"].exists()
+    errors = "\n".join(json_merge_messages(manager, "error"))
+    assert "invalid_json" in errors
+    assert "TOP_SECRET_INVALID_JSON" not in errors
+
+
+def test_json_merge_backup_failure_prevents_helper_call_and_preserves_inputs(
+    configured_tree,
+    monkeypatch,
+):
+    target = write_json(
+        configured_tree.roots["ui_config"] / "target.json",
+        {"target": "TOP_SECRET_TARGET"},
+    )
+    source = write_json(
+        configured_tree.config_dir / "patch.json",
+        {"source": "TOP_SECRET_SOURCE"},
+    )
+    target_bytes = target.read_bytes()
+    source_bytes = source.read_bytes()
+    helper_calls = []
+    manager = configure_manifest_manager(
+        configured_tree,
+        [
+            (
+                "1.0",
+                {
+                    "config": [],
+                    "json_merge": [
+                        {
+                            "target": "ui/ui_config/target.json",
+                            "source": "resources/config/patch.json",
+                        }
+                    ],
+                },
+            )
+        ],
+    )
+
+    monkeypatch.setattr(manager, "backup_config_file", lambda paths: not paths)
+
+    def unexpected_merge(*args):
+        helper_calls.append(args)
+        return True, "ok"
+
+    monkeypatch.setattr(
+        upgrade_config,
+        "merge_json_files_with_reason",
+        unexpected_merge,
+        raising=False,
+    )
+
+    assert manager.update_config_file() is False
+
+    assert helper_calls == []
+    assert target.read_bytes() == target_bytes
+    assert source.read_bytes() == source_bytes
+    errors = "\n".join(json_merge_messages(manager, "error"))
+    assert "backup_failed" in errors
+    assert "TOP_SECRET_TARGET" not in errors
+    assert "TOP_SECRET_SOURCE" not in errors
+
+
+@pytest.mark.parametrize(
+    ("reason", "source_bytes"),
+    [
+        ("invalid_json", b'{"TOP_SECRET_INVALID_JSON": '),
+        ("non_object_root", b'["TOP_SECRET_NON_OBJECT"]'),
+        ("write_failed", b'{"TOP_SECRET_WRITE": true}'),
+    ],
+)
+def test_json_merge_helper_failure_reason_is_logged_without_json_contents(
+    configured_tree,
+    monkeypatch,
+    reason,
+    source_bytes,
+):
+    target = write_json(
+        configured_tree.roots["ui_config"] / "target.json",
+        {"target": "TOP_SECRET_TARGET"},
+    )
+    source = configured_tree.config_dir / "patch.json"
+    source.write_bytes(source_bytes)
+    target_bytes = target.read_bytes()
+    manager = configure_manifest_manager(
+        configured_tree,
+        [
+            (
+                "1.0",
+                {
+                    "config": [],
+                    "json_merge": [
+                        {
+                            "target": "ui/ui_config/target.json",
+                            "source": "resources/config/patch.json",
+                        }
+                    ],
+                },
+            )
+        ],
+    )
+
+    if reason == "write_failed":
+        monkeypatch.setattr(
+            upgrade_config,
+            "merge_json_files_with_reason",
+            lambda _target, _source: (False, "write_failed"),
+            raising=False,
+        )
+
+    assert manager.update_config_file() is False
+
+    assert target.read_bytes() == target_bytes
+    assert source.read_bytes() == source_bytes
+    errors = "\n".join(json_merge_messages(manager, "error"))
+    assert reason in errors
+    for sensitive_text in (
+        "TOP_SECRET_INVALID_JSON",
+        "TOP_SECRET_NON_OBJECT",
+        "TOP_SECRET_WRITE",
+        "TOP_SECRET_TARGET",
+    ):
+        assert sensitive_text not in errors
+
+
+def test_json_merge_start_and_success_logs_and_prints_only_relative_paths(
+    configured_tree,
+    capsys,
+):
+    target_relative = "ui/ui_config/target.json"
+    source_relative = "resources/config/patch.json"
+    write_json(configured_tree.roots["ui_config"] / "target.json", {"target": True})
+    write_json(configured_tree.config_dir / "patch.json", {"source": True})
+    manager = configure_manifest_manager(
+        configured_tree,
+        [
+            (
+                "1.0",
+                {
+                    "config": [],
+                    "json_merge": [
+                        {"target": target_relative, "source": source_relative}
+                    ],
+                },
+            )
+        ],
+    )
+
+    assert manager.update_config_file() is True
+
+    messages = json_merge_messages(manager, "info")
+    assert any(
+        "start" in message
+        and target_relative in message
+        and source_relative in message
+        for message in messages
+    )
+    assert any(
+        "success" in message
+        and target_relative in message
+        and source_relative in message
+        for message in messages
+    )
+    for message in messages:
+        assert str(configured_tree.target_dir) not in message
+        assert str(configured_tree.package_dir) not in message
+
+    printed_merge_lines = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("json_merge")
+    ]
+    assert any("start" in line for line in printed_merge_lines)
+    assert any("success" in line for line in printed_merge_lines)
+    for line in printed_merge_lines:
+        assert str(configured_tree.target_dir) not in line
+        assert str(configured_tree.package_dir) not in line

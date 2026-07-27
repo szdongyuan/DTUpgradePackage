@@ -3,6 +3,8 @@ import os
 import shutil
 import tempfile
 
+from base.json_merge import merge_json_files_with_reason
+
 from consts.program_config import BACKUP_DIR, DEFAULT_DIR, TARGET_VERSION, ALL_VERSIONS, BACKUP_UI_PIC_PATH, CONFIG_DIR
 from consts.program_config import AI_MODEL_CONFIG_PATH, SCANNER_BARCODE_CONFIG_PATH, UI_CONFIG_PATH, UI_PIC_PATH
 from consts.program_config import BACKUP_AI_MODEL_CONFIG_PATH, BACKUP_SCANNER_BARCODE_CONFIG_PATH, BACKUP_UI_CONFIG_PATH
@@ -289,6 +291,223 @@ class ConfigManager(object):
             print(f"配置文件备份已保存到 {backup_path}")
         return True
 
+    def _normalize_json_merge_entries(self, raw_entries):
+        if not isinstance(raw_entries, list):
+            return None, "section_must_be_list"
+
+        normalized_entries = []
+        for entry in raw_entries:
+            if not isinstance(entry, dict):
+                return None, "entry_must_be_object"
+            if set(entry) != {"target", "source"}:
+                return None, "entry_fields_invalid"
+
+            target = entry["target"]
+            if not isinstance(target, str) or not target.strip():
+                return None, "target_must_be_non_empty_string"
+
+            source = entry["source"]
+            if not isinstance(source, str) or not source.strip():
+                return None, "source_must_be_non_empty_string"
+
+            normalized_entries.append(
+                {
+                    "target": target,
+                    "source": source,
+                }
+            )
+
+        return normalized_entries, None
+
+    def _relative_json_merge_path_error(self, relative_path):
+        if "\x00" in relative_path:
+            return "invalid_path"
+        if os.path.isabs(relative_path) or os.path.splitdrive(relative_path)[0]:
+            return "absolute_path"
+
+        path_components = relative_path.replace("\\", "/").split("/")
+        if ".." in path_components:
+            return "parent_reference"
+        return None
+
+    def _path_is_contained(self, path, root):
+        try:
+            normalized_path = os.path.normcase(os.path.abspath(path))
+            normalized_root = os.path.normcase(os.path.abspath(root))
+            return (
+                os.path.commonpath([normalized_root, normalized_path])
+                == normalized_root
+            )
+        except (OSError, ValueError):
+            return False
+
+    def _resolve_json_merge_target(self, relative_path):
+        path_error = self._relative_json_merge_path_error(relative_path)
+        if path_error is not None:
+            return None, path_error
+
+        try:
+            lexical_path = os.path.abspath(
+                os.path.join(DEFAULT_TARGET_DIR, relative_path)
+            )
+            resolved_path = os.path.realpath(lexical_path)
+        except (OSError, ValueError):
+            return None, "invalid_path"
+
+        allowed_roots = (
+            UI_CONFIG_PATH,
+            AI_MODEL_CONFIG_PATH,
+            SCANNER_BARCODE_CONFIG_PATH,
+        )
+        for allowed_root in allowed_roots:
+            lexical_root = os.path.abspath(allowed_root)
+            if not self._path_is_contained(lexical_path, lexical_root):
+                continue
+
+            try:
+                resolved_root = os.path.realpath(lexical_root)
+            except (OSError, ValueError):
+                return None, "invalid_path"
+            if not self._path_is_contained(resolved_path, resolved_root):
+                return None, "symlink_escape"
+            try:
+                if not os.path.isfile(lexical_path):
+                    return None, "missing_file"
+            except OSError:
+                return None, "missing_file"
+            return lexical_path, None
+
+        return None, "outside_allowed_root"
+
+    def _resolve_json_merge_source(self, relative_path):
+        path_error = self._relative_json_merge_path_error(relative_path)
+        if path_error is not None:
+            return None, path_error
+
+        try:
+            lexical_path = os.path.abspath(os.path.join(DEFAULT_DIR, relative_path))
+            lexical_root = os.path.abspath(CONFIG_DIR)
+            resolved_path = os.path.realpath(lexical_path)
+            resolved_root = os.path.realpath(lexical_root)
+        except (OSError, ValueError):
+            return None, "invalid_path"
+
+        if not self._path_is_contained(lexical_path, lexical_root):
+            return None, "outside_allowed_root"
+        if not self._path_is_contained(resolved_path, resolved_root):
+            return None, "symlink_escape"
+        try:
+            if not os.path.isfile(lexical_path):
+                return None, "missing_file"
+        except OSError:
+            return None, "missing_file"
+        return lexical_path, None
+
+    def _json_merge_manifest_path_key(self, relative_path):
+        if not isinstance(relative_path, str) or not relative_path.strip():
+            return None
+        if self._relative_json_merge_path_error(relative_path) is not None:
+            return None
+        try:
+            return os.path.normcase(
+                os.path.normpath(
+                    os.path.abspath(
+                        os.path.join(DEFAULT_TARGET_DIR, relative_path)
+                    )
+                )
+            )
+        except (OSError, ValueError):
+            return None
+
+    def _report_json_merge(self, level, message):
+        print(message)
+        getattr(self.logger, level)(message)
+
+    def _apply_json_merges(self, entries, config_entries):
+        config_target_keys = {
+            target_key
+            for target_key in (
+                self._json_merge_manifest_path_key(config_entry)
+                for config_entry in config_entries
+            )
+            if target_key is not None
+        }
+        for entry in entries:
+            target_key = self._json_merge_manifest_path_key(entry["target"])
+            if target_key is not None and target_key in config_target_keys:
+                self._report_json_merge(
+                    "error",
+                    "json_merge error: target_conflicts_with_config",
+                )
+                return False
+
+        for entry in entries:
+            target_relative_path = entry["target"]
+            source_relative_path = entry["source"]
+
+            target_path, target_error = self._resolve_json_merge_target(
+                target_relative_path
+            )
+            if target_error is not None:
+                self._report_json_merge(
+                    "error",
+                    f"json_merge error: target_path:{target_error}",
+                )
+                return False
+
+            source_path, source_error = self._resolve_json_merge_source(
+                source_relative_path
+            )
+            if source_error is not None:
+                self._report_json_merge(
+                    "error",
+                    f"json_merge error: source_path:{source_error}",
+                )
+                return False
+
+            try:
+                paths_are_aliases = os.path.samefile(target_path, source_path)
+            except OSError:
+                self._report_json_merge(
+                    "error",
+                    "json_merge error: target_source_alias_check_failed",
+                )
+                return False
+            if paths_are_aliases:
+                self._report_json_merge(
+                    "error",
+                    "json_merge error: target_source_alias",
+                )
+                return False
+
+            self._report_json_merge(
+                "info",
+                "json_merge start: "
+                f"target={target_relative_path} source={source_relative_path}",
+            )
+            if not self.backup_config_file([target_relative_path]):
+                self._report_json_merge(
+                    "error",
+                    "json_merge error: backup_failed",
+                )
+                return False
+
+            merged, reason = merge_json_files_with_reason(target_path, source_path)
+            if not merged:
+                self._report_json_merge(
+                    "error",
+                    f"json_merge error: merge_failed:{reason}",
+                )
+                return False
+
+            self._report_json_merge(
+                "info",
+                "json_merge success: "
+                f"target={target_relative_path} source={source_relative_path}",
+            )
+
+        return True
+
     def update_config_file(self):
         print("正在更新配置文件...")
         try:
@@ -313,6 +532,23 @@ class ConfigManager(object):
                 else:
                     print("配置文件备份错误")
                     self.logger.error("配置文件备份错误")
+                    return False
+
+                json_merge_entries, schema_error = (
+                    self._normalize_json_merge_entries(
+                        data.get("json_merge", [])
+                    )
+                )
+                if schema_error is not None:
+                    self._report_json_merge(
+                        "error",
+                        f"json_merge schema error: {schema_error}",
+                    )
+                    return False
+                if not self._apply_json_merges(
+                    json_merge_entries,
+                    config_file_source_path,
+                ):
                     return False
             return True
         except Exception as e:
