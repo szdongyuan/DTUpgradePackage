@@ -6,6 +6,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
 
 from base.json_merge import merge_json_files_with_reason
 
@@ -469,6 +470,72 @@ class ConfigManager(object):
         except (OSError, TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _atomic_move_no_replace(source_path, destination_path):
+        if os.name == "nt":
+            os.rename(source_path, destination_path)
+            return
+
+        if sys.platform.startswith("linux"):
+            import ctypes
+
+            libc = ctypes.CDLL(None, use_errno=True)
+            renameat2 = getattr(libc, "renameat2", None)
+            if renameat2 is None:
+                raise OSError("atomic no-replace rename is unavailable")
+            renameat2.argtypes = (
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            )
+            renameat2.restype = ctypes.c_int
+            result = renameat2(
+                -100,
+                os.fsencode(source_path),
+                -100,
+                os.fsencode(destination_path),
+                1,
+            )
+            if result != 0:
+                error_number = ctypes.get_errno()
+                raise OSError(
+                    error_number,
+                    os.strerror(error_number),
+                    destination_path,
+                )
+            return
+
+        if sys.platform == "darwin":
+            import ctypes
+
+            libc = ctypes.CDLL(None, use_errno=True)
+            renamex_np = getattr(libc, "renamex_np", None)
+            if renamex_np is None:
+                raise OSError("atomic no-replace rename is unavailable")
+            renamex_np.argtypes = (
+                ctypes.c_char_p,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            )
+            renamex_np.restype = ctypes.c_int
+            result = renamex_np(
+                os.fsencode(source_path),
+                os.fsencode(destination_path),
+                0x00000004,
+            )
+            if result != 0:
+                error_number = ctypes.get_errno()
+                raise OSError(
+                    error_number,
+                    os.strerror(error_number),
+                    destination_path,
+                )
+            return
+
+        raise OSError("atomic no-replace rename is unavailable")
+
     def _recover_old_snapshot_destination(
         self,
         old_path,
@@ -491,7 +558,10 @@ class ConfigManager(object):
             return old_path, True, None, True
 
         try:
-            os.replace(old_path, destination_path)
+            self._atomic_move_no_replace(
+                old_path,
+                destination_path,
+            )
         except BaseException as recovery_error:
             old_exists = self._snapshot_path_lexists(old_path)
             destination_exists = self._snapshot_path_lexists(
@@ -526,6 +596,7 @@ class ConfigManager(object):
         preserve_old_path = False
         preserve_staging_path = False
         source_aliases = ()
+        initial_destination_identity = None
 
         if source_anchor is None and destination_anchor is None:
             if (
@@ -577,6 +648,20 @@ class ConfigManager(object):
             and not self._snapshot_path_is_safe(destination_path)
         ):
             return False
+        if destination_exists:
+            try:
+                initial_destination_identity = (
+                    self._ordinary_config_stat_signature(
+                        os.lstat(destination_path)
+                    )
+                )
+            except (OSError, TypeError, ValueError) as e:
+                self._report_best_effort(
+                    "error",
+                    f"快照目标身份检查失败 {destination_path}: {e}",
+                    include_print=False,
+                )
+                return False
 
         try:
             os.makedirs(parent_path, exist_ok=True)
@@ -656,15 +741,59 @@ class ConfigManager(object):
             ):
                 return False
 
-            if os.path.exists(destination_path):
+            if destination_exists:
                 old_path = tempfile.mkdtemp(
                     prefix=f".{destination_name}.old-",
                     dir=parent_path,
                 )
                 os.rmdir(old_path)
-                os.replace(destination_path, old_path)
+                try:
+                    current_destination_identity = (
+                        self._ordinary_config_stat_signature(
+                            os.lstat(destination_path)
+                        )
+                    )
+                except (OSError, TypeError, ValueError):
+                    current_destination_identity = None
+                if (
+                    current_destination_identity
+                    != initial_destination_identity
+                ):
+                    raise OSError(
+                        "snapshot destination identity changed before move"
+                    )
+                self._atomic_move_no_replace(
+                    destination_path,
+                    old_path,
+                )
+                try:
+                    moved_destination_identity = (
+                        self._ordinary_config_stat_signature(
+                            os.lstat(old_path)
+                        )
+                    )
+                except (OSError, TypeError, ValueError):
+                    moved_destination_identity = None
+                if (
+                    moved_destination_identity
+                    != initial_destination_identity
+                ):
+                    try:
+                        self._atomic_move_no_replace(
+                            old_path,
+                            destination_path,
+                        )
+                        old_path = None
+                    except BaseException:
+                        preserve_old_path = True
+                    raise OSError(
+                        "snapshot destination identity changed during move"
+                    )
 
-            os.replace(staging_path, destination_path)
+            self._atomic_move_no_replace(
+                staging_path,
+                destination_path,
+            )
             staging_path = None
 
             if old_path is not None:
@@ -801,19 +930,141 @@ class ConfigManager(object):
         finally:
             os.close(file_descriptor)
 
+    @staticmethod
+    @contextmanager
+    def _ordinary_config_bound_directory(path, expected_stat):
+        if (
+            not stat.S_ISDIR(expected_stat.st_mode)
+            or ConfigManager._snapshot_entry_is_link_or_reparse(
+                expected_stat
+            )
+        ):
+            raise OSError("directory binding rejected unsafe entry")
+
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            class ByHandleFileInformation(ctypes.Structure):
+                _fields_ = (
+                    ("file_attributes", wintypes.DWORD),
+                    ("creation_time", wintypes.FILETIME),
+                    ("last_access_time", wintypes.FILETIME),
+                    ("last_write_time", wintypes.FILETIME),
+                    ("volume_serial_number", wintypes.DWORD),
+                    ("file_size_high", wintypes.DWORD),
+                    ("file_size_low", wintypes.DWORD),
+                    ("number_of_links", wintypes.DWORD),
+                    ("file_index_high", wintypes.DWORD),
+                    ("file_index_low", wintypes.DWORD),
+                )
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            create_file = kernel32.CreateFileW
+            create_file.argtypes = (
+                wintypes.LPCWSTR,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                wintypes.LPVOID,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                wintypes.HANDLE,
+            )
+            create_file.restype = wintypes.HANDLE
+            get_file_information = (
+                kernel32.GetFileInformationByHandle
+            )
+            get_file_information.argtypes = (
+                wintypes.HANDLE,
+                ctypes.POINTER(ByHandleFileInformation),
+            )
+            get_file_information.restype = wintypes.BOOL
+            close_handle = kernel32.CloseHandle
+            close_handle.argtypes = (wintypes.HANDLE,)
+            close_handle.restype = wintypes.BOOL
+
+            handle = create_file(
+                path,
+                0x00000001,
+                0x00000001 | 0x00000002,
+                None,
+                3,
+                0x00200000 | 0x02000000,
+                None,
+            )
+            if handle == ctypes.c_void_p(-1).value:
+                raise ctypes.WinError(ctypes.get_last_error())
+            try:
+                information = ByHandleFileInformation()
+                if not get_file_information(
+                    handle,
+                    ctypes.byref(information),
+                ):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                file_attributes = information.file_attributes
+                opened_inode = (
+                    information.file_index_high << 32
+                ) | information.file_index_low
+                if (
+                    not file_attributes & 0x00000010
+                    or file_attributes & 0x00000400
+                    or opened_inode != expected_stat.st_ino
+                ):
+                    raise OSError(
+                        "directory handle identity or type changed"
+                    )
+                current_stat = os.lstat(path)
+                if (
+                    ConfigManager._ordinary_config_stat_signature(
+                        current_stat
+                    )
+                    != ConfigManager._ordinary_config_stat_signature(
+                        expected_stat
+                    )
+                ):
+                    raise OSError(
+                        "directory path identity changed after binding"
+                    )
+                yield path
+            finally:
+                close_handle(handle)
+            return
+
+        flags = os.O_RDONLY
+        flags |= getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        file_descriptor = os.open(path, flags)
+        try:
+            opened_stat = os.fstat(file_descriptor)
+            expected_identity = (
+                expected_stat.st_dev,
+                expected_stat.st_ino,
+                stat.S_IFMT(expected_stat.st_mode),
+            )
+            opened_identity = (
+                opened_stat.st_dev,
+                opened_stat.st_ino,
+                stat.S_IFMT(opened_stat.st_mode),
+            )
+            if opened_identity != expected_identity:
+                raise OSError("directory identity changed while opening")
+            yield file_descriptor
+        finally:
+            os.close(file_descriptor)
+
     def _ordinary_config_manifest(self, root_path, reject_reparse):
-        pending = [(os.path.abspath(root_path), os.curdir)]
+        absolute_root = os.path.abspath(root_path)
         entries = []
         root_kind = None
 
-        while pending:
-            current_path, relative_path = pending.pop()
+        def inspect_entry(current_path, relative_path):
+            nonlocal root_kind
             try:
                 entry_stat = os.lstat(current_path)
             except FileNotFoundError:
-                return None, "missing_path"
+                return "missing_path"
             except (OSError, TypeError, ValueError):
-                return None, "identity_check_failed"
+                return "identity_check_failed"
 
             reparse_kind, reparse_error = (
                 self._ordinary_config_reparse_kind(
@@ -822,14 +1073,14 @@ class ConfigManager(object):
                 )
             )
             if reparse_error is not None:
-                return None, reparse_error
+                return reparse_error
             if reparse_kind is not None:
                 if reject_reparse:
-                    return None, "unsupported_reparse"
+                    return "unsupported_reparse"
                 try:
                     link_value = os.readlink(current_path)
                 except (OSError, TypeError, ValueError):
-                    return None, "identity_check_failed"
+                    return "identity_check_failed"
                 entry_kind = reparse_kind
                 digest = link_value
             elif stat.S_ISREG(entry_stat.st_mode):
@@ -840,12 +1091,12 @@ class ConfigManager(object):
                         entry_stat,
                     )
                 except (OSError, TypeError, ValueError):
-                    return None, "identity_check_failed"
+                    return "identity_check_failed"
             elif stat.S_ISDIR(entry_stat.st_mode):
                 entry_kind = "directory"
                 digest = None
             else:
-                return None, "unsupported_type"
+                return "unsupported_type"
 
             if relative_path == os.curdir:
                 root_kind = entry_kind
@@ -860,26 +1111,40 @@ class ConfigManager(object):
             )
 
             if entry_kind != "directory":
-                continue
+                return None
             try:
-                with os.scandir(current_path) as directory_entries:
-                    child_names = sorted(
-                        entry.name for entry in directory_entries
-                    )
-            except (OSError, ValueError):
-                return None, "identity_check_failed"
-            for child_name in reversed(child_names):
-                child_relative_path = (
-                    child_name
-                    if relative_path == os.curdir
-                    else os.path.join(relative_path, child_name)
-                )
-                pending.append(
-                    (
-                        os.path.join(current_path, child_name),
-                        child_relative_path,
-                    )
-                )
+                with self._ordinary_config_bound_directory(
+                    current_path,
+                    entry_stat,
+                ) as enumeration_target:
+                    with os.scandir(
+                        enumeration_target
+                    ) as directory_entries:
+                        child_names = sorted(
+                            entry.name for entry in directory_entries
+                        )
+                    for child_name in child_names:
+                        child_relative_path = (
+                            child_name
+                            if relative_path == os.curdir
+                            else os.path.join(
+                                relative_path,
+                                child_name,
+                            )
+                        )
+                        child_error = inspect_entry(
+                            os.path.join(current_path, child_name),
+                            child_relative_path,
+                        )
+                        if child_error is not None:
+                            return child_error
+            except (OSError, TypeError, ValueError):
+                return "identity_check_failed"
+            return None
+
+        manifest_error = inspect_entry(absolute_root, os.curdir)
+        if manifest_error is not None:
+            return None, manifest_error
 
         entries.sort(key=lambda entry: entry[0])
         return (root_kind, tuple(entries)), None
@@ -1358,7 +1623,10 @@ class ConfigManager(object):
                     raise OSError(
                         "destination changed before recovery transition"
                     )
-                os.replace(destination_path, old_path)
+                self._atomic_move_no_replace(
+                    destination_path,
+                    old_path,
+                )
                 if not self._ordinary_config_binding_matches(
                     destination_path,
                     initial_destination_binding,
@@ -1378,6 +1646,14 @@ class ConfigManager(object):
                     )
                     != initial_destination_binding[1]
                 ):
+                    try:
+                        self._atomic_move_no_replace(
+                            old_path,
+                            destination_path,
+                        )
+                        old_path = None
+                    except BaseException:
+                        preserve_old_path = True
                     raise OSError(
                         "old destination identity changed during transition"
                     )
@@ -1390,7 +1666,10 @@ class ConfigManager(object):
                 raise OSError(
                     "destination changed before staging transition"
                 )
-            os.replace(staging_path, destination_path)
+            self._atomic_move_no_replace(
+                staging_path,
+                destination_path,
+            )
             staging_path = None
             if not self._ordinary_config_binding_matches(
                 destination_path,
@@ -1460,7 +1739,7 @@ class ConfigManager(object):
                                     f".{destination_name}.staging-",
                                 )
                             )
-                        os.replace(
+                        self._atomic_move_no_replace(
                             destination_path,
                             replacement_artifact,
                         )
@@ -1497,7 +1776,10 @@ class ConfigManager(object):
                         raise OSError(
                             "destination changed before recovery"
                         )
-                    os.replace(old_path, destination_path)
+                    self._atomic_move_no_replace(
+                        old_path,
+                        destination_path,
+                    )
                     if not self._ordinary_config_binding_matches(
                         destination_path,
                         initial_destination_binding,
@@ -1545,7 +1827,7 @@ class ConfigManager(object):
                                 f".{destination_name}.staging-",
                             )
                         )
-                    os.replace(
+                    self._atomic_move_no_replace(
                         destination_path,
                         replacement_artifact,
                     )
@@ -2229,7 +2511,7 @@ class ConfigManager(object):
         return True
 
     def update_config_file(self):
-        print("正在更新配置文件...")
+        self._report_best_effort("info", "正在更新配置文件...")
         try:
             for upgrade_version in self.upgrade_version_list:
                 target_version_path = DEFAULT_DIR + f"resources/version_{upgrade_version}.yml"
@@ -2289,8 +2571,10 @@ class ConfigManager(object):
                         new_config_file_path,
                         target_file_path,
                     ) in config_updates:
-                        print(f"更新配置文件: {config_file_path}")
-                        self.logger.info(f"更新配置文件: {config_file_path}")
+                        self._report_best_effort(
+                            "info",
+                            f"更新配置文件: {config_file_path}",
+                        )
                         (
                             new_config_file_path,
                             source_error,
@@ -2306,22 +2590,30 @@ class ConfigManager(object):
                             new_config_file_path,
                             target_file_path,
                         ):
-                            print("配置文件升级失败")
-                            self.logger.error("配置文件升级失败")
+                            self._report_best_effort(
+                                "error",
+                                "配置文件升级失败",
+                            )
                             return False
-                        print("配置文件升级成功")
-                        self.logger.info("配置文件升级成功")
+                        self._report_best_effort(
+                            "info",
+                            "配置文件升级成功",
+                        )
                 else:
-                    print("配置文件备份错误")
-                    self.logger.error("配置文件备份错误")
+                    self._report_best_effort(
+                        "error",
+                        "配置文件备份错误",
+                    )
                     return False
 
                 if not self._apply_json_merges(json_merge_entries):
                     return False
             return True
         except Exception as e:
-            print(f"配置文件升级失败: {e}")
-            self.logger.error(f"配置文件升级失败: {e}")
+            self._report_best_effort(
+                "error",
+                f"配置文件升级失败: {e}",
+            )
             return False
 
     def restore_config(self):

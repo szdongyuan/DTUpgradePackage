@@ -1,3 +1,4 @@
+import builtins
 import json
 import os
 import subprocess
@@ -195,6 +196,42 @@ def track_config_update_mutations(manager, monkeypatch):
     return mutation_calls
 
 
+def install_reporting_probe(
+    manager,
+    monkeypatch,
+    reporter,
+    exception_type,
+    marker,
+):
+    if reporter == "print":
+        real_print = builtins.print
+
+        def probe_print(*args, **kwargs):
+            if args and marker in str(args[0]):
+                raise exception_type("injected print failure")
+            return real_print(*args, **kwargs)
+
+        monkeypatch.setattr(builtins, "print", probe_print)
+        return
+
+    class ProbingLogger(DummyLogger):
+        def _probe(self, level, message):
+            if marker in message:
+                raise exception_type("injected logger failure")
+            self.messages.append((level, message))
+
+        def info(self, message):
+            self._probe("info", message)
+
+        def warning(self, message):
+            self._probe("warning", message)
+
+        def error(self, message):
+            self._probe("error", message)
+
+    manager.logger = ProbingLogger()
+
+
 def test_successful_managed_root_backup_changes_only_matching_flag(configured_tree):
     manager = make_manager()
 
@@ -241,7 +278,7 @@ def test_backup_first_swap_move_failure_preserves_existing_data_and_flag(
     backup_root.joinpath("stale.txt").write_bytes(b"recovery data")
     backup_root.joinpath("nested", "retained.bin").write_bytes(b"\x00\xffrecovery")
     expected_backup = snapshot_tree(backup_root)
-    real_replace = os.replace
+    real_rename = os.rename
 
     def fail_existing_destination_move(source, destination):
         if (
@@ -249,9 +286,9 @@ def test_backup_first_swap_move_failure_preserves_existing_data_and_flag(
             and Path(destination).name.startswith(f".{backup_root.name}.old-")
         ):
             raise OSError("injected existing destination move failure")
-        return real_replace(source, destination)
+        return real_rename(source, destination)
 
-    monkeypatch.setattr(upgrade_config.os, "replace", fail_existing_destination_move)
+    monkeypatch.setattr(upgrade_config.os, "rename", fail_existing_destination_move)
 
     assert manager.backup_config_file(["ui/ui_config/settings.json"]) is False
 
@@ -416,7 +453,7 @@ def test_restore_swap_failure_rolls_back_live_target_and_retains_backup(
     backup_root.joinpath("recovery-only.bin").write_bytes(b"\xffbackup")
     expected_target = snapshot_tree(target_root)
     expected_backup = snapshot_tree(backup_root)
-    real_replace = os.replace
+    real_rename = os.rename
     replace_calls = []
 
     def fail_staging_install(source, destination):
@@ -426,9 +463,9 @@ def test_restore_swap_failure_rolls_back_live_target_and_retains_backup(
             and Path(source).name.startswith(f".{target_root.name}.staging-")
         ):
             raise OSError("injected staging install failure")
-        return real_replace(source, destination)
+        return real_rename(source, destination)
 
-    monkeypatch.setattr(upgrade_config.os, "replace", fail_staging_install)
+    monkeypatch.setattr(upgrade_config.os, "rename", fail_staging_install)
 
     assert manager.restore_config() is False
 
@@ -465,7 +502,7 @@ def test_staged_snapshot_swap_interruption_preserves_exact_recovery_data(
     destination.joinpath("nested", "state.txt").write_bytes(b"live state")
     expected_source = snapshot_tree(source)
     expected_destination = snapshot_tree(destination)
-    real_replace = os.replace
+    real_rename = os.rename
     staging_install_failed = False
 
     def interrupt_replace(source_path, destination_path):
@@ -505,7 +542,7 @@ def test_staged_snapshot_swap_interruption_preserves_exact_recovery_data(
         ):
             raise interruption_type("injected rollback interruption")
 
-        result = real_replace(source_path, destination_path)
+        result = real_rename(source_path, destination_path)
         if (
             interruption_transition == "after_destination_move"
             and is_destination_move
@@ -525,7 +562,7 @@ def test_staged_snapshot_swap_interruption_preserves_exact_recovery_data(
 
     monkeypatch.setattr(
         upgrade_config.os,
-        "replace",
+        "rename",
         interrupt_replace,
     )
 
@@ -567,7 +604,7 @@ def test_staged_snapshot_indeterminate_recovery_preserves_all_artifacts(
     destination.mkdir()
     destination.joinpath("target.bin").write_bytes(b"original snapshot")
     manager = make_manager()
-    real_replace = os.replace
+    real_rename = os.rename
     real_lexists = manager._snapshot_path_lexists
     install_failed = {"value": False}
 
@@ -580,7 +617,7 @@ def test_staged_snapshot_indeterminate_recovery_preserves_all_artifacts(
         ):
             install_failed["value"] = True
             raise OSError("injected snapshot install failure")
-        return real_replace(source_path, destination_path)
+        return real_rename(source_path, destination_path)
 
     def indeterminate_old(path):
         if (
@@ -593,7 +630,7 @@ def test_staged_snapshot_indeterminate_recovery_preserves_all_artifacts(
             return None
         return real_lexists(path)
 
-    monkeypatch.setattr(upgrade_config.os, "replace", fail_install)
+    monkeypatch.setattr(upgrade_config.os, "rename", fail_install)
     monkeypatch.setattr(
         manager,
         "_snapshot_path_lexists",
@@ -622,6 +659,240 @@ def test_staged_snapshot_indeterminate_recovery_preserves_all_artifacts(
     artifact_trees = [snapshot_tree(path) for path in artifacts]
     assert {"target.bin": b"original snapshot"} in artifact_trees
     assert {"source.bin": b"replacement snapshot"} in artifact_trees
+
+
+def test_staged_snapshot_absent_destination_install_is_atomic_no_clobber(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    source.joinpath("source.bin").write_bytes(b"replacement snapshot")
+    destination = tmp_path / "destination"
+    manager = make_manager()
+    real_rename = os.rename
+    race_triggered = {"value": False}
+
+    def create_destination_immediately_before_install(
+        source_path,
+        destination_path,
+    ):
+        if (
+            Path(destination_path) == destination
+            and Path(source_path).name.startswith(
+                f".{destination.name}.staging-"
+            )
+            and not race_triggered["value"]
+        ):
+            destination.mkdir()
+            destination.joinpath("concurrent.bin").write_bytes(
+                b"concurrent destination"
+            )
+            race_triggered["value"] = True
+        return real_rename(source_path, destination_path)
+
+    monkeypatch.setattr(
+        upgrade_config.os,
+        "rename",
+        create_destination_immediately_before_install,
+    )
+
+    assert manager._replace_with_staged_snapshot(
+        str(source),
+        str(destination),
+        source_anchor=str(tmp_path),
+        destination_anchor=str(tmp_path),
+    ) is False
+    assert race_triggered["value"] is True
+    assert snapshot_tree(destination) == {
+        "concurrent.bin": b"concurrent destination"
+    }
+
+
+def test_staged_snapshot_destination_move_verifies_exact_moved_identity(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    source.joinpath("source.bin").write_bytes(b"replacement snapshot")
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    destination.joinpath("original.bin").write_bytes(
+        b"original recovery data"
+    )
+    displaced_original = tmp_path / "displaced-original"
+    manager = make_manager()
+    real_rename = os.rename
+    race_triggered = {"value": False}
+
+    def replace_destination_immediately_before_move(
+        source_path,
+        destination_path,
+    ):
+        if (
+            Path(source_path) == destination
+            and Path(destination_path).name.startswith(
+                f".{destination.name}.old-"
+            )
+            and not race_triggered["value"]
+        ):
+            real_rename(destination, displaced_original)
+            destination.mkdir()
+            destination.joinpath("concurrent.bin").write_bytes(
+                b"concurrent replacement"
+            )
+            race_triggered["value"] = True
+        return real_rename(source_path, destination_path)
+
+    monkeypatch.setattr(
+        upgrade_config.os,
+        "rename",
+        replace_destination_immediately_before_move,
+    )
+
+    assert manager._replace_with_staged_snapshot(
+        str(source),
+        str(destination),
+        source_anchor=str(tmp_path),
+        destination_anchor=str(tmp_path),
+    ) is False
+    assert race_triggered["value"] is True
+    assert snapshot_tree(destination) == {
+        "concurrent.bin": b"concurrent replacement"
+    }
+    assert snapshot_tree(displaced_original) == {
+        "original.bin": b"original recovery data"
+    }
+
+
+def test_staged_snapshot_existing_destination_install_is_atomic_no_clobber(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    source.joinpath("source.bin").write_bytes(b"replacement snapshot")
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    destination.joinpath("original.bin").write_bytes(
+        b"original recovery data"
+    )
+    manager = make_manager()
+    real_rename = os.rename
+    race_triggered = {"value": False}
+
+    def create_destination_immediately_before_install(
+        source_path,
+        destination_path,
+    ):
+        if (
+            Path(destination_path) == destination
+            and Path(source_path).name.startswith(
+                f".{destination.name}.staging-"
+            )
+            and not race_triggered["value"]
+        ):
+            destination.mkdir()
+            destination.joinpath("concurrent.bin").write_bytes(
+                b"concurrent destination"
+            )
+            race_triggered["value"] = True
+        return real_rename(source_path, destination_path)
+
+    monkeypatch.setattr(
+        upgrade_config.os,
+        "rename",
+        create_destination_immediately_before_install,
+    )
+
+    assert manager._replace_with_staged_snapshot(
+        str(source),
+        str(destination),
+        source_anchor=str(tmp_path),
+        destination_anchor=str(tmp_path),
+    ) is False
+    assert race_triggered["value"] is True
+    assert snapshot_tree(destination) == {
+        "concurrent.bin": b"concurrent destination"
+    }
+    recovery_artifacts = [
+        path
+        for path in tmp_path.iterdir()
+        if path.name.startswith(f".{destination.name}.old-")
+    ]
+    assert len(recovery_artifacts) == 1
+    assert snapshot_tree(recovery_artifacts[0]) == {
+        "original.bin": b"original recovery data"
+    }
+
+
+def test_staged_snapshot_recovery_is_atomic_no_clobber(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    source.joinpath("source.bin").write_bytes(b"replacement snapshot")
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    destination.joinpath("original.bin").write_bytes(
+        b"original recovery data"
+    )
+    manager = make_manager()
+    real_rename = os.rename
+    race_triggered = {"value": False}
+
+    def fail_install_then_create_destination_before_recovery(
+        source_path,
+        destination_path,
+    ):
+        source_path = Path(source_path)
+        destination_path = Path(destination_path)
+        if (
+            destination_path == destination
+            and source_path.name.startswith(
+                f".{destination.name}.staging-"
+            )
+        ):
+            raise OSError("injected staging install failure")
+        if (
+            destination_path == destination
+            and source_path.name.startswith(f".{destination.name}.old-")
+            and not race_triggered["value"]
+        ):
+            destination.mkdir()
+            destination.joinpath("concurrent.bin").write_bytes(
+                b"concurrent destination"
+            )
+            race_triggered["value"] = True
+        return real_rename(source_path, destination_path)
+
+    monkeypatch.setattr(
+        upgrade_config.os,
+        "rename",
+        fail_install_then_create_destination_before_recovery,
+    )
+
+    assert manager._replace_with_staged_snapshot(
+        str(source),
+        str(destination),
+        source_anchor=str(tmp_path),
+        destination_anchor=str(tmp_path),
+    ) is False
+    assert race_triggered["value"] is True
+    assert snapshot_tree(destination) == {
+        "concurrent.bin": b"concurrent destination"
+    }
+    recovery_artifacts = [
+        path
+        for path in tmp_path.iterdir()
+        if path.name.startswith(f".{destination.name}.old-")
+    ]
+    assert len(recovery_artifacts) == 1
+    assert snapshot_tree(recovery_artifacts[0]) == {
+        "original.bin": b"original recovery data"
+    }
 
 
 def test_restore_failure_attempts_all_selected_roots_and_retains_backups(
@@ -1125,7 +1396,7 @@ def test_ordinary_config_swap_failure_stops_before_merges_and_keeps_target(
     )
     original_target_bytes = target.read_bytes()
     original_source_bytes = source.read_bytes()
-    real_replace = os.replace
+    real_rename = os.rename
     real_apply_json_merges = manager._apply_json_merges
     phase_calls = []
     helper_calls = []
@@ -1138,7 +1409,7 @@ def test_ordinary_config_swap_failure_stops_before_merges_and_keeps_target(
             )
         ):
             raise OSError("injected ordinary target swap failure")
-        return real_replace(source_path, destination_path)
+        return real_rename(source_path, destination_path)
 
     def track_phase(entries):
         phase_calls.append(entries)
@@ -1148,7 +1419,7 @@ def test_ordinary_config_swap_failure_stops_before_merges_and_keeps_target(
         helper_calls.append(args)
         return True, "ok"
 
-    monkeypatch.setattr(upgrade_config.os, "replace", fail_target_swap)
+    monkeypatch.setattr(upgrade_config.os, "rename", fail_target_swap)
     monkeypatch.setattr(manager, "_apply_json_merges", track_phase)
     monkeypatch.setattr(
         upgrade_config,
@@ -1352,11 +1623,11 @@ def test_ordinary_config_swap_interruption_reraises_after_restoring_target(
             )
         ],
     )
-    real_replace = os.replace
+    real_rename = os.rename
     interruption_injected = {"value": False}
 
     def interrupt_after_staging_install(source_path, destination_path):
-        result = real_replace(source_path, destination_path)
+        result = real_rename(source_path, destination_path)
         if (
             Path(destination_path) == target
             and Path(source_path).name.startswith(
@@ -1372,7 +1643,7 @@ def test_ordinary_config_swap_interruption_reraises_after_restoring_target(
 
     monkeypatch.setattr(
         upgrade_config.os,
-        "replace",
+        "rename",
         interrupt_after_staging_install,
     )
 
@@ -1408,7 +1679,7 @@ def test_ordinary_config_failed_restoration_keeps_explicit_recovery_artifact(
             )
         ],
     )
-    real_replace = os.replace
+    real_rename = os.rename
 
     def fail_install_and_restoration(source_path, destination_path):
         source_path = Path(source_path)
@@ -1423,11 +1694,11 @@ def test_ordinary_config_failed_restoration_keeps_explicit_recovery_artifact(
             and source_path.name.startswith(f".{target.name}.old-")
         ):
             raise OSError("injected original restoration failure")
-        return real_replace(source_path, destination_path)
+        return real_rename(source_path, destination_path)
 
     monkeypatch.setattr(
         upgrade_config.os,
-        "replace",
+        "rename",
         fail_install_and_restoration,
     )
 
@@ -1473,6 +1744,109 @@ def test_ordinary_config_logger_interruption_is_best_effort_during_copy_failure(
     assert swap_artifacts(target) == []
 
 
+@pytest.mark.parametrize("reporter", ["print", "logger"])
+@pytest.mark.parametrize(
+    "exception_type",
+    [RuntimeError, KeyboardInterrupt],
+)
+@pytest.mark.parametrize(
+    ("report_phase", "marker"),
+    [
+        ("before_replacement", "更新配置文件:"),
+        ("after_replacement", "配置文件升级成功"),
+        ("replacement_failure", "配置文件升级失败"),
+    ],
+)
+def test_ordinary_update_reporting_is_best_effort_at_transaction_boundaries(
+    configured_tree,
+    monkeypatch,
+    reporter,
+    exception_type,
+    report_phase,
+    marker,
+):
+    config_relative = "ui/ui_config/reporting-boundary.bin"
+    target = configured_tree.roots["ui_config"] / "reporting-boundary.bin"
+    source = configured_tree.config_dir / "reporting-boundary.bin"
+    target.write_bytes(b"original target")
+    source.write_bytes(b"replacement source")
+    original_target = target.read_bytes()
+    manager = configure_manifest_manager(
+        configured_tree,
+        [
+            (
+                "1.0",
+                {
+                    "config": [config_relative],
+                    "json_merge": [],
+                },
+            )
+        ],
+    )
+    replacement_calls = []
+    real_replacement = manager._replace_with_staged_ordinary_config
+
+    def replacement(source_path, destination_path):
+        replacement_calls.append((source_path, destination_path))
+        if report_phase == "replacement_failure":
+            return False
+        return real_replacement(source_path, destination_path)
+
+    monkeypatch.setattr(
+        manager,
+        "_replace_with_staged_ordinary_config",
+        replacement,
+    )
+    install_reporting_probe(
+        manager,
+        monkeypatch,
+        reporter,
+        exception_type,
+        marker,
+    )
+
+    result = manager.update_config_file()
+
+    assert len(replacement_calls) == 1
+    if report_phase == "replacement_failure":
+        assert result is False
+        assert target.read_bytes() == original_target
+    else:
+        assert result is True
+        assert target.read_bytes() == b"replacement source"
+
+
+@pytest.mark.parametrize("reporter", ["print", "logger"])
+@pytest.mark.parametrize(
+    "exception_type",
+    [RuntimeError, KeyboardInterrupt],
+)
+def test_ordinary_update_outer_exception_reporting_is_best_effort(
+    configured_tree,
+    monkeypatch,
+    reporter,
+    exception_type,
+):
+    manager = make_manager()
+    manager.upgrade_version_list = ["1.0"]
+    monkeypatch.setattr(
+        upgrade_config.Readyml,
+        "load_yaml",
+        lambda _path: (_ for _ in ()).throw(
+            ValueError("injected operational failure")
+        ),
+    )
+    install_reporting_probe(
+        manager,
+        monkeypatch,
+        reporter,
+        exception_type,
+        "配置文件升级失败:",
+    )
+
+    assert manager.update_config_file() is False
+
+
 @pytest.mark.parametrize("indeterminate_path", ["old", "destination"])
 def test_ordinary_config_indeterminate_recovery_preserves_all_artifacts(
     configured_tree,
@@ -1484,7 +1858,7 @@ def test_ordinary_config_indeterminate_recovery_preserves_all_artifacts(
     target.write_bytes(b"original indeterminate target")
     source.write_bytes(b"replacement indeterminate source")
     manager = make_manager()
-    real_replace = os.replace
+    real_rename = os.rename
     real_lexists = manager._snapshot_path_lexists
     install_failed = {"value": False}
 
@@ -1497,7 +1871,7 @@ def test_ordinary_config_indeterminate_recovery_preserves_all_artifacts(
         ):
             install_failed["value"] = True
             raise OSError("injected install failure")
-        return real_replace(source_path, destination_path)
+        return real_rename(source_path, destination_path)
 
     def indeterminate_lexists(path):
         if install_failed["value"] and path is not None:
@@ -1511,7 +1885,7 @@ def test_ordinary_config_indeterminate_recovery_preserves_all_artifacts(
                 return None
         return real_lexists(path)
 
-    monkeypatch.setattr(upgrade_config.os, "replace", fail_install)
+    monkeypatch.setattr(upgrade_config.os, "rename", fail_install)
     monkeypatch.setattr(
         manager,
         "_snapshot_path_lexists",
@@ -1723,6 +2097,205 @@ def test_ordinary_config_concurrent_destination_change_is_preserved(
     assert swap_artifacts(target) == []
 
 
+def test_ordinary_config_absent_destination_install_is_atomic_no_clobber(
+    configured_tree,
+    monkeypatch,
+):
+    target = configured_tree.roots["ui_config"] / "absent-install-race.bin"
+    source = configured_tree.config_dir / target.name
+    source.write_bytes(b"validated replacement")
+    manager = make_manager()
+    real_rename = os.rename
+    concurrent_bytes = b"concurrent destination created before install"
+    race_triggered = {"value": False}
+
+    def create_destination_immediately_before_install(
+        source_path,
+        destination_path,
+    ):
+        if (
+            Path(destination_path) == target
+            and Path(source_path).name.startswith(
+                f".{target.name}.staging-"
+            )
+            and not race_triggered["value"]
+        ):
+            target.write_bytes(concurrent_bytes)
+            race_triggered["value"] = True
+        return real_rename(source_path, destination_path)
+
+    monkeypatch.setattr(
+        upgrade_config.os,
+        "rename",
+        create_destination_immediately_before_install,
+    )
+
+    assert manager._replace_with_staged_ordinary_config(
+        str(source),
+        str(target),
+    ) is False
+    assert race_triggered["value"] is True
+    assert target.read_bytes() == concurrent_bytes
+    assert not any(
+        path.name.startswith(f".{target.name}.old-")
+        for path in target.parent.iterdir()
+    )
+
+
+def test_ordinary_config_destination_move_verifies_exact_moved_identity(
+    configured_tree,
+    monkeypatch,
+):
+    target = configured_tree.roots["ui_config"] / "move-identity-race.bin"
+    source = configured_tree.config_dir / target.name
+    target.write_bytes(b"original recovery data")
+    source.write_bytes(b"validated replacement")
+    displaced_original = target.with_name(f".{target.name}.concurrent-original")
+    manager = make_manager()
+    real_rename = os.rename
+    concurrent_bytes = b"concurrent replacement moved to recovery slot"
+    race_triggered = {"value": False}
+
+    def replace_destination_immediately_before_move(
+        source_path,
+        destination_path,
+    ):
+        if (
+            Path(source_path) == target
+            and Path(destination_path).name.startswith(
+                f".{target.name}.old-"
+            )
+            and not race_triggered["value"]
+        ):
+            real_rename(target, displaced_original)
+            target.write_bytes(concurrent_bytes)
+            race_triggered["value"] = True
+        return real_rename(source_path, destination_path)
+
+    monkeypatch.setattr(
+        upgrade_config.os,
+        "rename",
+        replace_destination_immediately_before_move,
+    )
+
+    assert manager._replace_with_staged_ordinary_config(
+        str(source),
+        str(target),
+    ) is False
+    assert race_triggered["value"] is True
+    assert target.read_bytes() == concurrent_bytes
+    assert displaced_original.read_bytes() == b"original recovery data"
+    assert not any(
+        path.name.startswith(f".{target.name}.old-")
+        for path in target.parent.iterdir()
+    )
+
+
+def test_ordinary_config_existing_destination_install_is_atomic_no_clobber(
+    configured_tree,
+    monkeypatch,
+):
+    target = configured_tree.roots["ui_config"] / "existing-install-race.bin"
+    source = configured_tree.config_dir / target.name
+    original_bytes = b"original recovery data"
+    concurrent_bytes = b"concurrent destination before staging install"
+    target.write_bytes(original_bytes)
+    source.write_bytes(b"validated replacement")
+    manager = make_manager()
+    real_rename = os.rename
+    race_triggered = {"value": False}
+
+    def create_destination_immediately_before_install(
+        source_path,
+        destination_path,
+    ):
+        if (
+            Path(destination_path) == target
+            and Path(source_path).name.startswith(
+                f".{target.name}.staging-"
+            )
+            and not race_triggered["value"]
+        ):
+            target.write_bytes(concurrent_bytes)
+            race_triggered["value"] = True
+        return real_rename(source_path, destination_path)
+
+    monkeypatch.setattr(
+        upgrade_config.os,
+        "rename",
+        create_destination_immediately_before_install,
+    )
+
+    assert manager._replace_with_staged_ordinary_config(
+        str(source),
+        str(target),
+    ) is False
+    assert race_triggered["value"] is True
+    assert target.read_bytes() == concurrent_bytes
+    recovery_artifacts = [
+        path
+        for path in target.parent.iterdir()
+        if path.name.startswith(f".{target.name}.old-")
+    ]
+    assert len(recovery_artifacts) == 1
+    assert recovery_artifacts[0].read_bytes() == original_bytes
+
+
+def test_ordinary_config_recovery_is_atomic_no_clobber(
+    configured_tree,
+    monkeypatch,
+):
+    target = configured_tree.roots["ui_config"] / "recovery-race.bin"
+    source = configured_tree.config_dir / target.name
+    original_bytes = b"original recovery data"
+    concurrent_bytes = b"concurrent destination before recovery"
+    target.write_bytes(original_bytes)
+    source.write_bytes(b"validated replacement")
+    manager = make_manager()
+    real_rename = os.rename
+    race_triggered = {"value": False}
+
+    def fail_install_then_create_destination_before_recovery(
+        source_path,
+        destination_path,
+    ):
+        source_path = Path(source_path)
+        destination_path = Path(destination_path)
+        if (
+            destination_path == target
+            and source_path.name.startswith(f".{target.name}.staging-")
+        ):
+            raise OSError("injected staging install failure")
+        if (
+            destination_path == target
+            and source_path.name.startswith(f".{target.name}.old-")
+            and not race_triggered["value"]
+        ):
+            target.write_bytes(concurrent_bytes)
+            race_triggered["value"] = True
+        return real_rename(source_path, destination_path)
+
+    monkeypatch.setattr(
+        upgrade_config.os,
+        "rename",
+        fail_install_then_create_destination_before_recovery,
+    )
+
+    assert manager._replace_with_staged_ordinary_config(
+        str(source),
+        str(target),
+    ) is False
+    assert race_triggered["value"] is True
+    assert target.read_bytes() == concurrent_bytes
+    recovery_artifacts = [
+        path
+        for path in target.parent.iterdir()
+        if path.name.startswith(f".{target.name}.old-")
+    ]
+    assert len(recovery_artifacts) == 1
+    assert recovery_artifacts[0].read_bytes() == original_bytes
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows junction regression")
 def test_ordinary_config_nested_parent_junction_substitution_cannot_mutate_external(
     configured_tree,
@@ -1742,7 +2315,7 @@ def test_ordinary_config_nested_parent_junction_substitution_cannot_mutate_exter
     external_witness.write_bytes(b"external witness must survive")
     displaced_parent = parent.with_name("nested-displaced")
     manager = make_manager()
-    real_replace = os.replace
+    real_rename = os.rename
     substitution_attempted = {"value": False}
 
     def substitute_parent_at_destination_transition(
@@ -1757,13 +2330,13 @@ def test_ordinary_config_nested_parent_junction_substitution_cannot_mutate_exter
             and not substitution_attempted["value"]
         ):
             substitution_attempted["value"] = True
-            real_replace(parent, displaced_parent)
+            real_rename(parent, displaced_parent)
             create_windows_junction(external, parent)
-        return real_replace(source_path, destination_path)
+        return real_rename(source_path, destination_path)
 
     monkeypatch.setattr(
         upgrade_config.os,
-        "replace",
+        "rename",
         substitute_parent_at_destination_transition,
     )
 
@@ -1904,6 +2477,81 @@ def test_ordinary_config_external_junction_substitution_during_copy_is_rejected(
         configured_tree.backups["ui_config"]
     ) == original_managed_root
     assert swap_artifacts(target) == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction regression")
+def test_directory_manifest_binds_lstat_entry_until_enumeration_finishes(
+    configured_tree,
+    monkeypatch,
+):
+    source = configured_tree.config_dir / "manifest-directory-race"
+    source.mkdir()
+    source.joinpath("validated.bin").write_bytes(b"validated source")
+    displaced_source = source.with_name(f".{source.name}.displaced")
+    external = configured_tree.package_dir / "external-manifest-data"
+    external.mkdir()
+    external_secret = external / "secret.bin"
+    external_secret.write_bytes(b"external data must never be traversed")
+    target = (
+        configured_tree.roots["ui_config"]
+        / "manifest-directory-race"
+    )
+    target.mkdir()
+    target.joinpath("original.bin").write_bytes(b"original target")
+    original_target = snapshot_tree(target)
+    manager = make_manager()
+    real_scandir = os.scandir
+    real_file_digest = manager._ordinary_config_file_digest
+    substitution_attempted = {"value": False}
+    substitution_blocked = {"value": False}
+
+    def substitute_junction_between_lstat_and_enumeration(path):
+        if (
+            Path(path) == source
+            and not substitution_attempted["value"]
+        ):
+            substitution_attempted["value"] = True
+            try:
+                os.rename(source, displaced_source)
+                create_windows_junction(external, source)
+            except OSError:
+                substitution_blocked["value"] = True
+                raise OSError("injected manifest enumeration failure")
+        return real_scandir(path)
+
+    def reject_external_hash(path, expected_stat):
+        if os.path.samefile(os.path.dirname(path), external):
+            pytest.fail("manifest traversed external junction data")
+        return real_file_digest(path, expected_stat)
+
+    monkeypatch.setattr(
+        upgrade_config.os,
+        "scandir",
+        substitute_junction_between_lstat_and_enumeration,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_ordinary_config_file_digest",
+        reject_external_hash,
+    )
+
+    try:
+        assert manager._replace_with_staged_ordinary_config(
+            str(source),
+            str(target),
+        ) is False
+        assert substitution_attempted["value"] is True
+        assert substitution_blocked["value"] is True
+        assert snapshot_tree(target) == original_target
+        assert external_secret.read_bytes() == (
+            b"external data must never be traversed"
+        )
+        assert swap_artifacts(target) == []
+    finally:
+        if os.path.isjunction(source):
+            os.rmdir(source)
+        if displaced_source.exists() and not source.exists():
+            os.rename(displaced_source, source)
 
 
 @pytest.mark.parametrize(
