@@ -25,6 +25,10 @@ class DummyLogger:
         self.messages.append(("error", message))
 
 
+class FatalReplacementSignal(BaseException):
+    pass
+
+
 def directory_path(path):
     return str(path) + os.sep
 
@@ -550,6 +554,74 @@ def test_staged_snapshot_swap_interruption_preserves_exact_recovery_data(
         )
     if not destination.exists():
         assert expected_destination in recovery_trees
+
+
+def test_staged_snapshot_indeterminate_recovery_preserves_all_artifacts(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    source.joinpath("source.bin").write_bytes(b"replacement snapshot")
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    destination.joinpath("target.bin").write_bytes(b"original snapshot")
+    manager = make_manager()
+    real_replace = os.replace
+    real_lexists = manager._snapshot_path_lexists
+    install_failed = {"value": False}
+
+    def fail_install(source_path, destination_path):
+        if (
+            Path(destination_path) == destination
+            and Path(source_path).name.startswith(
+                f".{destination.name}.staging-"
+            )
+        ):
+            install_failed["value"] = True
+            raise OSError("injected snapshot install failure")
+        return real_replace(source_path, destination_path)
+
+    def indeterminate_old(path):
+        if (
+            install_failed["value"]
+            and path is not None
+            and Path(path).name.startswith(
+                f".{destination.name}.old-"
+            )
+        ):
+            return None
+        return real_lexists(path)
+
+    monkeypatch.setattr(upgrade_config.os, "replace", fail_install)
+    monkeypatch.setattr(
+        manager,
+        "_snapshot_path_lexists",
+        indeterminate_old,
+    )
+
+    assert manager._replace_with_staged_snapshot(
+        str(source),
+        str(destination),
+        source_anchor=str(tmp_path),
+        destination_anchor=str(tmp_path),
+    ) is False
+
+    artifacts = [
+        path
+        for path in tmp_path.iterdir()
+        if path.name.startswith(
+            (
+                f".{destination.name}.old-",
+                f".{destination.name}.staging-",
+            )
+        )
+    ]
+    assert not destination.exists()
+    assert len(artifacts) == 2
+    artifact_trees = [snapshot_tree(path) for path in artifacts]
+    assert {"target.bin": b"original snapshot"} in artifact_trees
+    assert {"source.bin": b"replacement snapshot"} in artifact_trees
 
 
 def test_restore_failure_attempts_all_selected_roots_and_retains_backups(
@@ -1249,9 +1321,19 @@ def test_ordinary_config_old_artifact_cleanup_failure_rolls_back_target(
     assert swap_artifacts(target) == []
 
 
-def test_ordinary_config_swap_interruption_returns_false_and_restores_target(
+@pytest.mark.parametrize(
+    ("interruption_type", "expected_code"),
+    [
+        (KeyboardInterrupt, None),
+        (SystemExit, 23),
+        (FatalReplacementSignal, None),
+    ],
+)
+def test_ordinary_config_swap_interruption_reraises_after_restoring_target(
     configured_tree,
     monkeypatch,
+    interruption_type,
+    expected_code,
 ):
     target = configured_tree.roots["ui_config"] / "interrupted.bin"
     source = configured_tree.config_dir / "interrupted.bin"
@@ -1283,7 +1365,9 @@ def test_ordinary_config_swap_interruption_returns_false_and_restores_target(
             and not interruption_injected["value"]
         ):
             interruption_injected["value"] = True
-            raise KeyboardInterrupt("injected ordinary swap interruption")
+            if interruption_type is SystemExit:
+                raise interruption_type(expected_code)
+            raise interruption_type("injected ordinary swap interruption")
         return result
 
     monkeypatch.setattr(
@@ -1292,9 +1376,12 @@ def test_ordinary_config_swap_interruption_returns_false_and_restores_target(
         interrupt_after_staging_install,
     )
 
-    assert manager.update_config_file() is False
+    with pytest.raises(interruption_type) as raised:
+        manager.update_config_file()
 
     assert interruption_injected["value"] is True
+    if interruption_type is SystemExit:
+        assert raised.value.code == expected_code
     assert target.is_file()
     assert target.read_bytes() == original_target_bytes
     assert swap_artifacts(target) == []
@@ -1358,6 +1445,105 @@ def test_ordinary_config_failed_restoration_keeps_explicit_recovery_artifact(
         path.name.startswith(f".{target.name}.staging-")
         for path in target.parent.iterdir()
     )
+
+
+def test_ordinary_config_logger_interruption_is_best_effort_during_copy_failure(
+    configured_tree,
+    monkeypatch,
+):
+    target = configured_tree.roots["ui_config"] / "logger.bin"
+    source = configured_tree.config_dir / "logger.bin"
+    target.write_bytes(b"original logger target")
+    source.write_bytes(b"replacement logger source")
+    original_target = target.read_bytes()
+    manager = make_manager()
+
+    class InterruptingLogger(DummyLogger):
+        def error(self, message):
+            raise KeyboardInterrupt("logger must not control replacement")
+
+    manager.logger = InterruptingLogger()
+    monkeypatch.setattr(manager, "smart_copy", lambda *_args: False)
+
+    assert manager._replace_with_staged_ordinary_config(
+        str(source),
+        str(target),
+    ) is False
+    assert target.read_bytes() == original_target
+    assert swap_artifacts(target) == []
+
+
+@pytest.mark.parametrize("indeterminate_path", ["old", "destination"])
+def test_ordinary_config_indeterminate_recovery_preserves_all_artifacts(
+    configured_tree,
+    monkeypatch,
+    indeterminate_path,
+):
+    target = configured_tree.roots["ui_config"] / "indeterminate.bin"
+    source = configured_tree.config_dir / "indeterminate.bin"
+    target.write_bytes(b"original indeterminate target")
+    source.write_bytes(b"replacement indeterminate source")
+    manager = make_manager()
+    real_replace = os.replace
+    real_lexists = manager._snapshot_path_lexists
+    install_failed = {"value": False}
+
+    def fail_install(source_path, destination_path):
+        if (
+            Path(destination_path) == target
+            and Path(source_path).name.startswith(
+                f".{target.name}.staging-"
+            )
+        ):
+            install_failed["value"] = True
+            raise OSError("injected install failure")
+        return real_replace(source_path, destination_path)
+
+    def indeterminate_lexists(path):
+        if install_failed["value"] and path is not None:
+            path = Path(path)
+            if (
+                indeterminate_path == "old"
+                and path.name.startswith(f".{target.name}.old-")
+            ):
+                return None
+            if indeterminate_path == "destination" and path == target:
+                return None
+        return real_lexists(path)
+
+    monkeypatch.setattr(upgrade_config.os, "replace", fail_install)
+    monkeypatch.setattr(
+        manager,
+        "_snapshot_path_lexists",
+        indeterminate_lexists,
+    )
+
+    assert manager._replace_with_staged_ordinary_config(
+        str(source),
+        str(target),
+    ) is False
+
+    artifacts = {
+        path.name: path.read_bytes()
+        for path in target.parent.iterdir()
+        if path.name.startswith(
+            (
+                f".{target.name}.old-",
+                f".{target.name}.staging-",
+            )
+        )
+    }
+    assert not target.exists()
+    assert sorted(artifacts.values()) == sorted(
+        [
+            b"original indeterminate target",
+            b"replacement indeterminate source",
+        ]
+    )
+
+
+def test_snapshot_path_lexists_none_is_safe():
+    assert make_manager()._snapshot_path_lexists(None) is False
 
 
 @pytest.mark.parametrize("source_kind", ["file", "directory"])
@@ -1425,6 +1611,215 @@ def test_ordinary_config_source_disappearance_during_copy_preserves_target(
         configured_tree.backups["ui_config"]
     ) == original_managed_root
     assert swap_artifacts(target) == []
+
+
+@pytest.mark.parametrize("source_kind", ["file", "directory"])
+def test_ordinary_config_source_swap_during_copy_then_restore_is_rejected(
+    configured_tree,
+    monkeypatch,
+    source_kind,
+):
+    entry_name = f"content-race-{source_kind}"
+    target = configured_tree.roots["ui_config"] / entry_name
+    source = configured_tree.config_dir / entry_name
+    displaced_source = configured_tree.config_dir / f".{entry_name}.original"
+    if source_kind == "file":
+        target.write_bytes(b"original target file")
+        source.write_bytes(b"validated source file")
+        original_target = target.read_bytes()
+    else:
+        target.mkdir()
+        target.joinpath("target.bin").write_bytes(b"original target directory")
+        source.mkdir()
+        source.joinpath("payload.bin").write_bytes(b"validated directory source")
+        original_target = snapshot_tree(target)
+    manager = make_manager()
+    real_smart_copy = manager.smart_copy
+    race_triggered = {"value": False}
+
+    def swap_copy_restore(source_path, staging_path):
+        if Path(source_path) != source or race_triggered["value"]:
+            return real_smart_copy(source_path, staging_path)
+        race_triggered["value"] = True
+        os.replace(source, displaced_source)
+        if source_kind == "file":
+            source.write_bytes(b"unvalidated substituted file")
+        else:
+            source.mkdir()
+            source.joinpath("payload.bin").write_bytes(
+                b"unvalidated substituted directory"
+            )
+        try:
+            return real_smart_copy(source_path, staging_path)
+        finally:
+            assert manager.smart_remove(source_path) is True
+            os.replace(displaced_source, source)
+
+    monkeypatch.setattr(manager, "smart_copy", swap_copy_restore)
+
+    assert manager._replace_with_staged_ordinary_config(
+        str(source),
+        str(target),
+    ) is False
+
+    assert race_triggered["value"] is True
+    if source_kind == "file":
+        assert target.read_bytes() == original_target
+    else:
+        assert snapshot_tree(target) == original_target
+    assert swap_artifacts(target) == []
+
+
+def test_ordinary_config_concurrent_destination_creation_is_preserved(
+    configured_tree,
+    monkeypatch,
+):
+    target = configured_tree.roots["ui_config"] / "created-during-copy.bin"
+    source = configured_tree.config_dir / "created-during-copy.bin"
+    source.write_bytes(b"validated replacement")
+    manager = make_manager()
+    real_smart_copy = manager.smart_copy
+    created_bytes = b"concurrently created destination"
+
+    def create_destination_after_copy(source_path, staging_path):
+        result = real_smart_copy(source_path, staging_path)
+        target.write_bytes(created_bytes)
+        return result
+
+    monkeypatch.setattr(manager, "smart_copy", create_destination_after_copy)
+
+    assert manager._replace_with_staged_ordinary_config(
+        str(source),
+        str(target),
+    ) is False
+    assert target.read_bytes() == created_bytes
+    assert swap_artifacts(target) == []
+
+
+def test_ordinary_config_concurrent_destination_change_is_preserved(
+    configured_tree,
+    monkeypatch,
+):
+    target = configured_tree.roots["ui_config"] / "changed-during-copy.bin"
+    source = configured_tree.config_dir / "changed-during-copy.bin"
+    target.write_bytes(b"initial destination")
+    source.write_bytes(b"validated replacement")
+    manager = make_manager()
+    real_smart_copy = manager.smart_copy
+    changed_bytes = b"concurrently changed destination"
+
+    def change_destination_after_copy(source_path, staging_path):
+        result = real_smart_copy(source_path, staging_path)
+        target.write_bytes(changed_bytes)
+        return result
+
+    monkeypatch.setattr(manager, "smart_copy", change_destination_after_copy)
+
+    assert manager._replace_with_staged_ordinary_config(
+        str(source),
+        str(target),
+    ) is False
+    assert target.read_bytes() == changed_bytes
+    assert swap_artifacts(target) == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction regression")
+def test_ordinary_config_nested_parent_junction_substitution_cannot_mutate_external(
+    configured_tree,
+    monkeypatch,
+):
+    parent = configured_tree.roots["ui_config"] / "nested"
+    parent.mkdir()
+    target = parent / "parent-race.bin"
+    target.write_bytes(b"original managed target")
+    source = configured_tree.config_dir / target.name
+    source.write_bytes(b"validated replacement")
+    external = configured_tree.target_dir.parent / "external-parent"
+    external.mkdir()
+    external_target = external / target.name
+    external_target.write_bytes(b"external target must survive")
+    external_witness = external / "witness.bin"
+    external_witness.write_bytes(b"external witness must survive")
+    displaced_parent = parent.with_name("nested-displaced")
+    manager = make_manager()
+    real_replace = os.replace
+    substitution_attempted = {"value": False}
+
+    def substitute_parent_at_destination_transition(
+        source_path,
+        destination_path,
+    ):
+        if (
+            Path(source_path) == target
+            and Path(destination_path).name.startswith(
+                f".{target.name}.old-"
+            )
+            and not substitution_attempted["value"]
+        ):
+            substitution_attempted["value"] = True
+            real_replace(parent, displaced_parent)
+            create_windows_junction(external, parent)
+        return real_replace(source_path, destination_path)
+
+    monkeypatch.setattr(
+        upgrade_config.os,
+        "replace",
+        substitute_parent_at_destination_transition,
+    )
+
+    assert manager._replace_with_staged_ordinary_config(
+        str(source),
+        str(target),
+    ) is False
+
+    assert substitution_attempted["value"] is True
+    assert not os.path.isjunction(parent)
+    assert target.read_bytes() == b"original managed target"
+    assert external_target.read_bytes() == b"external target must survive"
+    assert external_witness.read_bytes() == b"external witness must survive"
+    assert swap_artifacts(target) == []
+
+
+@pytest.mark.parametrize("target_is_directory", [False, True])
+def test_cleanup_snapshot_artifact_removes_dangling_links_without_following(
+    tmp_path,
+    target_is_directory,
+):
+    manager = make_manager()
+    missing_target = tmp_path / (
+        "missing-directory" if target_is_directory else "missing-file"
+    )
+    artifact = tmp_path / (
+        "dangling-directory-link"
+        if target_is_directory
+        else "dangling-file-link"
+    )
+    create_symlink_or_skip(
+        missing_target,
+        artifact,
+        target_is_directory=target_is_directory,
+    )
+
+    assert os.path.lexists(artifact)
+    assert manager._cleanup_snapshot_artifact(str(artifact)) is True
+    assert not os.path.lexists(artifact)
+    assert not missing_target.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction regression")
+def test_cleanup_snapshot_artifact_removes_junction_without_following(
+    tmp_path,
+):
+    manager = make_manager()
+    external = tmp_path / "external"
+    external.mkdir()
+    external.joinpath("must-survive.bin").write_bytes(b"external data")
+    artifact = tmp_path / "artifact-junction"
+    create_windows_junction(external, artifact)
+
+    assert manager._cleanup_snapshot_artifact(str(artifact)) is True
+    assert not os.path.lexists(artifact)
+    assert external.joinpath("must-survive.bin").read_bytes() == b"external data"
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows junction regression")
