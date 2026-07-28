@@ -871,6 +871,40 @@ class ConfigManager(object):
         print(message)
         self.logger.error(message)
 
+    def _resolve_ordinary_config_source(self, destination_path):
+        try:
+            lexical_root = os.path.abspath(CONFIG_DIR)
+            source_name = os.path.basename(os.path.normpath(destination_path))
+            lexical_path = os.path.abspath(
+                os.path.join(lexical_root, source_name)
+            )
+            resolved_root = os.path.realpath(lexical_root)
+            resolved_path = os.path.realpath(lexical_path)
+        except (OSError, ValueError):
+            return None, "invalid_path"
+
+        if not self._path_is_contained(lexical_path, lexical_root):
+            return None, "outside_allowed_root"
+        if not self._path_is_contained(resolved_path, resolved_root):
+            return None, "symlink_escape"
+
+        try:
+            if not os.path.exists(lexical_path):
+                return None, "missing_path"
+            if not (
+                os.path.isfile(lexical_path)
+                or os.path.isdir(lexical_path)
+            ):
+                return None, "unsupported_type"
+        except OSError:
+            return None, "invalid_path"
+        return lexical_path, None
+
+    def _report_ordinary_config_source_error(self, error):
+        message = f"ordinary_config error: source_path:{error}"
+        print(message)
+        self.logger.error(message)
+
     def backup_config_file(self, config_file_source_path):
         managed_roots = (
             (
@@ -1288,20 +1322,53 @@ class ConfigManager(object):
                 ):
                     return False
 
+                config_updates = []
+                for config_file_path in config_file_source_path:
+                    target_file_path, path_error = (
+                        self._resolve_ordinary_config_destination(
+                            config_file_path
+                        )
+                    )
+                    if path_error is not None:
+                        self._report_ordinary_config_destination_error(
+                            path_error
+                        )
+                        return False
+                    new_config_file_path, source_error = (
+                        self._resolve_ordinary_config_source(
+                            target_file_path
+                        )
+                    )
+                    if source_error is not None:
+                        self._report_ordinary_config_source_error(
+                            source_error
+                        )
+                        return False
+                    config_updates.append(
+                        (
+                            config_file_path,
+                            new_config_file_path,
+                            target_file_path,
+                        )
+                    )
+
                 if self.backup_config_file(config_file_source_path):
-                    for config_file_path in config_file_source_path:
+                    for (
+                        config_file_path,
+                        new_config_file_path,
+                        target_file_path,
+                    ) in config_updates:
                         print(f"更新配置文件: {config_file_path}")
                         self.logger.info(f"更新配置文件: {config_file_path}")
-                        file_name = config_file_path.split("/")[-1]
-                        new_config_file_path = CONFIG_DIR + file_name
-                        target_file_path, path_error = (
-                            self._resolve_ordinary_config_destination(
-                                config_file_path
-                            )
+                        (
+                            new_config_file_path,
+                            source_error,
+                        ) = self._resolve_ordinary_config_source(
+                            target_file_path
                         )
-                        if path_error is not None:
-                            self._report_ordinary_config_destination_error(
-                                path_error
+                        if source_error is not None:
+                            self._report_ordinary_config_source_error(
+                                source_error
                             )
                             return False
                         if not self.smart_remove(target_file_path):

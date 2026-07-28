@@ -833,8 +833,24 @@ def test_ordinary_config_destination_accepts_managed_root_itself(
     )
 
 
+@pytest.mark.parametrize(
+    "config_entry",
+    [
+        "ui/ui_pic",
+        r"ui\ui_pic",
+        "ui/ui_pic/",
+        "ui/ui_pic/sub/..",
+    ],
+    ids=[
+        "canonical",
+        "backslash_alias",
+        "trailing_separator_alias",
+        "normalized_parent_alias",
+    ],
+)
 def test_ordinary_config_managed_root_entry_is_backed_up_and_replaced(
     configured_tree,
+    config_entry,
 ):
     source_root = configured_tree.config_dir / "ui_pic"
     source_root.mkdir()
@@ -848,7 +864,7 @@ def test_ordinary_config_managed_root_entry_is_backed_up_and_replaced(
             (
                 "1.0",
                 {
-                    "config": ["ui/ui_pic"],
+                    "config": [config_entry],
                     "json_merge": [],
                 },
             )
@@ -866,6 +882,57 @@ def test_ordinary_config_managed_root_entry_is_backed_up_and_replaced(
     assert manager.ui_pic_flag is False
     assert not any(
         "ordinary_config error: destination_path:symlink_escape" in message
+        for message in logged_messages(manager, "error")
+    )
+
+
+def test_missing_ordinary_source_fails_before_backup_or_target_mutation(
+    configured_tree,
+    monkeypatch,
+):
+    target_root = configured_tree.roots["ui_pic"]
+    original_target_tree = snapshot_tree(target_root)
+    manager = configure_manifest_manager(
+        configured_tree,
+        [
+            (
+                "1.0",
+                {
+                    "config": ["ui/ui_pic"],
+                    "json_merge": [],
+                },
+            )
+        ],
+    )
+    events = []
+    real_backup = manager.backup_config_file
+    real_remove = manager.smart_remove
+    real_copy = manager.smart_copy
+
+    def track_backup(paths):
+        events.append("backup")
+        return real_backup(paths)
+
+    def track_remove(path):
+        events.append("remove")
+        return real_remove(path)
+
+    def track_copy(source, target):
+        events.append("copy")
+        return real_copy(source, target)
+
+    monkeypatch.setattr(manager, "backup_config_file", track_backup)
+    monkeypatch.setattr(manager, "smart_remove", track_remove)
+    monkeypatch.setattr(manager, "smart_copy", track_copy)
+
+    assert manager.update_config_file() is False
+
+    assert events == []
+    assert snapshot_tree(target_root) == original_target_tree
+    assert manager.ui_pic_flag is True
+    assert not configured_tree.backups["ui_pic"].exists()
+    assert any(
+        "ordinary_config error: source_path:missing_path" in message
         for message in logged_messages(manager, "error")
     )
 
@@ -1622,6 +1689,67 @@ def create_windows_junction(source, link):
         check=False,
     )
     assert result.returncode == 0, result.stderr
+
+
+def assert_ordinary_source_escape_is_rejected_before_target_mutation(
+    configured_tree,
+    create_source_alias,
+):
+    target_root = configured_tree.roots["ui_pic"]
+    original_target_tree = snapshot_tree(target_root)
+    external_source = configured_tree.package_dir / "external-ui-pic"
+    external_source.mkdir()
+    (external_source / "marker.txt").write_text(
+        "external replacement",
+        encoding="utf-8",
+    )
+    source_alias = configured_tree.config_dir / "ui_pic"
+    create_source_alias(external_source, source_alias)
+    manager = configure_manifest_manager(
+        configured_tree,
+        [
+            (
+                "1.0",
+                {
+                    "config": ["ui/ui_pic"],
+                    "json_merge": [],
+                },
+            )
+        ],
+    )
+
+    assert manager.update_config_file() is False
+
+    assert snapshot_tree(target_root) == original_target_tree
+    assert os.path.samefile(source_alias, external_source)
+    assert manager.ui_pic_flag is True
+    assert not configured_tree.backups["ui_pic"].exists()
+    assert any(
+        "ordinary_config error: source_path:symlink_escape" in message
+        for message in logged_messages(manager, "error")
+    )
+
+
+def test_ordinary_source_rejects_symlink_escape_before_target_mutation(
+    configured_tree,
+):
+    assert_ordinary_source_escape_is_rejected_before_target_mutation(
+        configured_tree,
+        lambda source, link: create_symlink_or_skip(
+            source,
+            link,
+            target_is_directory=True,
+        ),
+    )
+
+
+def test_ordinary_source_rejects_junction_escape_before_target_mutation(
+    configured_tree,
+):
+    assert_ordinary_source_escape_is_rejected_before_target_mutation(
+        configured_tree,
+        create_junction_or_skip,
+    )
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows junction regression")
