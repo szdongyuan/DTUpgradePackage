@@ -246,6 +246,93 @@ def test_successful_managed_root_backup_changes_only_matching_flag(configured_tr
     )
 
 
+@pytest.mark.parametrize("reporter", ["print", "logger"])
+@pytest.mark.parametrize(
+    "exception_type",
+    [RuntimeError, KeyboardInterrupt, SystemExit],
+)
+def test_backup_success_reporting_is_best_effort_and_later_roots_are_attempted(
+    configured_tree,
+    monkeypatch,
+    reporter,
+    exception_type,
+):
+    manager = make_manager()
+    selected_roots = ("ui_pic", "ai_model_config")
+    expected_snapshots = {
+        name: snapshot_tree(configured_tree.roots[name])
+        for name in selected_roots
+    }
+    install_reporting_probe(
+        manager,
+        monkeypatch,
+        reporter,
+        exception_type,
+        "配置文件备份已保存到",
+    )
+
+    assert manager.backup_config_file(
+        [
+            "ui/ui_pic/theme/icon.png",
+            "configs/aimodel_config/model.json",
+        ]
+    ) is True
+
+    assert manager.ui_pic_flag is False
+    assert manager.ai_model_config_flag is False
+    assert manager.ui_config_flag is True
+    assert manager.scannre_barcode_config_flag is True
+    assert {
+        name: snapshot_tree(configured_tree.backups[name])
+        for name in selected_roots
+    } == expected_snapshots
+
+
+@pytest.mark.parametrize("reporter", ["print", "logger"])
+@pytest.mark.parametrize(
+    "exception_type",
+    [RuntimeError, KeyboardInterrupt, SystemExit],
+)
+@pytest.mark.parametrize(
+    "failure_path",
+    ["safety", "copy"],
+)
+def test_backup_failure_reporting_is_best_effort(
+    configured_tree,
+    monkeypatch,
+    reporter,
+    exception_type,
+    failure_path,
+):
+    manager = make_manager()
+    if failure_path == "safety":
+        monkeypatch.setattr(
+            manager,
+            "_snapshot_ancestor_chain_is_safe",
+            lambda *_args: False,
+        )
+    else:
+        monkeypatch.setattr(
+            manager,
+            "_replace_with_staged_snapshot",
+            lambda *_args: False,
+        )
+    install_reporting_probe(
+        manager,
+        monkeypatch,
+        reporter,
+        exception_type,
+        "",
+    )
+
+    assert manager.backup_config_file(
+        ["ui/ui_config/settings.json"]
+    ) is False
+
+    assert manager.ui_config_flag is True
+    assert not configured_tree.backups["ui_config"].exists()
+
+
 def test_failed_managed_root_backup_keeps_flag_and_reports_failure(configured_tree, monkeypatch):
     manager = make_manager()
     copy_calls = []

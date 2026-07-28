@@ -2159,8 +2159,7 @@ class ConfigManager(object):
             )
             if managed_root is None:
                 message = f"配置文件不在可备份目录中: {file_path}"
-                print(message)
-                self.logger.error(message)
+                self._report_best_effort("error", message)
                 return False
 
             backup_source_path, backup_path, flag_name = managed_root
@@ -2175,8 +2174,7 @@ class ConfigManager(object):
                     "配置文件备份安全检查失败: "
                     f"{backup_source_path}"
                 )
-                print(message)
-                self.logger.error(message)
+                self._report_best_effort("error", message)
                 return False
             if not self._snapshot_ancestor_chain_is_safe(
                 os.path.dirname(os.path.normpath(backup_path)),
@@ -2186,16 +2184,14 @@ class ConfigManager(object):
                     "配置文件备份目标安全检查失败: "
                     f"{backup_path}"
                 )
-                print(message)
-                self.logger.error(message)
+                self._report_best_effort("error", message)
                 return False
             if not self._snapshot_path_is_safe(backup_source_path):
                 message = (
                     "配置文件备份安全检查失败: "
                     f"{backup_source_path}"
                 )
-                print(message)
-                self.logger.error(message)
+                self._report_best_effort("error", message)
                 return False
 
             try:
@@ -2205,17 +2201,20 @@ class ConfigManager(object):
                     backup_path,
                 ):
                     message = f"配置文件备份失败: {backup_source_path} -> {backup_path}"
-                    print(message)
-                    self.logger.error(message)
+                    self._report_best_effort("error", message)
                     return False
             except Exception as e:
-                print(f"备份配置文件时发生错误：{e}")
-                self.logger.error(f"备份配置文件时发生错误：{e}")
+                self._report_best_effort(
+                    "error",
+                    f"备份配置文件时发生错误：{e}",
+                )
                 return False
 
             setattr(self, flag_name, False)
-            self.logger.info(f"配置文件备份已保存到 {backup_path}")
-            print(f"配置文件备份已保存到 {backup_path}")
+            self._report_best_effort(
+                "info",
+                f"配置文件备份已保存到 {backup_path}",
+            )
         return True
 
     def _normalize_json_merge_entries(self, raw_entries):
