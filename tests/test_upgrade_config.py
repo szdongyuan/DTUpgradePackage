@@ -809,6 +809,67 @@ def test_missing_or_empty_json_merge_is_a_compatible_noop(
     assert helper_calls == []
 
 
+@pytest.mark.parametrize(
+    ("relative_path", "root_name"),
+    [
+        ("ui/ui_pic", "ui_pic"),
+        ("ui/ui_config", "ui_config"),
+        ("configs/aimodel_config", "ai_model_config"),
+        ("configs/scanner_barcode_config", "scanner_barcode_config"),
+    ],
+)
+def test_ordinary_config_destination_accepts_managed_root_itself(
+    configured_tree,
+    relative_path,
+    root_name,
+):
+    destination_path, error = make_manager()._resolve_ordinary_config_destination(
+        relative_path
+    )
+
+    assert error is None
+    assert os.path.normcase(os.path.normpath(destination_path)) == os.path.normcase(
+        os.path.normpath(configured_tree.roots[root_name])
+    )
+
+
+def test_ordinary_config_managed_root_entry_is_backed_up_and_replaced(
+    configured_tree,
+):
+    source_root = configured_tree.config_dir / "ui_pic"
+    source_root.mkdir()
+    (source_root / "marker.txt").write_text(
+        "replacement ui_pic",
+        encoding="utf-8",
+    )
+    manager = configure_manifest_manager(
+        configured_tree,
+        [
+            (
+                "1.0",
+                {
+                    "config": ["ui/ui_pic"],
+                    "json_merge": [],
+                },
+            )
+        ],
+    )
+
+    assert manager.update_config_file() is True
+
+    assert (
+        configured_tree.backups["ui_pic"] / "marker.txt"
+    ).read_text(encoding="utf-8") == "original ui_pic"
+    assert (
+        configured_tree.roots["ui_pic"] / "marker.txt"
+    ).read_text(encoding="utf-8") == "replacement ui_pic"
+    assert manager.ui_pic_flag is False
+    assert not any(
+        "ordinary_config error: destination_path:symlink_escape" in message
+        for message in logged_messages(manager, "error")
+    )
+
+
 def test_existing_config_actions_run_before_json_merge_actions(
     configured_tree,
     monkeypatch,

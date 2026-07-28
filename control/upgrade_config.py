@@ -853,9 +853,15 @@ class ConfigManager(object):
         except (OSError, ValueError):
             return None, "invalid_path"
 
+        destination_is_managed_root = os.path.normcase(
+            os.path.normpath(destination_path)
+        ) == os.path.normcase(os.path.normpath(lexical_root))
         if (
             not self._path_is_contained(resolved_destination, resolved_root)
-            or not self._path_is_contained(resolved_parent, resolved_root)
+            or (
+                not destination_is_managed_root
+                and not self._path_is_contained(resolved_parent, resolved_root)
+            )
         ):
             return None, "symlink_escape"
         return destination_path, None
