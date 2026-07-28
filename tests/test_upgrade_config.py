@@ -203,20 +203,23 @@ def install_reporting_probe(
     exception_type,
     marker,
 ):
+    report_attempts = []
     if reporter == "print":
         real_print = builtins.print
 
         def probe_print(*args, **kwargs):
             if args and marker in str(args[0]):
+                report_attempts.append(str(args[0]))
                 raise exception_type("injected print failure")
             return real_print(*args, **kwargs)
 
         monkeypatch.setattr(builtins, "print", probe_print)
-        return
+        return report_attempts
 
     class ProbingLogger(DummyLogger):
         def _probe(self, level, message):
             if marker in message:
+                report_attempts.append(message)
                 raise exception_type("injected logger failure")
             self.messages.append((level, message))
 
@@ -230,6 +233,7 @@ def install_reporting_probe(
             self._probe("error", message)
 
     manager.logger = ProbingLogger()
+    return report_attempts
 
 
 def test_successful_managed_root_backup_changes_only_matching_flag(configured_tree):
@@ -331,6 +335,113 @@ def test_backup_failure_reporting_is_best_effort(
 
     assert manager.ui_config_flag is True
     assert not configured_tree.backups["ui_config"].exists()
+
+
+@pytest.mark.parametrize(
+    ("failure_path", "report_marker"),
+    [
+        ("ancestor_safety", "快照祖先安全检查失败"),
+        ("snapshot_copy", "快照暂存复制失败"),
+    ],
+)
+@pytest.mark.parametrize(
+    "exception_type",
+    [RuntimeError, KeyboardInterrupt, SystemExit],
+)
+def test_backup_real_snapshot_failure_reporting_is_isolated(
+    configured_tree,
+    monkeypatch,
+    failure_path,
+    report_marker,
+    exception_type,
+):
+    manager = make_manager()
+    backup_root = configured_tree.backups["ui_config"]
+
+    if failure_path == "ancestor_safety":
+        real_path_is_contained = manager._path_is_contained
+
+        def reject_source_ancestor(path, root):
+            if (
+                os.path.normcase(os.path.normpath(path))
+                == os.path.normcase(
+                    os.path.normpath(upgrade_config.UI_CONFIG_PATH)
+                )
+                and os.path.normcase(os.path.normpath(root))
+                == os.path.normcase(
+                    os.path.normpath(upgrade_config.DEFAULT_TARGET_DIR)
+                )
+            ):
+                return False
+            return real_path_is_contained(path, root)
+
+        monkeypatch.setattr(
+            manager,
+            "_path_is_contained",
+            reject_source_ancestor,
+        )
+    else:
+        def partially_fail_copy(_source, destination):
+            Path(destination).mkdir(parents=True, exist_ok=True)
+            Path(destination).joinpath("partial.bin").write_bytes(
+                b"partial snapshot"
+            )
+            return False
+
+        monkeypatch.setattr(manager, "smart_copy", partially_fail_copy)
+
+    report_attempts = install_reporting_probe(
+        manager,
+        monkeypatch,
+        "logger",
+        exception_type,
+        report_marker,
+    )
+
+    assert manager.backup_config_file(
+        ["ui/ui_config/settings.json"]
+    ) is False
+
+    assert report_attempts
+    assert manager.ui_config_flag is True
+    assert manager.ui_pic_flag is True
+    assert manager.ai_model_config_flag is True
+    assert manager.scannre_barcode_config_flag is True
+    assert not backup_root.exists()
+    assert (
+        not configured_tree.backup_dir.exists()
+        or swap_artifacts(backup_root) == []
+    )
+
+
+def test_backup_operational_base_exception_propagates_and_cleans_staging(
+    configured_tree,
+    monkeypatch,
+):
+    manager = make_manager()
+    backup_root = configured_tree.backups["ui_config"]
+
+    def abort_partial_copy(_source, destination):
+        Path(destination).mkdir(parents=True, exist_ok=True)
+        Path(destination).joinpath("partial.bin").write_bytes(
+            b"partial snapshot"
+        )
+        raise FatalReplacementSignal("injected operational failure")
+
+    monkeypatch.setattr(manager, "smart_copy", abort_partial_copy)
+
+    with pytest.raises(
+        FatalReplacementSignal,
+        match="injected operational failure",
+    ):
+        manager.backup_config_file(["ui/ui_config/settings.json"])
+
+    assert manager.ui_config_flag is True
+    assert manager.ui_pic_flag is True
+    assert manager.ai_model_config_flag is True
+    assert manager.scannre_barcode_config_flag is True
+    assert not backup_root.exists()
+    assert swap_artifacts(backup_root) == []
 
 
 def test_failed_managed_root_backup_keeps_flag_and_reports_failure(configured_tree, monkeypatch):

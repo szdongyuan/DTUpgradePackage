@@ -161,8 +161,10 @@ class ConfigManager(object):
                 absolute_anchor,
             )
         except (OSError, TypeError, ValueError) as e:
-            self.logger.error(
-                f"快照祖先安全检查失败 {path}: {e}"
+            self._report_best_effort(
+                "error",
+                f"快照祖先安全检查失败 {path}: {e}",
+                include_print=False,
             )
             return False
 
@@ -177,8 +179,10 @@ class ConfigManager(object):
             except FileNotFoundError:
                 break
             except (OSError, ValueError) as e:
-                self.logger.error(
-                    f"快照祖先安全检查失败 {current_path}: {e}"
+                self._report_best_effort(
+                    "error",
+                    f"快照祖先安全检查失败 {current_path}: {e}",
+                    include_print=False,
                 )
                 return False
 
@@ -188,8 +192,10 @@ class ConfigManager(object):
                     resolved_path,
                     resolved_anchor,
                 ):
-                    self.logger.error(
-                        f"快照祖先逃逸可信目录: {current_path}"
+                    self._report_best_effort(
+                        "error",
+                        f"快照祖先逃逸可信目录: {current_path}",
+                        include_print=False,
                     )
                     return False
 
@@ -199,14 +205,18 @@ class ConfigManager(object):
                     followed_stat.st_ino,
                 )
             except (OSError, ValueError) as e:
-                self.logger.error(
-                    f"快照祖先安全检查失败 {current_path}: {e}"
+                self._report_best_effort(
+                    "error",
+                    f"快照祖先安全检查失败 {current_path}: {e}",
+                    include_print=False,
                 )
                 return False
 
             if identity in visited_identities:
-                self.logger.error(
-                    f"快照祖先循环链接: {current_path}"
+                self._report_best_effort(
+                    "error",
+                    f"快照祖先循环链接: {current_path}",
+                    include_print=False,
                 )
                 return False
             visited_identities.add(identity)
@@ -219,7 +229,11 @@ class ConfigManager(object):
             resolved_root = os.path.realpath(absolute_root)
             root_stat = os.stat(absolute_root)
         except (OSError, TypeError, ValueError) as e:
-            self.logger.error(f"快照安全检查失败 {root_path}: {e}")
+            self._report_best_effort(
+                "error",
+                f"快照安全检查失败 {root_path}: {e}",
+                include_print=False,
+            )
             return False, ()
 
         if not stat.S_ISDIR(root_stat.st_mode):
@@ -240,8 +254,10 @@ class ConfigManager(object):
                 with os.scandir(current_path) as directory_entries:
                     entries = list(directory_entries)
             except (OSError, ValueError) as e:
-                self.logger.error(
-                    f"快照安全检查失败 {current_path}: {e}"
+                self._report_best_effort(
+                    "error",
+                    f"快照安全检查失败 {current_path}: {e}",
+                    include_print=False,
                 )
                 return False, ()
 
@@ -249,8 +265,10 @@ class ConfigManager(object):
                 try:
                     entry_stat = entry.stat(follow_symlinks=False)
                 except (OSError, ValueError) as e:
-                    self.logger.error(
-                        f"快照安全检查失败 {entry.path}: {e}"
+                    self._report_best_effort(
+                        "error",
+                        f"快照安全检查失败 {entry.path}: {e}",
+                        include_print=False,
                     )
                     return False, ()
 
@@ -272,8 +290,10 @@ class ConfigManager(object):
                         )
                     )
                     if not is_junction and not entry.is_symlink():
-                        self.logger.error(
-                            f"快照拒绝不支持的重解析点: {entry.path}"
+                        self._report_best_effort(
+                            "error",
+                            f"快照拒绝不支持的重解析点: {entry.path}",
+                            include_print=False,
                         )
                         return False, ()
 
@@ -283,8 +303,10 @@ class ConfigManager(object):
                             resolved_target,
                             resolved_root,
                         ):
-                            self.logger.error(
-                                f"快照拒绝外部链接或重解析点: {entry.path}"
+                            self._report_best_effort(
+                                "error",
+                                f"快照拒绝外部链接或重解析点: {entry.path}",
+                                include_print=False,
                             )
                             return False, ()
 
@@ -294,8 +316,10 @@ class ConfigManager(object):
                             followed_stat.st_ino,
                         )
                     except (OSError, ValueError) as e:
-                        self.logger.error(
-                            f"快照链接安全检查失败 {entry.path}: {e}"
+                        self._report_best_effort(
+                            "error",
+                            f"快照链接安全检查失败 {entry.path}: {e}",
+                            include_print=False,
                         )
                         return False, ()
 
@@ -306,8 +330,10 @@ class ConfigManager(object):
                         target_is_directory
                         and target_identity in ancestor_identities
                     ):
-                        self.logger.error(
-                            f"快照拒绝循环链接或重解析点: {entry.path}"
+                        self._report_best_effort(
+                            "error",
+                            f"快照拒绝循环链接或重解析点: {entry.path}",
+                            include_print=False,
                         )
                         return False, ()
 
@@ -326,8 +352,10 @@ class ConfigManager(object):
                             else os.readlink(entry.path)
                         )
                     except (OSError, ValueError) as e:
-                        self.logger.error(
-                            f"快照链接安全检查失败 {entry.path}: {e}"
+                        self._report_best_effort(
+                            "error",
+                            f"快照链接安全检查失败 {entry.path}: {e}",
+                            include_print=False,
                         )
                         return False, ()
 
@@ -347,8 +375,10 @@ class ConfigManager(object):
 
                 identity = (entry_stat.st_dev, entry_stat.st_ino)
                 if identity in ancestor_identities:
-                    self.logger.error(
-                        f"快照拒绝目录循环: {entry.path}"
+                    self._report_best_effort(
+                        "error",
+                        f"快照拒绝目录循环: {entry.path}",
+                        include_print=False,
                     )
                     return False, ()
                 if identity in visited_directory_identities:
@@ -429,8 +459,10 @@ class ConfigManager(object):
                         target_is_directory=target_is_directory,
                     )
             except (OSError, TypeError, ValueError) as e:
-                self.logger.error(
-                    f"快照链接重建失败 {relative_entry}: {e}"
+                self._report_best_effort(
+                    "error",
+                    f"快照链接重建失败 {relative_entry}: {e}",
+                    include_print=False,
                 )
                 return False
 
@@ -639,8 +671,10 @@ class ConfigManager(object):
         try:
             destination_exists = os.path.lexists(destination_path)
         except (OSError, ValueError) as e:
-            self.logger.error(
-                f"快照目标安全检查失败 {destination_path}: {e}"
+            self._report_best_effort(
+                "error",
+                f"快照目标安全检查失败 {destination_path}: {e}",
+                include_print=False,
             )
             return False
         if (
@@ -691,8 +725,10 @@ class ConfigManager(object):
                 dir=parent_path,
             )
             if not self.smart_copy(src_path, staging_path):
-                self.logger.error(
-                    f"快照暂存复制失败: {src_path} -> {staging_path}"
+                self._report_best_effort(
+                    "error",
+                    f"快照暂存复制失败: {src_path} -> {staging_path}",
+                    include_print=False,
                 )
                 return False
 
