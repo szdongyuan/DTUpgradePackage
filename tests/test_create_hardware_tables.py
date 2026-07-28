@@ -36,6 +36,14 @@ VALID_CALIBRATION = {
     },
 }
 
+VALID_OUTPUT_CALIBRATION = {
+    "calibration_coefficients": [
+        0.11150234741784035,
+        1.2449542928034842e-17,
+    ],
+    "max_voltage": 8.52,
+}
+
 
 def _create_empty_system_db(tmp_path):
     db_path = tmp_path / "database" / "system_data.db"
@@ -201,7 +209,7 @@ def test_calibration_sync_imports_and_preserves_existing_payload(tmp_path, monke
         db_path,
         "SELECT * FROM hardware_channel_calibrations WHERE direction = 'input'",
     )
-    assert input_channel["calibration_type"] == "v2pa"
+    assert input_channel["calibration_type"] == "mic_v2pa"
     assert input_channel["factor_value"] == 1.0916916788093647
     assert input_channel["standard_spl"] == 94
     assert input_channel["max_voltage"] is None
@@ -214,10 +222,266 @@ def test_calibration_sync_imports_and_preserves_existing_payload(tmp_path, monke
         db_path,
         "SELECT * FROM hardware_channel_calibrations WHERE direction = 'input'",
     )
-    assert preserved_channel["calibration_type"] == "v2pa"
+    assert preserved_channel["calibration_type"] == "mic_v2pa"
     assert preserved_channel["factor_value"] == 1.0916916788093647
     assert preserved_channel["standard_spl"] == 94
     assert "calibrated_at" in preserved_channel["coefficients_json"]
+
+
+def test_output_calibration_sync_imports_expected_database_shape_without_duplicates(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = _create_empty_system_db(tmp_path)
+    _write_json(tmp_path, "ui/ui_config/last_audio_devices.json", VALID_SELECTED_DEVICES)
+    _write_json(
+        tmp_path,
+        "ui/ui_config/calibration_coefficients.json",
+        VALID_OUTPUT_CALIBRATION,
+    )
+    monkeypatch.chdir(tmp_path)
+
+    create_hardware_tables()
+    create_hardware_tables()
+
+    output_channel = _fetch_one(
+        db_path,
+        "SELECT * FROM hardware_channel_calibrations WHERE direction = 'output'",
+    )
+    assert output_channel["channel_index"] == 0
+    assert output_channel["channel_label"] == "Out1"
+    assert output_channel["calibration_type"] == "output_amplitude"
+    assert output_channel["factor_value"] is None
+    assert output_channel["standard_spl"] is None
+    assert output_channel["max_voltage"] == 8.52
+    assert json.loads(output_channel["coefficients_json"]) == {
+        "calibration_coefficients": [
+            0.11150234741784035,
+            1.2449542928034842e-17,
+        ]
+    }
+    assert (
+        _fetch_one(
+            db_path,
+            "SELECT COUNT(*) AS count FROM hardware_channel_calibrations "
+            "WHERE direction = 'output'",
+        )["count"]
+        == 1
+    )
+
+
+def test_missing_output_calibration_warns_and_leaves_placeholder(tmp_path, monkeypatch):
+    db_path = _create_empty_system_db(tmp_path)
+    _write_json(tmp_path, "ui/ui_config/last_audio_devices.json", VALID_SELECTED_DEVICES)
+    monkeypatch.chdir(tmp_path)
+
+    warnings = create_hardware_tables()
+
+    output_channel = _fetch_one(
+        db_path,
+        "SELECT * FROM hardware_channel_calibrations WHERE direction = 'output'",
+    )
+    assert output_channel["calibration_type"] is None
+    assert output_channel["max_voltage"] is None
+    assert output_channel["coefficients_json"] is None
+    assert any("扬声器输出幅度校准" in warning and "缺失" in warning for warning in warnings)
+
+
+@pytest.mark.parametrize(
+    "calibration",
+    [
+        None,
+        [],
+        {},
+        {"max_voltage": 8.52},
+        {"calibration_coefficients": [0.1], "max_voltage": 8.52},
+        {"calibration_coefficients": [0.1, 0.2, 0.3], "max_voltage": 8.52},
+        {"calibration_coefficients": [True, 0.2], "max_voltage": 8.52},
+        {"calibration_coefficients": ["bad", 0.2], "max_voltage": 8.52},
+        {"calibration_coefficients": [float("nan"), 0.2], "max_voltage": 8.52},
+        {"calibration_coefficients": [float("inf"), 0.2], "max_voltage": 8.52},
+        {"calibration_coefficients": [10**400, 0.2], "max_voltage": 8.52},
+        {"calibration_coefficients": [0.1, 0.2]},
+        {"calibration_coefficients": [0.1, 0.2], "max_voltage": True},
+        {"calibration_coefficients": [0.1, 0.2], "max_voltage": "bad"},
+        {"calibration_coefficients": [0.1, 0.2], "max_voltage": 0},
+        {"calibration_coefficients": [0.1, 0.2], "max_voltage": -1},
+        {"calibration_coefficients": [0.1, 0.2], "max_voltage": float("nan")},
+        {"calibration_coefficients": [0.1, 0.2], "max_voltage": float("inf")},
+        {"calibration_coefficients": [0.1, 0.2], "max_voltage": 10**400},
+    ],
+)
+def test_invalid_output_calibration_warns_and_leaves_placeholder(
+    tmp_path,
+    monkeypatch,
+    calibration,
+):
+    db_path = _create_empty_system_db(tmp_path)
+    _write_json(tmp_path, "ui/ui_config/last_audio_devices.json", VALID_SELECTED_DEVICES)
+    _write_json(
+        tmp_path,
+        "ui/ui_config/calibration_coefficients.json",
+        calibration,
+    )
+    monkeypatch.chdir(tmp_path)
+
+    warnings = create_hardware_tables()
+
+    output_channel = _fetch_one(
+        db_path,
+        "SELECT * FROM hardware_channel_calibrations WHERE direction = 'output'",
+    )
+    assert output_channel["calibration_type"] is None
+    assert output_channel["max_voltage"] is None
+    assert output_channel["coefficients_json"] is None
+    matching_warnings = [
+        warning
+        for warning in warnings
+        if "扬声器输出幅度校准" in warning and "缺失或不完整" in warning
+    ]
+    assert len(matching_warnings) == 1
+
+
+def test_output_calibration_is_preserved_when_later_source_is_missing(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = _create_empty_system_db(tmp_path)
+    _write_json(tmp_path, "ui/ui_config/last_audio_devices.json", VALID_SELECTED_DEVICES)
+    calibration_path = _write_json(
+        tmp_path,
+        "ui/ui_config/calibration_coefficients.json",
+        VALID_OUTPUT_CALIBRATION,
+    )
+    monkeypatch.chdir(tmp_path)
+
+    create_hardware_tables()
+    calibration_path.unlink()
+    create_hardware_tables()
+
+    output_channel = _fetch_one(
+        db_path,
+        "SELECT * FROM hardware_channel_calibrations WHERE direction = 'output'",
+    )
+    assert output_channel["calibration_type"] == "output_amplitude"
+    assert output_channel["max_voltage"] == 8.52
+    assert json.loads(output_channel["coefficients_json"]) == {
+        "calibration_coefficients": [
+            0.11150234741784035,
+            1.2449542928034842e-17,
+        ]
+    }
+
+
+def test_output_calibration_is_preserved_when_later_source_is_invalid(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = _create_empty_system_db(tmp_path)
+    _write_json(tmp_path, "ui/ui_config/last_audio_devices.json", VALID_SELECTED_DEVICES)
+    _write_json(
+        tmp_path,
+        "ui/ui_config/calibration_coefficients.json",
+        VALID_OUTPUT_CALIBRATION,
+    )
+    monkeypatch.chdir(tmp_path)
+
+    create_hardware_tables()
+    _write_json(
+        tmp_path,
+        "ui/ui_config/calibration_coefficients.json",
+        {"calibration_coefficients": [0.1], "max_voltage": 8.52},
+    )
+    create_hardware_tables()
+
+    output_channel = _fetch_one(
+        db_path,
+        "SELECT * FROM hardware_channel_calibrations WHERE direction = 'output'",
+    )
+    assert output_channel["calibration_type"] == "output_amplitude"
+    assert output_channel["max_voltage"] == 8.52
+    assert json.loads(output_channel["coefficients_json"]) == {
+        "calibration_coefficients": [
+            0.11150234741784035,
+            1.2449542928034842e-17,
+        ]
+    }
+
+
+def test_output_calibration_skips_warning_when_speaker_is_invalid(tmp_path, monkeypatch):
+    db_path = _create_empty_system_db(tmp_path)
+    selected_devices = {**VALID_SELECTED_DEVICES, "speaker": None}
+    _write_json(tmp_path, "ui/ui_config/last_audio_devices.json", selected_devices)
+    _write_json(
+        tmp_path,
+        "ui/ui_config/calibration_coefficients.json",
+        VALID_OUTPUT_CALIBRATION,
+    )
+    monkeypatch.chdir(tmp_path)
+
+    warnings = create_hardware_tables()
+
+    assert _fetch_all(
+        db_path,
+        "SELECT * FROM hardware_channel_calibrations WHERE direction = 'output'",
+    ) == []
+    assert any("扬声器信息缺失或不完整" in warning for warning in warnings)
+    assert not any("扬声器输出幅度校准" in warning for warning in warnings)
+
+
+def test_output_calibration_respects_ui_config_dir_override(tmp_path):
+    db_path = _create_empty_system_db(tmp_path)
+    alternate_dir = tmp_path / "alternate-config"
+    _write_json(alternate_dir, "last_audio_devices.json", VALID_SELECTED_DEVICES)
+    _write_json(
+        alternate_dir,
+        "calibration_coefficients.json",
+        VALID_OUTPUT_CALIBRATION,
+    )
+
+    create_hardware_tables(db_path=db_path, ui_config_dir=alternate_dir)
+
+    output_channel = _fetch_one(
+        db_path,
+        "SELECT * FROM hardware_channel_calibrations WHERE direction = 'output'",
+    )
+    assert output_channel["calibration_type"] == "output_amplitude"
+    assert output_channel["max_voltage"] == 8.52
+    assert json.loads(output_channel["coefficients_json"]) == {
+        "calibration_coefficients": [
+            0.11150234741784035,
+            1.2449542928034842e-17,
+        ]
+    }
+
+
+def test_output_calibration_normalizes_integers_and_drops_unknown_fields(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = _create_empty_system_db(tmp_path)
+    _write_json(tmp_path, "ui/ui_config/last_audio_devices.json", VALID_SELECTED_DEVICES)
+    _write_json(
+        tmp_path,
+        "ui/ui_config/calibration_coefficients.json",
+        {
+            "calibration_coefficients": [1, 2],
+            "max_voltage": 9,
+            "ignored": "must not be stored",
+        },
+    )
+    monkeypatch.chdir(tmp_path)
+
+    create_hardware_tables()
+
+    output_channel = _fetch_one(
+        db_path,
+        "SELECT * FROM hardware_channel_calibrations WHERE direction = 'output'",
+    )
+    assert json.loads(output_channel["coefficients_json"]) == {
+        "calibration_coefficients": [1.0, 2.0]
+    }
+    assert output_channel["max_voltage"] == 9.0
 
 
 def test_valid_selected_devices_without_calibration_imports_placeholders(tmp_path, monkeypatch):
@@ -390,6 +654,7 @@ def test_missing_or_unsupported_samplerate_falls_back_to_48000(
         "ui/ui_config/last_audio_devices.json",
         "ui/ui_config/mic_channel_calibration.json",
         "ui/ui_config/mic_channel_calibration.josn",
+        "ui/ui_config/calibration_coefficients.json",
     ],
 )
 def test_malformed_json_rolls_back_and_main_returns_failure(

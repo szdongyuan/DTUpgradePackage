@@ -1,4 +1,5 @@
 import json
+import math
 import sqlite3
 import sys
 import uuid
@@ -10,6 +11,9 @@ DEFAULT_UI_CONFIG_DIR = Path("ui") / "ui_config"
 DEFAULT_SELECTED_DEVICES_PATH = DEFAULT_UI_CONFIG_DIR / "last_audio_devices.json"
 DEFAULT_CALIBRATION_PATH = DEFAULT_UI_CONFIG_DIR / "mic_channel_calibration.json"
 FALLBACK_CALIBRATION_PATH = DEFAULT_UI_CONFIG_DIR / "mic_channel_calibration.josn"
+DEFAULT_OUTPUT_CALIBRATION_PATH = (
+    DEFAULT_UI_CONFIG_DIR / "calibration_coefficients.json"
+)
 LEGACY_IMPORT_UUID_NAMESPACE = uuid.UUID("7d65144d-3935-5ca8-9f30-3f6ea9e62324")
 
 WARNING_BOTH_IMPORTED = (
@@ -38,6 +42,15 @@ WARNING_CALIBRATION_INVALID = "警告：旧麦克风校准内容缺失或不完�
 WARNING_EXTRA_CALIBRATION_CHANNELS = (
     "警告：旧麦克风校准包含非 0 通道；本次旧配置导入只注册 1 个输入通道，已忽略其他通道。"
 )
+WARNING_OUTPUT_CALIBRATION_MISSING = (
+    "警告：旧扬声器输出幅度校准 JSON 缺失，已导入扬声器通道占位信息但跳过校准同步。"
+)
+WARNING_OUTPUT_CALIBRATION_INVALID = (
+    "警告：旧扬声器输出幅度校准内容缺失或不完整，已跳过校准同步。"
+)
+
+
+_MISSING_OUTPUT_CALIBRATION = object()
 
 
 CREATE_HARDWARE_ASSETS_SQL = """
@@ -276,6 +289,38 @@ def _valid_numeric(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
+def _normalize_finite_number(value):
+    if not _valid_numeric(value):
+        return None
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(normalized):
+        return None
+    return normalized
+
+
+def _normalize_output_calibration(calibration):
+    if not isinstance(calibration, dict):
+        return None
+
+    coefficients = calibration.get("calibration_coefficients")
+    if not isinstance(coefficients, (list, tuple)) or len(coefficients) != 2:
+        return None
+
+    normalized_coefficients = [
+        _normalize_finite_number(coefficient) for coefficient in coefficients
+    ]
+    normalized_max_voltage = _normalize_finite_number(calibration.get("max_voltage"))
+    if any(coefficient is None for coefficient in normalized_coefficients):
+        return None
+    if normalized_max_voltage is None or normalized_max_voltage <= 0:
+        return None
+
+    return normalized_coefficients, normalized_max_voltage
+
+
 def _load_calibration(ui_config_dir: Path, warnings, warn_if_missing=True):
     calibration_path = _select_calibration_path(ui_config_dir)
     if calibration_path is None:
@@ -283,6 +328,13 @@ def _load_calibration(ui_config_dir: Path, warnings, warn_if_missing=True):
             warnings.append(WARNING_CALIBRATION_MISSING)
         return None
     return _load_json_if_exists(calibration_path)
+
+
+def _load_output_calibration(ui_config_dir: Path):
+    output_calibration_path = ui_config_dir / DEFAULT_OUTPUT_CALIBRATION_PATH.name
+    if not output_calibration_path.exists():
+        return _MISSING_OUTPUT_CALIBRATION
+    return _load_json_if_exists(output_calibration_path)
 
 
 def _sync_calibration(conn, mic_payload, calibration, warnings):
@@ -317,7 +369,7 @@ def _sync_calibration(conn, mic_payload, calibration, warnings):
         """
         UPDATE hardware_channel_calibrations
         SET
-            calibration_type = 'v2pa',
+            calibration_type = 'mic_v2pa',
             factor_value = ?,
             standard_spl = ?,
             max_voltage = NULL,
@@ -330,6 +382,43 @@ def _sync_calibration(conn, mic_payload, calibration, warnings):
             standard_spl,
             json.dumps(channel_zero, ensure_ascii=False, sort_keys=True),
             _build_channel_id(mic_payload["hardware_id"], "input", 0),
+        ),
+    )
+
+
+def _sync_output_calibration(conn, speaker_payload, calibration, warnings):
+    if speaker_payload is None:
+        return
+    if calibration is _MISSING_OUTPUT_CALIBRATION:
+        warnings.append(WARNING_OUTPUT_CALIBRATION_MISSING)
+        return
+
+    normalized = _normalize_output_calibration(calibration)
+    if normalized is None:
+        warnings.append(WARNING_OUTPUT_CALIBRATION_INVALID)
+        return
+
+    coefficients, max_voltage = normalized
+    conn.execute(
+        """
+        UPDATE hardware_channel_calibrations
+        SET
+            calibration_type = 'output_amplitude',
+            factor_value = NULL,
+            standard_spl = NULL,
+            max_voltage = ?,
+            coefficients_json = ?,
+            updated_at = DATETIME('now', '+8 hours')
+        WHERE channel_id = ?
+        """,
+        (
+            max_voltage,
+            json.dumps(
+                {"calibration_coefficients": coefficients},
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            _build_channel_id(speaker_payload["hardware_id"], "output", 0),
         ),
     )
 
@@ -354,15 +443,23 @@ def create_hardware_tables(db_path=None, ui_config_dir=None):
             warnings,
             warn_if_missing=selected_devices is not None,
         )
+        output_calibration = _load_output_calibration(config_dir)
         mic_payload = None
+        speaker_payload = None
         if selected_devices is not None:
-            mic_payload, _speaker_payload = _import_legacy_hardware(
+            mic_payload, speaker_payload = _import_legacy_hardware(
                 conn,
                 selected_devices,
                 warnings,
             )
             if calibration is not None:
                 _sync_calibration(conn, mic_payload, calibration, warnings)
+            _sync_output_calibration(
+                conn,
+                speaker_payload,
+                output_calibration,
+                warnings,
+            )
 
         conn.commit()
     except Exception:
