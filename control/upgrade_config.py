@@ -703,6 +703,423 @@ class ConfigManager(object):
             ):
                 self._cleanup_snapshot_artifact(old_path)
 
+    @staticmethod
+    def _ordinary_config_stat_signature(entry_stat):
+        return (
+            stat.S_IFMT(entry_stat.st_mode),
+            entry_stat.st_dev,
+            entry_stat.st_ino,
+            entry_stat.st_size,
+            getattr(entry_stat, "st_mtime_ns", None),
+        )
+
+    def _ordinary_config_reparse_kind(self, path, entry_stat):
+        if not self._snapshot_entry_is_link_or_reparse(entry_stat):
+            return None, None
+
+        is_junction = bool(
+            os.name == "nt"
+            and (
+                getattr(
+                    os.path,
+                    "isjunction",
+                    lambda _path: False,
+                )(path)
+                or getattr(entry_stat, "st_reparse_tag", None)
+                == getattr(
+                    stat,
+                    "IO_REPARSE_TAG_MOUNT_POINT",
+                    0xA0000003,
+                )
+            )
+        )
+        if is_junction:
+            return "junction", None
+        if stat.S_ISLNK(entry_stat.st_mode):
+            return "symlink", None
+        return None, "unsupported_reparse"
+
+    def _ordinary_config_source_state(self, source_path):
+        try:
+            lexical_root = os.path.abspath(CONFIG_DIR)
+            lexical_path = os.path.abspath(source_path)
+            resolved_root = os.path.realpath(lexical_root)
+            resolved_path = os.path.realpath(lexical_path)
+        except (OSError, TypeError, ValueError):
+            return None, "invalid_path"
+
+        if not self._path_is_contained(lexical_path, lexical_root):
+            return None, "outside_allowed_root"
+        if not self._path_is_contained(resolved_path, resolved_root):
+            return None, "symlink_escape"
+
+        pending = [(lexical_path, os.curdir, frozenset())]
+        state_entries = []
+        source_kind = None
+        while pending:
+            current_path, relative_path, ancestor_identities = pending.pop()
+            try:
+                entry_stat = os.lstat(current_path)
+                followed_stat = os.stat(current_path)
+                current_resolved_path = os.path.realpath(current_path)
+            except FileNotFoundError:
+                return None, "missing_path"
+            except (OSError, TypeError, ValueError):
+                return None, "identity_check_failed"
+
+            if not self._path_is_contained(
+                current_resolved_path,
+                resolved_root,
+            ):
+                return None, "symlink_escape"
+
+            reparse_kind, reparse_error = (
+                self._ordinary_config_reparse_kind(
+                    current_path,
+                    entry_stat,
+                )
+            )
+            if reparse_error is not None:
+                return None, reparse_error
+
+            if stat.S_ISREG(followed_stat.st_mode):
+                entry_kind = "file"
+            elif stat.S_ISDIR(followed_stat.st_mode):
+                entry_kind = "directory"
+            else:
+                return None, "unsupported_type"
+
+            if relative_path == os.curdir:
+                source_kind = entry_kind
+
+            followed_identity = (
+                followed_stat.st_dev,
+                followed_stat.st_ino,
+            )
+            if (
+                entry_kind == "directory"
+                and followed_identity in ancestor_identities
+            ):
+                return None, "reparse_cycle"
+
+            state_entries.append(
+                (
+                    relative_path,
+                    entry_kind,
+                    reparse_kind,
+                    os.path.normcase(
+                        os.path.normpath(current_resolved_path)
+                    ),
+                    self._ordinary_config_stat_signature(entry_stat),
+                    self._ordinary_config_stat_signature(followed_stat),
+                )
+            )
+
+            if entry_kind != "directory":
+                continue
+
+            try:
+                with os.scandir(current_path) as directory_entries:
+                    child_names = sorted(
+                        entry.name for entry in directory_entries
+                    )
+            except (OSError, ValueError):
+                return None, "identity_check_failed"
+
+            child_ancestors = ancestor_identities | frozenset(
+                (followed_identity,)
+            )
+            for child_name in reversed(child_names):
+                child_relative_path = (
+                    child_name
+                    if relative_path == os.curdir
+                    else os.path.join(relative_path, child_name)
+                )
+                pending.append(
+                    (
+                        os.path.join(current_path, child_name),
+                        child_relative_path,
+                        child_ancestors,
+                    )
+                )
+
+        state_entries.sort(key=lambda entry: entry[0])
+        return (
+            source_kind,
+            os.path.normcase(os.path.normpath(lexical_path)),
+            tuple(state_entries),
+        ), None
+
+    def _ordinary_config_staging_is_safe(
+        self,
+        staging_path,
+        expected_kind,
+    ):
+        try:
+            root_stat = os.lstat(staging_path)
+        except (OSError, TypeError, ValueError):
+            return False
+
+        if self._snapshot_entry_is_link_or_reparse(root_stat):
+            return False
+        if expected_kind == "file":
+            return stat.S_ISREG(root_stat.st_mode)
+        if not stat.S_ISDIR(root_stat.st_mode):
+            return False
+
+        pending = [staging_path]
+        while pending:
+            current_path = pending.pop()
+            try:
+                with os.scandir(current_path) as directory_entries:
+                    child_paths = [
+                        entry.path for entry in directory_entries
+                    ]
+            except (OSError, ValueError):
+                return False
+
+            for child_path in child_paths:
+                try:
+                    child_stat = os.lstat(child_path)
+                except (OSError, ValueError):
+                    return False
+                if self._snapshot_entry_is_link_or_reparse(child_stat):
+                    return False
+                if stat.S_ISDIR(child_stat.st_mode):
+                    pending.append(child_path)
+                elif not stat.S_ISREG(child_stat.st_mode):
+                    return False
+
+        return True
+
+    def _ordinary_config_destination_is_current(self, destination_path):
+        try:
+            destination_relative_path = os.path.relpath(
+                destination_path,
+                DEFAULT_TARGET_DIR,
+            )
+        except (OSError, TypeError, ValueError):
+            return False, "invalid_path"
+
+        current_path, path_error = (
+            self._resolve_ordinary_config_destination(
+                destination_relative_path
+            )
+        )
+        if path_error is not None:
+            return False, path_error
+        if os.path.normcase(os.path.normpath(current_path)) != os.path.normcase(
+            os.path.normpath(destination_path)
+        ):
+            return False, "identity_check_failed"
+        return True, None
+
+    @staticmethod
+    def _reserve_sibling_artifact(parent_path, prefix):
+        file_descriptor, artifact_path = tempfile.mkstemp(
+            prefix=prefix,
+            dir=parent_path,
+        )
+        os.close(file_descriptor)
+        os.remove(artifact_path)
+        return artifact_path
+
+    def _replace_with_staged_ordinary_config(
+        self,
+        source_path,
+        destination_path,
+    ):
+        destination_path = os.path.normpath(destination_path)
+        parent_path = os.path.dirname(destination_path) or os.curdir
+        destination_name = os.path.basename(destination_path)
+        staging_path = None
+        old_path = None
+        preserve_old_path = False
+        destination_existed = False
+
+        source_state, source_error = (
+            self._ordinary_config_source_state(source_path)
+        )
+        if source_error is not None:
+            self._report_ordinary_config_source_error(source_error)
+            return False
+        source_kind = source_state[0]
+
+        destination_is_current, destination_error = (
+            self._ordinary_config_destination_is_current(
+                destination_path
+            )
+        )
+        if not destination_is_current:
+            self._report_ordinary_config_destination_error(
+                destination_error
+            )
+            return False
+
+        try:
+            os.makedirs(parent_path, exist_ok=True)
+            destination_existed = os.path.lexists(destination_path)
+            staging_path = self._reserve_sibling_artifact(
+                parent_path,
+                f".{destination_name}.staging-",
+            )
+
+            current_source_state, source_error = (
+                self._ordinary_config_source_state(source_path)
+            )
+            if (
+                source_error is not None
+                or current_source_state != source_state
+            ):
+                self._report_ordinary_config_source_error(
+                    source_error or "identity_changed"
+                )
+                return False
+
+            if not self.smart_copy(source_path, staging_path):
+                self.logger.error(
+                    "配置文件暂存复制失败: "
+                    f"{source_path} -> {staging_path}"
+                )
+                return False
+
+            current_source_state, source_error = (
+                self._ordinary_config_source_state(source_path)
+            )
+            if (
+                source_error is not None
+                or current_source_state != source_state
+            ):
+                self._report_ordinary_config_source_error(
+                    source_error or "identity_changed"
+                )
+                return False
+            if not self._ordinary_config_staging_is_safe(
+                staging_path,
+                source_kind,
+            ):
+                self.logger.error("配置文件暂存安全检查失败")
+                return False
+
+            current_source_state, source_error = (
+                self._ordinary_config_source_state(source_path)
+            )
+            if (
+                source_error is not None
+                or current_source_state != source_state
+            ):
+                self._report_ordinary_config_source_error(
+                    source_error or "identity_changed"
+                )
+                return False
+
+            destination_is_current, destination_error = (
+                self._ordinary_config_destination_is_current(
+                    destination_path
+                )
+            )
+            if not destination_is_current:
+                self._report_ordinary_config_destination_error(
+                    destination_error
+                )
+                return False
+
+            if destination_existed:
+                old_path = self._reserve_sibling_artifact(
+                    parent_path,
+                    f".{destination_name}.old-",
+                )
+                os.replace(destination_path, old_path)
+
+            os.replace(staging_path, destination_path)
+            staging_path = None
+
+            if old_path is not None:
+                if not self._cleanup_snapshot_artifact(old_path):
+                    preserve_old_path = True
+                    raise OSError("旧配置清理失败")
+                old_path = None
+
+            return True
+        except BaseException as replacement_error:
+            recovery_error = None
+            replacement_artifact = staging_path
+            old_exists = self._snapshot_path_lexists(old_path)
+            destination_exists = self._snapshot_path_lexists(
+                destination_path
+            )
+
+            if old_exists:
+                try:
+                    if destination_exists:
+                        if (
+                            replacement_artifact is None
+                            or self._snapshot_path_lexists(
+                                replacement_artifact
+                            )
+                        ):
+                            replacement_artifact = (
+                                self._reserve_sibling_artifact(
+                                    parent_path,
+                                    f".{destination_name}.staging-",
+                                )
+                            )
+                        os.replace(
+                            destination_path,
+                            replacement_artifact,
+                        )
+                    os.replace(old_path, destination_path)
+                    old_path = None
+                    preserve_old_path = False
+                except BaseException as error:
+                    recovery_error = error
+                    preserve_old_path = True
+            elif not destination_existed and destination_exists:
+                try:
+                    if (
+                        replacement_artifact is None
+                        or self._snapshot_path_lexists(
+                            replacement_artifact
+                        )
+                    ):
+                        replacement_artifact = (
+                            self._reserve_sibling_artifact(
+                                parent_path,
+                                f".{destination_name}.staging-",
+                            )
+                        )
+                    os.replace(
+                        destination_path,
+                        replacement_artifact,
+                    )
+                except BaseException as error:
+                    recovery_error = error
+
+            staging_path = replacement_artifact
+            if recovery_error is not None:
+                self._report_best_effort(
+                    "error",
+                    "配置文件替换回滚失败，恢复数据保留在 "
+                    f"{old_path}: {recovery_error}",
+                    include_print=False,
+                )
+            self._report_best_effort(
+                "error",
+                "配置文件暂存替换失败 "
+                f"{source_path} -> {destination_path}: "
+                f"{replacement_error}",
+                include_print=False,
+            )
+            return False
+        finally:
+            self._cleanup_snapshot_artifact(staging_path)
+            if (
+                old_path is not None
+                and not preserve_old_path
+                and self._snapshot_path_lexists(destination_path)
+            ):
+                self._cleanup_snapshot_artifact(old_path)
+
     def smart_remove(self, path):
         """
         智能删除方法，自动判断是文件还是目录
@@ -1371,11 +1788,7 @@ class ConfigManager(object):
                                 source_error
                             )
                             return False
-                        if not self.smart_remove(target_file_path):
-                            print("配置文件删除失败")
-                            self.logger.error("配置文件删除失败")
-                            return False
-                        if not self.smart_copy(
+                        if not self._replace_with_staged_ordinary_config(
                             new_config_file_path,
                             target_file_path,
                         ):

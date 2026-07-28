@@ -970,12 +970,8 @@ def test_existing_config_actions_run_before_json_merge_actions(
         events.append(("backup", tuple(paths)))
         return True
 
-    def track_remove(path):
-        events.append(("remove", path))
-        return True
-
-    def track_copy(source, target):
-        events.append(("copy", source, target))
+    def track_replace(source, target):
+        events.append(("replace", source, target))
         return True
 
     def track_merge(target, source):
@@ -983,8 +979,11 @@ def test_existing_config_actions_run_before_json_merge_actions(
         return True, "ok"
 
     monkeypatch.setattr(manager, "backup_config_file", track_backup)
-    monkeypatch.setattr(manager, "smart_remove", track_remove)
-    monkeypatch.setattr(manager, "smart_copy", track_copy)
+    monkeypatch.setattr(
+        manager,
+        "_replace_with_staged_ordinary_config",
+        track_replace,
+    )
     monkeypatch.setattr(
         upgrade_config,
         "merge_json_files_with_reason",
@@ -995,17 +994,16 @@ def test_existing_config_actions_run_before_json_merge_actions(
     assert manager.update_config_file() is True
 
     event_names = [event[0] for event in events]
-    assert event_names == ["backup", "remove", "copy", "backup", "merge"]
+    assert event_names == ["backup", "replace", "backup", "merge"]
     assert events[0][1] == (replacement_relative,)
     expected_replacement_target = os.path.abspath(
         os.path.join(upgrade_config.DEFAULT_TARGET_DIR, replacement_relative)
     )
-    assert events[1] == ("remove", expected_replacement_target)
-    assert events[2][2] == expected_replacement_target
-    assert events[3][1] == (merge_relative,)
+    assert events[1][2] == expected_replacement_target
+    assert events[2][1] == (merge_relative,)
 
 
-def test_ordinary_config_remove_failure_stops_before_merges_and_keeps_backup(
+def test_ordinary_config_swap_failure_stops_before_merges_and_keeps_target(
     configured_tree,
     monkeypatch,
 ):
@@ -1055,15 +1053,20 @@ def test_ordinary_config_remove_failure_stops_before_merges_and_keeps_backup(
     )
     original_target_bytes = target.read_bytes()
     original_source_bytes = source.read_bytes()
-    real_smart_remove = manager.smart_remove
+    real_replace = os.replace
     real_apply_json_merges = manager._apply_json_merges
     phase_calls = []
     helper_calls = []
 
-    def fail_target_remove(path):
-        if Path(path) == target:
-            return False
-        return real_smart_remove(path)
+    def fail_target_swap(source_path, destination_path):
+        if (
+            Path(source_path) == target
+            and Path(destination_path).name.startswith(
+                f".{target.name}.old-"
+            )
+        ):
+            raise OSError("injected ordinary target swap failure")
+        return real_replace(source_path, destination_path)
 
     def track_phase(entries):
         phase_calls.append(entries)
@@ -1073,7 +1076,7 @@ def test_ordinary_config_remove_failure_stops_before_merges_and_keeps_backup(
         helper_calls.append(args)
         return True, "ok"
 
-    monkeypatch.setattr(manager, "smart_remove", fail_target_remove)
+    monkeypatch.setattr(upgrade_config.os, "replace", fail_target_swap)
     monkeypatch.setattr(manager, "_apply_json_merges", track_phase)
     monkeypatch.setattr(
         upgrade_config,
@@ -1090,8 +1093,9 @@ def test_ordinary_config_remove_failure_stops_before_merges_and_keeps_backup(
     assert (
         configured_tree.backups["ui_config"] / "ordinary.json"
     ).read_bytes() == original_target_bytes
+    assert swap_artifacts(target) == []
     assert any(
-        "配置文件删除失败" in message
+        "配置文件升级失败" in message
         for message in logged_messages(manager, "error")
     )
 
@@ -1152,7 +1156,13 @@ def test_ordinary_config_copy_failure_stops_before_merges_and_can_restore(
     helper_calls = []
 
     def fail_ordinary_copy(source_path, target_path):
-        if Path(source_path) == source and Path(target_path) == target:
+        if (
+            Path(source_path) == source
+            and Path(target_path).parent == target.parent
+            and Path(target_path).name.startswith(
+                f".{target.name}.staging-"
+            )
+        ):
             return False
         return real_smart_copy(source_path, target_path)
 
@@ -1176,11 +1186,12 @@ def test_ordinary_config_copy_failure_stops_before_merges_and_can_restore(
 
     assert phase_calls == []
     assert helper_calls == []
-    assert not target.exists()
+    assert target.read_bytes() == original_target_bytes
     assert source.read_bytes() == original_source_bytes
     assert (
         configured_tree.backups["ui_config"] / "ordinary.json"
     ).read_bytes() == original_target_bytes
+    assert swap_artifacts(target) == []
     assert any(
         "配置文件升级失败" in message
         for message in logged_messages(manager, "error")
@@ -1188,6 +1199,316 @@ def test_ordinary_config_copy_failure_stops_before_merges_and_can_restore(
 
     assert manager.restore_config() is True
     assert target.read_bytes() == original_target_bytes
+
+
+def test_ordinary_config_old_artifact_cleanup_failure_rolls_back_target(
+    configured_tree,
+    monkeypatch,
+):
+    target = configured_tree.roots["ui_config"] / "cleanup-race.bin"
+    source = configured_tree.config_dir / "cleanup-race.bin"
+    target.write_bytes(b"\x00original-cleanup-target\xff")
+    source.write_bytes(b"\x00replacement-cleanup-source\xff")
+    original_target_bytes = target.read_bytes()
+    manager = configure_manifest_manager(
+        configured_tree,
+        [
+            (
+                "1.0",
+                {
+                    "config": ["ui/ui_config/cleanup-race.bin"],
+                    "json_merge": [],
+                },
+            )
+        ],
+    )
+    real_cleanup = manager._cleanup_snapshot_artifact
+    cleanup_failure_injected = {"value": False}
+
+    def fail_old_artifact_cleanup(path):
+        if (
+            path
+            and Path(path).name.startswith(f".{target.name}.old-")
+            and not cleanup_failure_injected["value"]
+        ):
+            cleanup_failure_injected["value"] = True
+            return False
+        return real_cleanup(path)
+
+    monkeypatch.setattr(
+        manager,
+        "_cleanup_snapshot_artifact",
+        fail_old_artifact_cleanup,
+    )
+
+    assert manager.update_config_file() is False
+
+    assert cleanup_failure_injected["value"] is True
+    assert target.is_file()
+    assert target.read_bytes() == original_target_bytes
+    assert swap_artifacts(target) == []
+
+
+def test_ordinary_config_swap_interruption_returns_false_and_restores_target(
+    configured_tree,
+    monkeypatch,
+):
+    target = configured_tree.roots["ui_config"] / "interrupted.bin"
+    source = configured_tree.config_dir / "interrupted.bin"
+    target.write_bytes(b"\x00original-interrupted-target\xff")
+    source.write_bytes(b"\x00replacement-interrupted-source\xff")
+    original_target_bytes = target.read_bytes()
+    manager = configure_manifest_manager(
+        configured_tree,
+        [
+            (
+                "1.0",
+                {
+                    "config": ["ui/ui_config/interrupted.bin"],
+                    "json_merge": [],
+                },
+            )
+        ],
+    )
+    real_replace = os.replace
+    interruption_injected = {"value": False}
+
+    def interrupt_after_staging_install(source_path, destination_path):
+        result = real_replace(source_path, destination_path)
+        if (
+            Path(destination_path) == target
+            and Path(source_path).name.startswith(
+                f".{target.name}.staging-"
+            )
+            and not interruption_injected["value"]
+        ):
+            interruption_injected["value"] = True
+            raise KeyboardInterrupt("injected ordinary swap interruption")
+        return result
+
+    monkeypatch.setattr(
+        upgrade_config.os,
+        "replace",
+        interrupt_after_staging_install,
+    )
+
+    assert manager.update_config_file() is False
+
+    assert interruption_injected["value"] is True
+    assert target.is_file()
+    assert target.read_bytes() == original_target_bytes
+    assert swap_artifacts(target) == []
+
+
+def test_ordinary_config_failed_restoration_keeps_explicit_recovery_artifact(
+    configured_tree,
+    monkeypatch,
+):
+    target = configured_tree.roots["ui_config"] / "recovery.bin"
+    source = configured_tree.config_dir / "recovery.bin"
+    target.write_bytes(b"\x00original-recovery-target\xff")
+    source.write_bytes(b"\x00replacement-recovery-source\xff")
+    original_target_bytes = target.read_bytes()
+    manager = configure_manifest_manager(
+        configured_tree,
+        [
+            (
+                "1.0",
+                {
+                    "config": ["ui/ui_config/recovery.bin"],
+                    "json_merge": [],
+                },
+            )
+        ],
+    )
+    real_replace = os.replace
+
+    def fail_install_and_restoration(source_path, destination_path):
+        source_path = Path(source_path)
+        destination_path = Path(destination_path)
+        if (
+            destination_path == target
+            and source_path.name.startswith(f".{target.name}.staging-")
+        ):
+            raise OSError("injected staging install failure")
+        if (
+            destination_path == target
+            and source_path.name.startswith(f".{target.name}.old-")
+        ):
+            raise OSError("injected original restoration failure")
+        return real_replace(source_path, destination_path)
+
+    monkeypatch.setattr(
+        upgrade_config.os,
+        "replace",
+        fail_install_and_restoration,
+    )
+
+    assert manager.update_config_file() is False
+
+    recovery_artifacts = [
+        path
+        for path in target.parent.iterdir()
+        if path.name.startswith(f".{target.name}.old-")
+    ]
+    assert not target.exists()
+    assert len(recovery_artifacts) == 1
+    assert recovery_artifacts[0].read_bytes() == original_target_bytes
+    assert not any(
+        path.name.startswith(f".{target.name}.staging-")
+        for path in target.parent.iterdir()
+    )
+
+
+@pytest.mark.parametrize("source_kind", ["file", "directory"])
+def test_ordinary_config_source_disappearance_during_copy_preserves_target(
+    configured_tree,
+    monkeypatch,
+    source_kind,
+):
+    entry_name = f"race-{source_kind}"
+    config_relative = f"ui/ui_config/{entry_name}"
+    target = configured_tree.roots["ui_config"] / entry_name
+    source = configured_tree.config_dir / entry_name
+    if source_kind == "file":
+        target.write_bytes(b"\x00original-file-target\xff")
+        source.write_bytes(b"\x00replacement-file-source\xff")
+        original_target = target.read_bytes()
+    else:
+        target.mkdir()
+        target.joinpath("original.bin").write_bytes(b"\x00original-directory\xff")
+        target.joinpath("retained.txt").write_bytes(b"retained")
+        source.mkdir()
+        source.joinpath("replacement.bin").write_bytes(b"replacement")
+        source.joinpath("new.txt").write_bytes(b"new")
+        original_target = snapshot_tree(target)
+    original_managed_root = snapshot_tree(
+        configured_tree.roots["ui_config"]
+    )
+    manager = configure_manifest_manager(
+        configured_tree,
+        [
+            (
+                "1.0",
+                {
+                    "config": [config_relative],
+                    "json_merge": [],
+                },
+            )
+        ],
+    )
+    real_smart_copy = manager.smart_copy
+    race_triggered = {"value": False}
+
+    def remove_source_immediately_before_copy(source_path, destination_path):
+        if Path(source_path) == source and not race_triggered["value"]:
+            race_triggered["value"] = True
+            assert manager.smart_remove(source_path) is True
+        return real_smart_copy(source_path, destination_path)
+
+    monkeypatch.setattr(
+        manager,
+        "smart_copy",
+        remove_source_immediately_before_copy,
+    )
+
+    assert manager.update_config_file() is False
+
+    assert race_triggered["value"] is True
+    if source_kind == "file":
+        assert target.is_file()
+        assert target.read_bytes() == original_target
+    else:
+        assert target.is_dir()
+        assert snapshot_tree(target) == original_target
+    assert snapshot_tree(
+        configured_tree.backups["ui_config"]
+    ) == original_managed_root
+    assert swap_artifacts(target) == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction regression")
+@pytest.mark.parametrize("source_kind", ["file", "directory"])
+def test_ordinary_config_external_junction_substitution_during_copy_is_rejected(
+    configured_tree,
+    monkeypatch,
+    source_kind,
+):
+    entry_name = f"junction-race-{source_kind}"
+    config_relative = f"ui/ui_config/{entry_name}"
+    target = configured_tree.roots["ui_config"] / entry_name
+    source = configured_tree.config_dir / entry_name
+    if source_kind == "file":
+        target.write_bytes(b"\x00original-file-target\xff")
+        source.write_bytes(b"\x00replacement-file-source\xff")
+        original_target = target.read_bytes()
+    else:
+        target.mkdir()
+        target.joinpath("original.bin").write_bytes(b"\x00original-directory\xff")
+        target.joinpath("retained.txt").write_bytes(b"retained")
+        source.mkdir()
+        source.joinpath("replacement.bin").write_bytes(b"replacement")
+        source.joinpath("new.txt").write_bytes(b"new")
+        original_target = snapshot_tree(target)
+    original_managed_root = snapshot_tree(
+        configured_tree.roots["ui_config"]
+    )
+    external_source = (
+        configured_tree.package_dir / f"external-{source_kind}-source"
+    )
+    external_source.mkdir()
+    external_source.joinpath("external.bin").write_bytes(
+        b"\x00external-content-must-not-be-installed\xff"
+    )
+    expected_external_tree = snapshot_tree(external_source)
+    displaced_source = (
+        configured_tree.config_dir / f".{entry_name}.displaced"
+    )
+    manager = configure_manifest_manager(
+        configured_tree,
+        [
+            (
+                "1.0",
+                {
+                    "config": [config_relative],
+                    "json_merge": [],
+                },
+            )
+        ],
+    )
+    real_smart_copy = manager.smart_copy
+    race_triggered = {"value": False}
+
+    def substitute_junction_immediately_before_copy(
+        source_path,
+        destination_path,
+    ):
+        if Path(source_path) == source and not race_triggered["value"]:
+            os.replace(source, displaced_source)
+            create_windows_junction(external_source, source)
+            race_triggered["value"] = True
+        return real_smart_copy(source_path, destination_path)
+
+    monkeypatch.setattr(
+        manager,
+        "smart_copy",
+        substitute_junction_immediately_before_copy,
+    )
+
+    assert manager.update_config_file() is False
+
+    assert race_triggered["value"] is True
+    if source_kind == "file":
+        assert target.is_file()
+        assert target.read_bytes() == original_target
+    else:
+        assert target.is_dir()
+        assert snapshot_tree(target) == original_target
+    assert snapshot_tree(external_source) == expected_external_tree
+    assert snapshot_tree(
+        configured_tree.backups["ui_config"]
+    ) == original_managed_root
+    assert swap_artifacts(target) == []
 
 
 @pytest.mark.parametrize(
