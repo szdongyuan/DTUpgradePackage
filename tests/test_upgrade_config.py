@@ -884,6 +884,195 @@ def test_windows_delete_transaction_collision_retries_relative_bound_rename(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
+@pytest.mark.parametrize("race_kind", ["source_appearance", "content_change"])
+def test_windows_delete_transaction_revalidates_after_every_collision(
+    configured_tree,
+    monkeypatch,
+    race_kind,
+):
+    manager = make_manager()
+    target = configured_tree.roots["ui_config"] / f"{race_kind}.bin"
+    target.write_bytes(b"captured")
+    source = configured_tree.config_dir / target.name
+    ops = upgrade_config.WindowsHandleOps()
+    snapshot, error = manager._preflight_ordinary_config_delete(
+        str(target),
+        str(source),
+        handle_ops=ops,
+    )
+    assert error is None
+    rename_attempts = []
+    writer_handle = None
+    write_file = None
+    if race_kind == "content_change":
+        writer_handle = ops._handle_value(
+            ops._create_file(
+                str(target),
+                0x40000000,
+                (
+                    upgrade_config._FILE_SHARE_READ
+                    | upgrade_config._FILE_SHARE_WRITE
+                    | upgrade_config._FILE_SHARE_DELETE
+                ),
+                None,
+                upgrade_config._OPEN_EXISTING,
+                upgrade_config._FILE_FLAG_OPEN_REPARSE_POINT,
+                None,
+            )
+        )
+        assert writer_handle not in (
+            None,
+            upgrade_config._INVALID_HANDLE_VALUE,
+        )
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        write_file = kernel32.WriteFile
+        write_file.argtypes = (
+            wintypes.HANDLE,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+            wintypes.LPVOID,
+        )
+        write_file.restype = wintypes.BOOL
+
+    def collide_then_change(_object_handle, _parent_handle, target_name):
+        rename_attempts.append(target_name)
+        if race_kind == "source_appearance":
+            source.write_bytes(b"appeared")
+        else:
+            assert ops._set_file_pointer(writer_handle, 0, None, 0)
+            write_buffer = ctypes.create_string_buffer(b"changed!")
+            bytes_written = wintypes.DWORD()
+            assert write_file(
+                writer_handle,
+                write_buffer,
+                8,
+                ctypes.byref(bytes_written),
+                None,
+            )
+            assert bytes_written.value == 8
+        raise upgrade_config.WindowsDeleteFailure("rename_collision")
+
+    monkeypatch.setattr(
+        ops,
+        "rename_relative_no_replace",
+        collide_then_change,
+    )
+
+    try:
+        assert manager._delete_ordinary_config_compatibility(
+            snapshot,
+            handle_ops=ops,
+        ) is False
+    finally:
+        if writer_handle is not None:
+            ops.close(writer_handle)
+    assert len(rename_attempts) == 1
+    assert target.exists()
+    assert target.read_bytes() == (
+        b"captured" if race_kind == "source_appearance" else b"changed!"
+    )
+    assert not list((configured_tree.backup_dir / "recovery").iterdir())
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
+def test_windows_delete_transaction_collision_retry_has_no_arbitrary_cap(
+    configured_tree,
+    monkeypatch,
+):
+    manager = make_manager()
+    target = configured_tree.roots["ui_config"] / "many-collisions.bin"
+    target.write_bytes(b"payload")
+    source = configured_tree.config_dir / target.name
+    ops = upgrade_config.WindowsHandleOps()
+    snapshot, error = manager._preflight_ordinary_config_delete(
+        str(target),
+        str(source),
+        handle_ops=ops,
+    )
+    assert error is None
+    real_rename = ops.rename_relative_no_replace
+    attempts = []
+
+    def collide_129_times(object_handle, parent_handle, target_name):
+        attempts.append(target_name)
+        if len(attempts) <= 129:
+            raise upgrade_config.WindowsDeleteFailure("rename_collision")
+        return real_rename(object_handle, parent_handle, target_name)
+
+    monkeypatch.setattr(
+        ops,
+        "rename_relative_no_replace",
+        collide_129_times,
+    )
+
+    assert manager._delete_ordinary_config_compatibility(
+        snapshot,
+        handle_ops=ops,
+    ) is True
+    assert len(attempts) == 130
+    assert not target.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
+@pytest.mark.parametrize(
+    ("failing_method", "expected_error"),
+    [
+        ("rename_relative_no_replace", "unsupported_probe_rename"),
+        ("set_delete_disposition", "unsupported_probe_disposition"),
+    ],
+)
+def test_delete_snapshot_proves_real_volume_capability_before_success(
+    configured_tree,
+    monkeypatch,
+    failing_method,
+    expected_error,
+):
+    manager = make_manager()
+    target = configured_tree.roots["ui_config"] / f"{failing_method}.bin"
+    target.write_bytes(b"preserve")
+    source = configured_tree.config_dir / target.name
+    ops = upgrade_config.WindowsHandleOps()
+
+    def unsupported(*_args, **_kwargs):
+        raise upgrade_config.WindowsDeleteUnsupported(expected_error)
+
+    monkeypatch.setattr(ops, failing_method, unsupported)
+
+    snapshot, error = manager._preflight_ordinary_config_delete(
+        str(target),
+        str(source),
+        handle_ops=ops,
+    )
+
+    assert snapshot is None
+    assert error == expected_error
+    assert target.read_bytes() == b"preserve"
+    recovery = configured_tree.backup_dir / "recovery"
+    assert recovery.is_dir()
+    assert not list(recovery.iterdir())
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
+def test_delete_snapshot_records_real_volume_capability_proof(configured_tree):
+    manager = make_manager()
+    target = configured_tree.roots["ui_config"] / "capability.bin"
+    target.write_bytes(b"preserve")
+    source = configured_tree.config_dir / target.name
+
+    snapshot, error = manager._preflight_ordinary_config_delete(
+        str(target),
+        str(source),
+    )
+
+    assert error is None
+    assert snapshot.capability.volume_serial == snapshot.recovery_identity[0]
+    assert snapshot.capability.relative_rename is True
+    assert snapshot.capability.disposition is True
+    assert not list((configured_tree.backup_dir / "recovery").iterdir())
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
 def test_windows_delete_transaction_exact_target_handle_blocks_final_swap(
     configured_tree,
     monkeypatch,
@@ -962,6 +1151,97 @@ def test_windows_delete_transaction_post_rename_failure_restores_locally(
     assert target.read_bytes() == b"restore-me"
     assert not list((configured_tree.backup_dir / "recovery").iterdir())
     assert not any("delete_compatibility success" in message for message in logged_messages(manager))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
+def test_windows_delete_transaction_reports_actual_location_when_restore_verification_fails(
+    configured_tree,
+    monkeypatch,
+):
+    manager = make_manager()
+    target = configured_tree.roots["ui_config"] / "restore-location.bin"
+    target.write_bytes(b"recoverable")
+    source = configured_tree.config_dir / target.name
+    ops = upgrade_config.WindowsHandleOps()
+    snapshot, error = manager._preflight_ordinary_config_delete(
+        str(target),
+        str(source),
+        handle_ops=ops,
+    )
+    assert error is None
+
+    real_target_manifest = manager._delete_target_manifest
+    manifest_failure_injected = {"done": False}
+
+    def fail_post_detach_manifest(*args, **kwargs):
+        if (
+            not manifest_failure_injected["done"]
+            and ops.last_rename is not None
+            and ops.last_rename["target_name"]
+            != snapshot.destination_name
+        ):
+            manifest_failure_injected["done"] = True
+            raise upgrade_config.WindowsDeleteFailure(
+                "injected_post_detach_verification"
+            )
+        return real_target_manifest(*args, **kwargs)
+
+    monkeypatch.setattr(
+        manager,
+        "_delete_target_manifest",
+        fail_post_detach_manifest,
+    )
+    real_named_identity = manager._delete_verify_named_identity
+    named_identity_calls = []
+
+    def fail_destination_verification(*args, **kwargs):
+        name = args[3]
+        named_identity_calls.append(name)
+        if (
+            name == snapshot.destination_name
+            and named_identity_calls.count(name) == 2
+        ):
+            return False
+        return real_named_identity(*args, **kwargs)
+
+    monkeypatch.setattr(
+        manager,
+        "_delete_verify_named_identity",
+        fail_destination_verification,
+    )
+    real_rename = ops.rename_relative_no_replace
+    target_artifact_names = []
+
+    def record_rename(object_handle, parent_handle, target_name):
+        if target_name != snapshot.destination_name:
+            target_artifact_names.append(target_name)
+        return real_rename(object_handle, parent_handle, target_name)
+
+    monkeypatch.setattr(
+        ops,
+        "rename_relative_no_replace",
+        record_rename,
+    )
+
+    assert manager._delete_ordinary_config_compatibility(
+        snapshot,
+        handle_ops=ops,
+    ) is False
+
+    assert target.read_bytes() == b"recoverable"
+    assert manifest_failure_injected["done"] is True
+    assert snapshot.destination_name in named_identity_calls
+    assert len(target_artifact_names) == 1
+    stale_artifact_path = os.path.normpath(
+        os.path.join(snapshot.recovery_path, target_artifact_names[0])
+    )
+    actual_path = os.path.normpath(str(target))
+    assert not os.path.lexists(stale_artifact_path)
+    assert actual_path in manager._ordinary_config_delete_retained_artifacts
+    assert stale_artifact_path not in manager._ordinary_config_delete_retained_artifacts
+    errors = logged_messages(manager, "error")
+    assert any(actual_path in message for message in errors)
+    assert not any(stale_artifact_path in message for message in errors)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")

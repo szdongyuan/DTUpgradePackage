@@ -1117,6 +1117,17 @@ class WindowsHandleOps:
         delete_children(root_handle, "")
 
 
+class _WindowsDeleteCapability(NamedTuple):
+    volume_serial: int
+    relative_rename: bool
+    disposition: bool
+
+
+class _OrdinaryConfigDeleteRestoreResult(NamedTuple):
+    restored: bool
+    retained_path: object
+
+
 class _OrdinaryConfigDeleteSnapshot(NamedTuple):
     source_path: str
     source_name: str
@@ -3550,6 +3561,119 @@ class ConfigManager(object):
             parent_handle,
         )
 
+    def _delete_probe_volume_capability(
+        self,
+        ops,
+        recovery_handle,
+        recovery_path,
+        expected_volume_serial,
+    ):
+        source_name = f".delete-capability-source-{uuid.uuid4().hex}"
+        target_name = f".delete-capability-target-{uuid.uuid4().hex}"
+        source_path = os.path.join(recovery_path, source_name)
+        target_path = os.path.join(recovery_path, target_name)
+        probe_handle = None
+        probe_identity = None
+        probe_error = None
+        cleanup_error = None
+        previous_last_rename = ops.last_rename
+        previous_disposition_flags = ops.last_disposition_flags
+
+        try:
+            flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_BINARY", 0)
+            )
+            descriptor = os.open(source_path, flags, 0o600)
+            os.close(descriptor)
+            probe_handle = ops.open_relative(
+                recovery_handle,
+                source_name,
+                directory=False,
+                delete=True,
+            )
+            probe_identity = ops.identity(probe_handle)
+            if probe_identity[0] != expected_volume_serial:
+                raise WindowsDeleteFailure(
+                    "capability_probe_volume_mismatch"
+                )
+
+            ops.rename_relative_no_replace(
+                probe_handle,
+                recovery_handle,
+                target_name,
+            )
+            if not ops.name_is_absent(recovery_handle, source_name):
+                raise WindowsDeleteFailure(
+                    "capability_probe_rename_failed"
+                )
+            verification_handle = ops.open_relative_attributes(
+                recovery_handle,
+                target_name,
+            )
+            try:
+                if ops.identity(verification_handle) != probe_identity:
+                    raise WindowsDeleteFailure(
+                        "capability_probe_identity_changed"
+                    )
+            finally:
+                ops.close(verification_handle)
+
+            ops.set_delete_disposition(probe_handle)
+            ops.close(probe_handle)
+            probe_handle = None
+            if not ops.name_is_absent(recovery_handle, target_name):
+                raise WindowsDeleteFailure(
+                    "capability_probe_disposition_failed"
+                )
+        except WindowsDeleteFailure as error:
+            probe_error = error
+        except (OSError, TypeError, ValueError):
+            probe_error = WindowsDeleteFailure(
+                "capability_probe_failed"
+            )
+        finally:
+            if probe_handle is not None:
+                try:
+                    ops.close(probe_handle)
+                except WindowsDeleteFailure as error:
+                    cleanup_error = error
+            for probe_path in (source_path, target_path):
+                try:
+                    if os.path.lexists(probe_path):
+                        os.remove(probe_path)
+                except (OSError, TypeError, ValueError):
+                    cleanup_error = WindowsDeleteFailure(
+                        "capability_probe_cleanup_failed"
+                    )
+            for probe_name in (source_name, target_name):
+                try:
+                    if not ops.name_is_absent(
+                        recovery_handle,
+                        probe_name,
+                    ):
+                        cleanup_error = WindowsDeleteFailure(
+                            "capability_probe_cleanup_failed"
+                        )
+                except WindowsDeleteFailure:
+                    cleanup_error = WindowsDeleteFailure(
+                        "capability_probe_cleanup_failed"
+                    )
+            ops.last_rename = previous_last_rename
+            ops.last_disposition_flags = previous_disposition_flags
+
+        if cleanup_error is not None:
+            raise cleanup_error
+        if probe_error is not None:
+            raise probe_error
+        return _WindowsDeleteCapability(
+            int(expected_volume_serial),
+            True,
+            True,
+        )
+
     def _delete_managed_root(self, destination_path):
         destination_path = self._delete_normalized_path(destination_path)
         roots = (
@@ -3783,6 +3907,12 @@ class ConfigManager(object):
                     raise WindowsDeleteFailure(
                         "recovery_volume_mismatch"
                     )
+                capability = self._delete_probe_volume_capability(
+                    ops,
+                    recovery_handle,
+                    recovery_path,
+                    destination_volume,
+                )
 
                 snapshot = _OrdinaryConfigDeleteSnapshot(
                     source_path,
@@ -3801,7 +3931,7 @@ class ConfigManager(object):
                     recovery_path,
                     recovery_chain,
                     recovery_identity,
-                    "supported",
+                    capability,
                 )
                 return snapshot, None
         except WindowsDeleteFailure as error:
@@ -3848,6 +3978,76 @@ class ConfigManager(object):
                 expected_chain,
             )
         )
+
+    def _delete_validate_before_rename_attempt(
+        self,
+        ops,
+        owner,
+        snapshot,
+        artifact_handle,
+        source_handles,
+        destination_handles,
+        recovery_handles,
+    ):
+        if not self._delete_held_chain_matches(
+            ops,
+            source_handles,
+            snapshot.source_chain,
+        ):
+            raise WindowsDeleteFailure("source_chain_changed")
+        if not self._delete_held_chain_matches(
+            ops,
+            destination_handles,
+            snapshot.destination_chain,
+        ):
+            raise WindowsDeleteFailure(
+                "destination_chain_changed"
+            )
+        if not self._delete_held_chain_matches(
+            ops,
+            recovery_handles,
+            snapshot.recovery_chain,
+        ):
+            raise WindowsDeleteFailure("recovery_chain_changed")
+
+        config_handle = source_handles[-1]
+        destination_parent_handle = destination_handles[-1]
+        recovery_handle = recovery_handles[-1]
+        if not ops.name_is_absent(
+            config_handle,
+            snapshot.source_name,
+        ):
+            raise WindowsDeleteFailure("source_appeared")
+        if (
+            ops.identity(recovery_handle)[0]
+            != snapshot.capability.volume_serial
+        ):
+            raise WindowsDeleteFailure("recovery_volume_changed")
+        if not self._delete_verify_named_identity(
+            ops,
+            owner,
+            destination_parent_handle,
+            snapshot.destination_name,
+            snapshot,
+        ):
+            raise WindowsDeleteFailure(
+                "destination_binding_changed"
+            )
+
+        current_identity = ops.identity(artifact_handle)
+        if (
+            current_identity != snapshot.destination_identity
+            or self._delete_identity_is_directory(current_identity)
+            is not snapshot.destination_directory
+            or self._delete_identity_is_reparse(current_identity)
+            or self._delete_target_manifest(
+                ops,
+                artifact_handle,
+                directory=snapshot.destination_directory,
+            )
+            != snapshot.destination_manifest
+        ):
+            raise WindowsDeleteFailure("destination_changed")
 
     def _delete_artifact_is_intact(
         self,
@@ -3907,36 +4107,37 @@ class ConfigManager(object):
     ):
         destination_parent_handle = destination_handles[-1]
         recovery_handle = recovery_handles[-1]
+        rename_back_completed = False
         try:
             if not self._delete_held_chain_matches(
                 ops,
                 source_handles,
                 snapshot.source_chain,
             ):
-                return False
+                return _OrdinaryConfigDeleteRestoreResult(False, None)
             if not self._delete_held_chain_matches(
                 ops,
                 destination_handles,
                 snapshot.destination_chain,
             ):
-                return False
+                return _OrdinaryConfigDeleteRestoreResult(False, None)
             if not self._delete_held_chain_matches(
                 ops,
                 recovery_handles,
                 snapshot.recovery_chain,
             ):
-                return False
+                return _OrdinaryConfigDeleteRestoreResult(False, None)
             if not self._delete_artifact_is_intact(
                 ops,
                 artifact_handle,
                 snapshot,
             ):
-                return False
+                return _OrdinaryConfigDeleteRestoreResult(False, None)
             if not ops.name_is_absent(
                 destination_parent_handle,
                 snapshot.destination_name,
             ):
-                return False
+                return _OrdinaryConfigDeleteRestoreResult(False, None)
             if not self._delete_verify_named_identity(
                 ops,
                 owner,
@@ -3944,33 +4145,48 @@ class ConfigManager(object):
                 artifact_name,
                 snapshot,
             ):
-                return False
+                return _OrdinaryConfigDeleteRestoreResult(False, None)
 
             ops.rename_relative_no_replace(
                 artifact_handle,
                 destination_parent_handle,
                 snapshot.destination_name,
             )
+            rename_back_completed = True
             if not ops.name_is_absent(recovery_handle, artifact_name):
-                return False
-            return self._delete_verify_named_identity(
+                return _OrdinaryConfigDeleteRestoreResult(
+                    False,
+                    snapshot.destination_path,
+                )
+            restored = self._delete_verify_named_identity(
                 ops,
                 owner,
                 destination_parent_handle,
                 snapshot.destination_name,
                 snapshot,
             )
+            return _OrdinaryConfigDeleteRestoreResult(
+                restored,
+                None if restored else snapshot.destination_path,
+            )
         except WindowsDeleteFailure:
-            return False
+            return _OrdinaryConfigDeleteRestoreResult(
+                False,
+                (
+                    snapshot.destination_path
+                    if rename_back_completed
+                    else None
+                ),
+            )
 
-    def _delete_retain_artifact(self, artifact_path):
-        normalized_path = os.path.normpath(artifact_path)
+    def _delete_retain_location(self, retained_path):
+        normalized_path = os.path.normpath(retained_path)
         self._ordinary_config_delete_retained_artifacts.add(
             normalized_path
         )
         self._report_best_effort(
             "error",
-            "delete_compatibility retained recovery artifact: "
+            "delete_compatibility retained recovery object: "
             f"{normalized_path}",
         )
 
@@ -3983,7 +4199,14 @@ class ConfigManager(object):
         ops = handle_ops or WindowsHandleOps()
         if (
             not isinstance(snapshot, _OrdinaryConfigDeleteSnapshot)
-            or snapshot.capability != "supported"
+            or not isinstance(
+                snapshot.capability,
+                _WindowsDeleteCapability,
+            )
+            or not snapshot.capability.relative_rename
+            or not snapshot.capability.disposition
+            or snapshot.capability.volume_serial
+            != snapshot.recovery_identity[0]
         ):
             self._report_best_effort(
                 "error",
@@ -4089,38 +4312,19 @@ class ConfigManager(object):
                         "destination_changed"
                     )
 
-                if not self._delete_held_chain_matches(
-                    ops,
-                    source_handles,
-                    snapshot.source_chain,
-                ):
-                    raise WindowsDeleteFailure("source_chain_changed")
-                if not self._delete_held_chain_matches(
-                    ops,
-                    destination_handles,
-                    snapshot.destination_chain,
-                ):
-                    raise WindowsDeleteFailure(
-                        "destination_chain_changed"
-                    )
-                if not self._delete_held_chain_matches(
-                    ops,
-                    recovery_handles,
-                    snapshot.recovery_chain,
-                ):
-                    raise WindowsDeleteFailure(
-                        "recovery_chain_changed"
-                    )
-                if not ops.name_is_absent(
-                    config_handle,
-                    snapshot.source_name,
-                ):
-                    raise WindowsDeleteFailure("source_appeared")
-
-                for _attempt in range(128):
+                while True:
                     candidate = (
                         f".{snapshot.destination_name}.delete-"
                         f"{uuid.uuid4().hex}"
+                    )
+                    self._delete_validate_before_rename_attempt(
+                        ops,
+                        owner,
+                        snapshot,
+                        artifact_handle,
+                        source_handles,
+                        destination_handles,
+                        recovery_handles,
                     )
                     try:
                         ops.rename_relative_no_replace(
@@ -4139,10 +4343,6 @@ class ConfigManager(object):
                     )
                     detached = True
                     break
-                else:
-                    raise WindowsDeleteFailure(
-                        "artifact_name_exhausted"
-                    )
 
                 if not ops.name_is_absent(
                     destination_parent_handle,
@@ -4231,11 +4431,16 @@ class ConfigManager(object):
                 return True
         except WindowsDeleteFailure as error:
             failure_category = error.category
+            restore_result = _OrdinaryConfigDeleteRestoreResult(
+                False,
+                None,
+            )
             if (
                 detached
                 and not root_disposition_accepted
                 and artifact_handle is not None
-                and self._delete_try_local_restore(
+            ):
+                restore_result = self._delete_try_local_restore(
                     ops,
                     owner,
                     snapshot,
@@ -4245,15 +4450,21 @@ class ConfigManager(object):
                     destination_handles,
                     recovery_handles,
                 )
-            ):
+            if restore_result.restored:
+                detached = False
+                artifact_path = None
+            elif restore_result.retained_path is not None:
+                self._delete_retain_location(
+                    restore_result.retained_path
+                )
                 detached = False
                 artifact_path = None
             elif detached and artifact_path is not None:
-                self._delete_retain_artifact(artifact_path)
+                self._delete_retain_location(artifact_path)
         except (OSError, TypeError, ValueError):
             failure_category = "transaction_failed"
             if detached and artifact_path is not None:
-                self._delete_retain_artifact(artifact_path)
+                self._delete_retain_location(artifact_path)
         finally:
             try:
                 owner.close_all()
