@@ -1129,37 +1129,164 @@ class _OrdinaryConfigDeleteRestoreResult(NamedTuple):
     previous_artifact_path_valid: bool = True
 
 
-class _OrdinaryConfigDeleteArtifactState:
-    def __init__(self, name=None, path=None):
+class _OrdinaryConfigDeleteArtifactCandidate:
+    def __init__(self, name, path, *, phase, retain_only):
         self.name = name
         self.path = path
-        self.path_valid = name is not None and path is not None
-        self.retain_only = False
-        self.pending_name = None
-        self.pending_path = None
-        self.pending_retain_only = False
+        self.phase = phase
+        self.retain_only = retain_only
+        self.rename_accepted = None
+        self.commit_known = False
+        self.conclusively_exact = False
+        self.conclusively_excluded = False
+        self.indeterminate = False
 
-    def stage_pending(self, name, path, *, retain_only):
-        self.pending_name = name
-        self.pending_path = path
-        self.pending_retain_only = retain_only
+
+class _OrdinaryConfigDeleteArtifactState:
+    def __init__(self, name=None, path=None):
+        self.candidates = []
+        self.pending_candidate = None
+        self.current_candidate = None
+        if name is not None and path is not None:
+            self.stage_pending(
+                name,
+                path,
+                phase="existing",
+                retain_only=False,
+            )
+            self.commit_pending(verified=True)
+
+    @property
+    def plausible_candidates(self):
+        return tuple(
+            candidate
+            for candidate in self.candidates
+            if not candidate.conclusively_excluded
+        )
+
+    @property
+    def name(self):
+        if self.current_candidate is None:
+            return None
+        return self.current_candidate.name
+
+    @property
+    def path(self):
+        if self.current_candidate is None:
+            return None
+        return self.current_candidate.path
+
+    @property
+    def path_valid(self):
+        return (
+            self.current_candidate is not None
+            and not self.current_candidate.conclusively_excluded
+        )
+
+    @property
+    def retain_only(self):
+        return (
+            self.current_candidate is not None
+            and self.current_candidate.retain_only
+        )
+
+    @property
+    def pending_name(self):
+        if self.pending_candidate is None:
+            return None
+        return self.pending_candidate.name
+
+    @property
+    def pending_path(self):
+        if self.pending_candidate is None:
+            return None
+        return self.pending_candidate.path
+
+    @property
+    def pending_retain_only(self):
+        return (
+            self.pending_candidate is not None
+            and self.pending_candidate.retain_only
+        )
+
+    def stage_pending(self, name, path, *, phase, retain_only):
+        if self.pending_candidate is not None:
+            self.pending_candidate.indeterminate = True
+        candidate = _OrdinaryConfigDeleteArtifactCandidate(
+            name,
+            path,
+            phase=phase,
+            retain_only=retain_only,
+        )
+        self.candidates.append(candidate)
+        self.pending_candidate = candidate
+        return candidate
+
+    def mark_pending_indeterminate(self):
+        if self.pending_candidate is not None:
+            self.pending_candidate.indeterminate = True
+
+    def exclude_candidate(self, candidate, *, rename_accepted=False):
+        candidate.rename_accepted = rename_accepted
+        candidate.conclusively_exact = False
+        candidate.conclusively_excluded = True
+        candidate.indeterminate = False
+        if self.pending_candidate is candidate:
+            self.pending_candidate = None
+        if self.current_candidate is candidate:
+            self.current_candidate = None
 
     def clear_pending(self):
-        self.pending_name = None
-        self.pending_path = None
-        self.pending_retain_only = False
+        if self.pending_candidate is not None:
+            self.exclude_candidate(self.pending_candidate)
 
-    def commit_pending(self):
-        self.name = self.pending_name
-        self.path = self.pending_path
-        self.path_valid = True
-        self.retain_only = self.pending_retain_only
-        self.clear_pending()
+    def commit_candidate(self, candidate, *, verified=False):
+        candidate.rename_accepted = True
+        candidate.commit_known = True
+        candidate.conclusively_exact = verified
+        candidate.conclusively_excluded = False
+        candidate.indeterminate = not verified
+        self.current_candidate = candidate
+        if self.pending_candidate is candidate:
+            self.pending_candidate = None
+        if verified:
+            for prior_candidate in self.candidates:
+                if prior_candidate is not candidate:
+                    self.exclude_candidate(prior_candidate)
+        return candidate
+
+    def commit_pending(self, *, verified=False):
+        candidate = self.pending_candidate
+        if candidate is None:
+            return None
+        return self.commit_candidate(candidate, verified=verified)
+
+    def confirm_current(self):
+        if self.current_candidate is not None:
+            self.commit_candidate(
+                self.current_candidate,
+                verified=True,
+            )
+
+    def select_verified_candidate(self, candidate):
+        candidate.rename_accepted = True
+        candidate.commit_known = True
+        candidate.conclusively_exact = True
+        candidate.conclusively_excluded = False
+        candidate.indeterminate = False
+        self.current_candidate = candidate
+        if self.pending_candidate is candidate:
+            self.pending_candidate = None
+        return candidate
 
     def mark_original_name(self):
-        self.path_valid = False
-        self.retain_only = False
-        self.clear_pending()
+        for candidate in self.candidates:
+            self.exclude_candidate(candidate)
+        self.pending_candidate = None
+        self.current_candidate = None
+
+    def mark_deleted(self):
+        self.mark_original_name()
 
 
 class _OrdinaryConfigDeleteSnapshot(NamedTuple):
@@ -4188,7 +4315,6 @@ class ConfigManager(object):
                 snapshot.destination_name,
             )
             rename_back_completed = True
-            artifact_state.path_valid = False
             if not ops.name_is_absent(recovery_handle, artifact_name):
                 return self._delete_redetach_after_restore_failure(
                     ops,
@@ -4199,6 +4325,11 @@ class ConfigManager(object):
                     recovery_handles,
                     artifact_state,
                 )
+            if artifact_state.current_candidate is not None:
+                artifact_state.exclude_candidate(
+                    artifact_state.current_candidate,
+                    rename_accepted=True,
+                )
             restored = self._delete_verify_named_identity(
                 ops,
                 owner,
@@ -4207,6 +4338,7 @@ class ConfigManager(object):
                 snapshot,
             )
             if restored:
+                artifact_state.mark_original_name()
                 return _OrdinaryConfigDeleteRestoreResult(
                     True,
                     None,
@@ -4259,6 +4391,7 @@ class ConfigManager(object):
             artifact_state.stage_pending(
                 candidate,
                 candidate_path,
+                phase="recovery_redetach",
                 retain_only=True,
             )
             try:
@@ -4280,6 +4413,28 @@ class ConfigManager(object):
                 artifact_state.clear_pending()
                 if error.category == "rename_collision":
                     continue
+                reconciled_location = (
+                    self._delete_reconcile_artifact_candidates(
+                        ops,
+                        owner,
+                        snapshot,
+                        destination_parent_handle,
+                        recovery_handle,
+                        artifact_state,
+                    )
+                )
+                if reconciled_location == "original":
+                    return _OrdinaryConfigDeleteRestoreResult(
+                        True,
+                        None,
+                        False,
+                    )
+                if reconciled_location == "candidate":
+                    return _OrdinaryConfigDeleteRestoreResult(
+                        False,
+                        artifact_state.path,
+                        False,
+                    )
                 self._report_best_effort(
                     "error",
                     "delete_compatibility recovery re-detach failed: "
@@ -4302,7 +4457,7 @@ class ConfigManager(object):
                 )
                 if rename_location == "candidate":
                     rename_accepted = True
-                    artifact_state.commit_pending()
+                    artifact_state.commit_pending(verified=True)
                 elif rename_location == "original":
                     artifact_state.mark_original_name()
                 else:
@@ -4311,6 +4466,7 @@ class ConfigManager(object):
                         owner,
                         snapshot,
                         artifact_handle,
+                        destination_parent_handle,
                         recovery_handle,
                         artifact_state,
                     )
@@ -4366,6 +4522,7 @@ class ConfigManager(object):
                     candidate_path if rename_accepted else None,
                     False,
                 )
+            artifact_state.confirm_current()
             return _OrdinaryConfigDeleteRestoreResult(
                 False,
                 candidate_path,
@@ -4520,12 +4677,60 @@ class ConfigManager(object):
             return "candidate"
         return "indeterminate"
 
+    def _delete_reconcile_artifact_candidates(
+        self,
+        ops,
+        owner,
+        snapshot,
+        destination_parent_handle,
+        recovery_handle,
+        artifact_state,
+    ):
+        exact_candidates = []
+        for candidate in artifact_state.plausible_candidates:
+            try:
+                candidate_matches = self._delete_verify_named_identity(
+                    ops,
+                    owner,
+                    recovery_handle,
+                    candidate.name,
+                    snapshot,
+                )
+            except BaseException:
+                candidate.indeterminate = True
+                continue
+            if candidate_matches:
+                exact_candidates.append(candidate)
+            else:
+                artifact_state.exclude_candidate(candidate)
+
+        try:
+            original_matches = self._delete_verify_named_identity(
+                ops,
+                owner,
+                destination_parent_handle,
+                snapshot.destination_name,
+                snapshot,
+            )
+        except BaseException:
+            original_matches = None
+        if original_matches is True:
+            artifact_state.mark_original_name()
+            return "original"
+        if not exact_candidates:
+            return "indeterminate"
+        artifact_state.select_verified_candidate(
+            exact_candidates[-1]
+        )
+        return "candidate"
+
     def _delete_preserve_indeterminate_exact_handle(
         self,
         ops,
         owner,
         snapshot,
         artifact_handle,
+        destination_parent_handle,
         recovery_handle,
         artifact_state,
     ):
@@ -4541,6 +4746,7 @@ class ConfigManager(object):
             artifact_state.stage_pending(
                 candidate,
                 candidate_path,
+                phase="preservation",
                 retain_only=True,
             )
             try:
@@ -4553,12 +4759,13 @@ class ConfigManager(object):
                 artifact_state.clear_pending()
                 if error.category == "rename_collision":
                     continue
+                break
             except BaseException:
-                pass
+                artifact_state.mark_pending_indeterminate()
             else:
                 artifact_state.commit_pending()
                 try:
-                    self._delete_verify_named_identity(
+                    candidate_matches = self._delete_verify_named_identity(
                         ops,
                         owner,
                         recovery_handle,
@@ -4567,6 +4774,9 @@ class ConfigManager(object):
                     )
                 except BaseException:
                     pass
+                else:
+                    if candidate_matches:
+                        artifact_state.confirm_current()
                 return True
             try:
                 candidate_matches = self._delete_verify_named_identity(
@@ -4577,14 +4787,23 @@ class ConfigManager(object):
                     snapshot,
                 )
             except BaseException:
-                candidate_matches = False
+                artifact_state.mark_pending_indeterminate()
+                candidate_matches = None
             if candidate_matches:
-                artifact_state.commit_pending()
+                artifact_state.commit_pending(verified=True)
                 return True
-            artifact_state.clear_pending()
-            artifact_state.path_valid = False
-            artifact_state.retain_only = False
-            return False
+            if candidate_matches is False:
+                artifact_state.clear_pending()
+            break
+
+        return self._delete_reconcile_artifact_candidates(
+            ops,
+            owner,
+            snapshot,
+            destination_parent_handle,
+            recovery_handle,
+            artifact_state,
+        ) != "indeterminate"
 
     def _delete_recover_after_restore_interruption(
         self,
@@ -4812,6 +5031,7 @@ class ConfigManager(object):
                     artifact_state.stage_pending(
                         candidate,
                         candidate_path,
+                        phase="initial_detach",
                         retain_only=False,
                     )
                     try:
@@ -4842,7 +5062,7 @@ class ConfigManager(object):
                             )
                         )
                         if rename_location == "candidate":
-                            artifact_state.commit_pending()
+                            artifact_state.commit_pending(verified=True)
                         elif rename_location == "original":
                             artifact_state.mark_original_name()
                         else:
@@ -4851,6 +5071,7 @@ class ConfigManager(object):
                                 owner,
                                 snapshot,
                                 artifact_handle,
+                                destination_parent_handle,
                                 recovery_handle,
                                 artifact_state,
                             )
@@ -4882,6 +5103,7 @@ class ConfigManager(object):
                     raise WindowsDeleteFailure(
                         "artifact_binding_changed"
                     )
+                artifact_state.confirm_current()
                 if (
                     ops.identity(artifact_handle)
                     != snapshot.destination_identity
@@ -4943,6 +5165,7 @@ class ConfigManager(object):
                 self._ordinary_config_delete_retained_artifacts.discard(
                     os.path.normpath(artifact_path)
                 )
+                artifact_state.mark_deleted()
                 detached = False
                 artifact_path = None
                 owner.close_all()
@@ -4985,7 +5208,7 @@ class ConfigManager(object):
                         )
                     )
                     if rename_location == "candidate":
-                        artifact_state.commit_pending()
+                        artifact_state.commit_pending(verified=True)
                     elif rename_location == "original":
                         artifact_state.mark_original_name()
                     else:
@@ -4994,9 +5217,27 @@ class ConfigManager(object):
                             owner,
                             snapshot,
                             artifact_handle,
+                            destination_parent_handle,
                             recovery_handle,
                             artifact_state,
                         )
+                except BaseException:
+                    pass
+            if (
+                artifact_state is not None
+                and artifact_handle is not None
+                and not artifact_state.path_valid
+                and artifact_state.plausible_candidates
+            ):
+                try:
+                    self._delete_reconcile_artifact_candidates(
+                        ops,
+                        owner,
+                        snapshot,
+                        destination_parent_handle,
+                        recovery_handle,
+                        artifact_state,
+                    )
                 except BaseException:
                     pass
             if (

@@ -21,6 +21,116 @@ class WindowsHandleInstrumentationSignal(BaseException):
     pass
 
 
+def test_delete_artifact_ledger_stages_candidates_without_overwriting_prior_location():
+    state = upgrade_config._OrdinaryConfigDeleteArtifactState()
+
+    initial = state.stage_pending(
+        "initial",
+        "recovery/initial",
+        phase="initial_detach",
+        retain_only=False,
+    )
+    preservation = state.stage_pending(
+        "preservation",
+        "recovery/preservation",
+        phase="preservation",
+        retain_only=True,
+    )
+
+    assert state.candidates == [initial, preservation]
+    assert initial.indeterminate is True
+    assert initial.conclusively_excluded is False
+    assert state.pending_candidate is preservation
+
+
+def test_delete_artifact_ledger_collision_excludes_only_colliding_candidate():
+    state = upgrade_config._OrdinaryConfigDeleteArtifactState()
+    initial = state.stage_pending(
+        "initial",
+        "recovery/initial",
+        phase="initial_detach",
+        retain_only=False,
+    )
+    collision = state.stage_pending(
+        "collision",
+        "recovery/collision",
+        phase="preservation",
+        retain_only=True,
+    )
+
+    state.clear_pending()
+
+    assert collision.conclusively_excluded is True
+    assert collision.rename_accepted is False
+    assert initial.conclusively_excluded is False
+    assert state.plausible_candidates == (initial,)
+
+
+def test_delete_artifact_ledger_verified_commit_retires_prior_candidates():
+    state = upgrade_config._OrdinaryConfigDeleteArtifactState()
+    initial = state.stage_pending(
+        "initial",
+        "recovery/initial",
+        phase="initial_detach",
+        retain_only=False,
+    )
+    state.stage_pending(
+        "preservation",
+        "recovery/preservation",
+        phase="preservation",
+        retain_only=True,
+    )
+
+    committed = state.commit_pending(verified=True)
+
+    assert committed.commit_known is True
+    assert committed.rename_accepted is True
+    assert state.current_candidate is committed
+    assert state.path == "recovery/preservation"
+    assert initial.conclusively_excluded is True
+    assert state.plausible_candidates == (committed,)
+
+
+def test_delete_artifact_ledger_preservation_failure_keeps_prior_candidate_plausible():
+    state = upgrade_config._OrdinaryConfigDeleteArtifactState()
+    initial = state.stage_pending(
+        "initial",
+        "recovery/initial",
+        phase="initial_detach",
+        retain_only=False,
+    )
+    preservation = state.stage_pending(
+        "preservation",
+        "recovery/preservation",
+        phase="preservation",
+        retain_only=True,
+    )
+
+    state.clear_pending()
+
+    assert preservation.conclusively_excluded is True
+    assert initial.indeterminate is True
+    assert state.plausible_candidates == (initial,)
+
+
+def test_delete_artifact_ledger_conclusive_deletion_retires_every_candidate():
+    state = upgrade_config._OrdinaryConfigDeleteArtifactState()
+    state.stage_pending(
+        "initial",
+        "recovery/initial",
+        phase="initial_detach",
+        retain_only=False,
+    )
+    state.commit_pending()
+
+    state.mark_deleted()
+
+    assert state.plausible_candidates == ()
+    assert state.current_candidate is None
+    assert state.pending_candidate is None
+    assert state.path_valid is False
+
+
 def _assert_disposed_handles_close_before_parent(events):
     active_by_handle = {}
     active_in_acquisition_order = []
@@ -1976,6 +2086,101 @@ def test_windows_delete_indeterminate_preservation_keeps_successful_rename_candi
     assert manager.restore_config() is True
     assert target.read_bytes() == b"recoverable"
     assert Path(retained_path).read_bytes() == b"recoverable"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
+@pytest.mark.parametrize(
+    "exception_type",
+    [RuntimeError, KeyboardInterrupt, SystemExit],
+)
+def test_windows_delete_failed_preservation_retains_prior_accepted_candidate(
+    configured_tree,
+    monkeypatch,
+    exception_type,
+):
+    manager = make_manager()
+    target = configured_tree.roots["ui_config"] / (
+        f"failed-preservation-{exception_type.__name__}.bin"
+    )
+    target.write_bytes(b"recoverable")
+    original_identity = (target.stat().st_dev, target.stat().st_ino)
+    source = configured_tree.config_dir / target.name
+    events = []
+    ops = upgrade_config.WindowsHandleOps(event_sink=events.append)
+    snapshot, error = manager._preflight_ordinary_config_delete(
+        str(target),
+        str(source),
+        handle_ops=ops,
+    )
+    assert error is None
+    assert manager.backup_config_file(
+        [f"ui/ui_config/{target.name}"]
+    ) is True
+    events.clear()
+    real_rename = ops.rename_relative_no_replace
+    rename_calls = []
+    boundary_message = (
+        f"injected accepted initial rename {exception_type.__name__}"
+    )
+
+    def accept_initial_then_fail_preservation(
+        object_handle,
+        parent_handle,
+        target_name,
+    ):
+        rename_calls.append(target_name)
+        if len(rename_calls) == 1:
+            real_rename(object_handle, parent_handle, target_name)
+            raise exception_type(boundary_message)
+        raise upgrade_config.WindowsDeleteFailure("access_denied")
+
+    monkeypatch.setattr(
+        ops,
+        "rename_relative_no_replace",
+        accept_initial_then_fail_preservation,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_delete_reconcile_pending_rename",
+        lambda *args, **kwargs: "indeterminate",
+    )
+
+    with pytest.raises(exception_type, match=boundary_message):
+        manager._delete_ordinary_config_compatibility(
+            snapshot,
+            handle_ops=ops,
+        )
+
+    assert len(rename_calls) == 3
+    assert rename_calls[0].startswith(f".{target.name}.delete-")
+    assert rename_calls[1].startswith(f".{target.name}.recovery-")
+    assert rename_calls[2] == target.name
+    initial_path = os.path.normpath(
+        os.path.join(snapshot.recovery_path, rename_calls[0])
+    )
+    failed_preservation_path = os.path.normpath(
+        os.path.join(snapshot.recovery_path, rename_calls[1])
+    )
+    assert not target.exists()
+    assert Path(initial_path).read_bytes() == b"recoverable"
+    assert (os.stat(initial_path).st_dev, os.stat(initial_path).st_ino) == (
+        original_identity
+    )
+    assert not os.path.lexists(failed_preservation_path)
+    assert manager._ordinary_config_delete_retained_artifacts == {
+        initial_path
+    }
+    assert any(
+        "retained recovery object" in message
+        and initial_path in message
+        and failed_preservation_path not in message
+        for message in logged_messages(manager, "error")
+    )
+    _assert_opened_handles_close_in_reverse_order(events)
+
+    assert manager.restore_config() is True
+    assert target.read_bytes() == b"recoverable"
+    assert Path(initial_path).read_bytes() == b"recoverable"
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
