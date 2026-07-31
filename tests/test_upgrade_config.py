@@ -1239,12 +1239,22 @@ def test_windows_delete_transaction_post_rename_failure_restores_locally(
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
 @pytest.mark.parametrize(
-    "redetach_verification_failure",
-    [None, "named_identity", "manifest"],
+    (
+        "redetach_precondition_race",
+        "redetach_verification_failure",
+    ),
+    [
+        (None, None),
+        (None, "named_identity"),
+        (None, "manifest"),
+        ("persistent_destination_verification", None),
+        ("source_appeared", None),
+    ],
 )
 def test_windows_delete_restore_verification_failure_redetaches_before_global_rollback(
     configured_tree,
     monkeypatch,
+    redetach_precondition_race,
     redetach_verification_failure,
 ):
     target = configured_tree.roots["ui_config"] / "restore-location.bin"
@@ -1308,8 +1318,22 @@ def test_windows_delete_restore_verification_failure_redetaches_before_global_ro
         named_identity_calls.append(name)
         if (
             name == target.name
-            and named_identity_calls.count(name) == 2
+            and (
+                named_identity_calls.count(name) == 2
+                or (
+                    redetach_precondition_race
+                    == "persistent_destination_verification"
+                    and named_identity_calls.count(name) >= 2
+                )
+            )
         ):
+            if (
+                redetach_precondition_race == "source_appeared"
+                and named_identity_calls.count(name) == 2
+            ):
+                (configured_tree.config_dir / target.name).write_bytes(
+                    b"appeared-after-delete-linearization"
+                )
             return False
         if (
             redetach_verification_failure == "named_identity"
@@ -1355,6 +1379,15 @@ def test_windows_delete_restore_verification_failure_redetaches_before_global_ro
         redetach_verification_failure == "manifest"
     )
     assert target.name in named_identity_calls
+    if (
+        redetach_precondition_race
+        == "persistent_destination_verification"
+    ):
+        assert named_identity_calls.count(target.name) == 2
+    if redetach_precondition_race == "source_appeared":
+        assert (
+            configured_tree.config_dir / target.name
+        ).read_bytes() == b"appeared-after-delete-linearization"
     assert len(target_artifact_names) == 2
     retained_paths = manager._ordinary_config_delete_retained_artifacts
     assert len(retained_paths) == 1

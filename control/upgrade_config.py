@@ -4160,7 +4160,6 @@ class ConfigManager(object):
                     owner,
                     snapshot,
                     artifact_handle,
-                    source_handles,
                     destination_handles,
                     recovery_handles,
                 )
@@ -4182,7 +4181,6 @@ class ConfigManager(object):
                 owner,
                 snapshot,
                 artifact_handle,
-                source_handles,
                 destination_handles,
                 recovery_handles,
             )
@@ -4193,7 +4191,6 @@ class ConfigManager(object):
                     owner,
                     snapshot,
                     artifact_handle,
-                    source_handles,
                     destination_handles,
                     recovery_handles,
                 )
@@ -4205,7 +4202,6 @@ class ConfigManager(object):
         owner,
         snapshot,
         artifact_handle,
-        source_handles,
         destination_handles,
         recovery_handles,
     ):
@@ -4222,12 +4218,10 @@ class ConfigManager(object):
             )
             rename_accepted = False
             try:
-                self._delete_validate_before_rename_attempt(
+                self._delete_validate_before_recovery_redetach_attempt(
                     ops,
-                    owner,
                     snapshot,
                     artifact_handle,
-                    source_handles,
                     destination_handles,
                     recovery_handles,
                 )
@@ -4306,6 +4300,54 @@ class ConfigManager(object):
                 candidate_path,
                 False,
             )
+
+    def _delete_validate_before_recovery_redetach_attempt(
+        self,
+        ops,
+        snapshot,
+        artifact_handle,
+        destination_handles,
+        recovery_handles,
+    ):
+        if not self._delete_held_chain_matches(
+            ops,
+            destination_handles,
+            snapshot.destination_chain,
+        ):
+            raise WindowsDeleteFailure(
+                "destination_chain_changed"
+            )
+        if not self._delete_held_chain_matches(
+            ops,
+            recovery_handles,
+            snapshot.recovery_chain,
+        ):
+            raise WindowsDeleteFailure("recovery_chain_changed")
+
+        recovery_identity = ops.identity(recovery_handles[-1])
+        if (
+            recovery_identity != snapshot.recovery_identity
+            or recovery_identity[0]
+            != snapshot.capability.volume_serial
+        ):
+            raise WindowsDeleteFailure(
+                "recovery_directory_changed"
+            )
+
+        current_identity = ops.identity(artifact_handle)
+        if (
+            current_identity != snapshot.destination_identity
+            or self._delete_identity_is_directory(current_identity)
+            is not snapshot.destination_directory
+            or self._delete_identity_is_reparse(current_identity)
+            or self._delete_target_manifest(
+                ops,
+                artifact_handle,
+                directory=snapshot.destination_directory,
+            )
+            != snapshot.destination_manifest
+        ):
+            raise WindowsDeleteFailure("recovery_object_changed")
 
     def _delete_retain_location(self, retained_path):
         normalized_path = os.path.normpath(retained_path)
