@@ -1,4 +1,6 @@
 import builtins
+import ctypes
+import hashlib
 import json
 import os
 import subprocess
@@ -10,6 +12,380 @@ import yaml
 
 from base.json_merge import merge_json_files_with_reason as real_merge_json_files_with_reason
 from control import upgrade_config
+
+
+def test_windows_handle_ctypes_layouts_are_stable():
+    assert ctypes.sizeof(upgrade_config._FILE_ID_128) == 16
+    assert upgrade_config._FILE_ID_INFO.FileId.offset == 8
+    assert ctypes.sizeof(upgrade_config._FILE_ID_INFO) == 24
+    assert upgrade_config._FILE_RENAME_INFO_HEADER.RootDirectory.offset == (
+        8 if ctypes.sizeof(ctypes.c_void_p) == 8 else 4
+    )
+    assert upgrade_config._FILE_RENAME_INFO_HEADER.FileName.offset == (
+        20 if ctypes.sizeof(ctypes.c_void_p) == 8 else 12
+    )
+    assert ctypes.sizeof(upgrade_config._FILE_DISPOSITION_INFO_EX) == 4
+    assert (
+        upgrade_config._WINDOWS_DISPOSITION_REQUIRED_FLAGS
+        == upgrade_config._FILE_DISPOSITION_DELETE
+        | upgrade_config._FILE_DISPOSITION_POSIX_SEMANTICS
+        | upgrade_config._FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE
+    )
+
+
+def test_windows_handle_owner_closes_once_in_reverse_order_on_baseexception():
+    closed = []
+    owner = upgrade_config.WindowsHandleOwner(closed.append)
+
+    with pytest.raises(FatalReplacementSignal):
+        with owner:
+            owner.acquire(11)
+            owner.acquire(22)
+            owner.acquire(33)
+            owner.release(22)
+            owner.acquire(22)
+            raise FatalReplacementSignal()
+
+    assert closed == [22, 33, 11]
+    owner.close_all()
+    assert closed == [22, 33, 11]
+
+
+def test_windows_handle_owner_finishes_closing_after_close_baseexception():
+    closed = []
+
+    def close(handle):
+        closed.append(handle)
+        if handle == 2:
+            raise FatalReplacementSignal()
+
+    owner = upgrade_config.WindowsHandleOwner(close)
+    owner.acquire(1)
+    owner.acquire(2)
+    owner.acquire(3)
+
+    with pytest.raises(FatalReplacementSignal):
+        owner.close_all()
+
+    assert closed == [3, 2, 1]
+    owner.close_all()
+    assert closed == [3, 2, 1]
+
+
+def test_windows_handle_failures_are_non_sensitive():
+    sensitive_path = r"C:\TOP_SECRET\payload.txt"
+    sensitive_contents = "TOP_SECRET_CONTENTS"
+    failure = upgrade_config.WindowsDeleteFailure(
+        "relative_open_failed",
+        sensitive_path,
+        sensitive_contents,
+    )
+    unsupported = upgrade_config.WindowsDeleteUnsupported(
+        "unsupported_filesystem",
+        sensitive_path,
+    )
+
+    assert failure.category == "relative_open_failed"
+    assert str(failure) == "relative_open_failed"
+    assert unsupported.category == "unsupported_filesystem"
+    assert str(unsupported) == "unsupported_filesystem"
+    assert sensitive_path not in repr(failure)
+    assert sensitive_contents not in repr(failure)
+
+
+def test_windows_handle_adapter_import_and_platform_availability(monkeypatch):
+    ops = upgrade_config.WindowsHandleOps(platform_name="not-windows")
+    assert ops.is_supported() is False
+    assert ops.unsupported_category == "unsupported_platform"
+
+    ops = upgrade_config.WindowsHandleOps(platform_name="nt")
+    monkeypatch.setattr(ops, "_load_bindings", lambda: False)
+    assert ops.is_supported() is False
+    assert ops.unsupported_category == "unsupported_api"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
+def test_windows_handle_open_protocol_identity_and_ancestor_binding(tmp_path):
+    directory = tmp_path / "ancestor"
+    directory.mkdir()
+    ops = upgrade_config.WindowsHandleOps()
+    assert ops.is_supported() is True
+
+    handle = ops.open_absolute(str(directory), directory=True)
+    try:
+        audit = ops.last_open_protocol
+        assert audit["desired_access"] == (
+            upgrade_config._FILE_READ_ATTRIBUTES
+            | upgrade_config._FILE_LIST_DIRECTORY
+        )
+        assert audit["share_mode"] == (
+            upgrade_config._FILE_SHARE_READ
+            | upgrade_config._FILE_SHARE_WRITE
+        )
+        assert not audit["share_mode"] & upgrade_config._FILE_SHARE_DELETE
+        assert audit["flags"] & upgrade_config._FILE_FLAG_BACKUP_SEMANTICS
+        assert audit["flags"] & upgrade_config._FILE_FLAG_OPEN_REPARSE_POINT
+
+        identity = ops.identity(handle)
+        assert isinstance(identity[0], int)
+        assert len(identity[1]) == 16
+        assert identity[2] & upgrade_config._FILE_ATTRIBUTE_DIRECTORY
+
+        with pytest.raises(OSError):
+            os.rename(directory, tmp_path / "rebound")
+    finally:
+        ops.close(handle)
+
+    os.rename(directory, tmp_path / "rebound")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
+def test_windows_handle_target_access_and_relative_open_do_not_follow_reparse(
+    tmp_path,
+):
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    child = parent / "child.txt"
+    child.write_bytes(b"child-data")
+    external = tmp_path / "external"
+    external.mkdir()
+    junction = parent / "junction"
+    result = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(external)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+
+    ops = upgrade_config.WindowsHandleOps()
+    parent_handle = ops.open_absolute(str(parent), directory=True)
+    child_handle = None
+    junction_handle = None
+    try:
+        child_handle = ops.open_relative(
+            parent_handle,
+            child.name,
+            directory=False,
+            delete=True,
+        )
+        audit = ops.last_open_protocol
+        assert audit["relative"] is True
+        assert audit["desired_access"] == (
+            upgrade_config._DELETE
+            | upgrade_config._FILE_READ_ATTRIBUTES
+            | upgrade_config._GENERIC_READ
+            | upgrade_config._SYNCHRONIZE
+        )
+        assert not audit["share_mode"] & upgrade_config._FILE_SHARE_DELETE
+        assert audit["flags"] & upgrade_config._FILE_FLAG_OPEN_REPARSE_POINT
+        assert ops.read_digest(child_handle) == hashlib.sha256(
+            b"child-data"
+        ).hexdigest()
+
+        junction_handle = ops.open_relative(
+            parent_handle,
+            junction.name,
+            directory=True,
+            delete=True,
+        )
+        junction_identity = ops.identity(junction_handle)
+        assert junction_identity[2] & upgrade_config._FILE_ATTRIBUTE_REPARSE_POINT
+        assert junction_identity[3] != 0
+    finally:
+        if junction_handle is not None:
+            ops.close(junction_handle)
+        if child_handle is not None:
+            ops.close(child_handle)
+        ops.close(parent_handle)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
+def test_windows_handle_final_name_absence_is_fail_closed(tmp_path, monkeypatch):
+    parent = tmp_path / "source"
+    parent.mkdir()
+    (parent / "present.txt").write_text("present", encoding="utf-8")
+    ops = upgrade_config.WindowsHandleOps()
+    parent_handle = ops.open_absolute(str(parent), directory=True)
+    try:
+        assert ops.name_is_absent(parent_handle, "missing.txt") is True
+        assert ops.name_is_absent(parent_handle, "present.txt") is False
+
+        monkeypatch.setattr(
+            ops,
+            "_nt_open_relative",
+            lambda *_args, **_kwargs: (None, 0xC0000022),
+        )
+        with pytest.raises(
+            upgrade_config.WindowsDeleteFailure,
+            match="source_absence_indeterminate",
+        ):
+            ops.name_is_absent(parent_handle, "denied.txt")
+
+        monkeypatch.setattr(
+            ops,
+            "_nt_open_relative",
+            lambda *_args, **_kwargs: (None, 0xC000003A),
+        )
+        with pytest.raises(
+            upgrade_config.WindowsDeleteFailure,
+            match="source_parent_changed",
+        ):
+            ops.name_is_absent(parent_handle, "parent-missing.txt")
+    finally:
+        ops.close(parent_handle)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
+def test_windows_handle_relative_no_replace_rename_and_collision(tmp_path):
+    source_dir = tmp_path / "source"
+    recovery_dir = tmp_path / "recovery"
+    source_dir.mkdir()
+    recovery_dir.mkdir()
+    source = source_dir / "payload.txt"
+    source.write_bytes(b"payload")
+    collision_source = source_dir / "collision-source.txt"
+    collision_source.write_bytes(b"new")
+    collision = recovery_dir / "collision.txt"
+    collision.write_bytes(b"existing")
+
+    ops = upgrade_config.WindowsHandleOps()
+    recovery_handle = ops.open_absolute(str(recovery_dir), directory=True)
+    source_handle = ops.open_absolute(str(source), directory=False, delete=True)
+    collision_handle = ops.open_absolute(
+        str(collision_source),
+        directory=False,
+        delete=True,
+    )
+    try:
+        ops.rename_relative_no_replace(
+            source_handle,
+            recovery_handle,
+            "artifact.txt",
+        )
+        assert not source.exists()
+        assert ops.identity(source_handle)[1]
+        ops.close(source_handle)
+        source_handle = None
+        assert (recovery_dir / "artifact.txt").read_bytes() == b"payload"
+        assert ops.last_rename["root_directory"] == recovery_handle
+        assert ops.last_rename["replace"] is False
+
+        with pytest.raises(
+            upgrade_config.WindowsDeleteFailure,
+            match="rename_collision",
+        ):
+            ops.rename_relative_no_replace(
+                collision_handle,
+                recovery_handle,
+                collision.name,
+            )
+        assert collision.read_bytes() == b"existing"
+        ops.close(collision_handle)
+        collision_handle = None
+        assert collision_source.read_bytes() == b"new"
+    finally:
+        if collision_handle is not None:
+            ops.close(collision_handle)
+        if source_handle is not None:
+            ops.close(source_handle)
+        ops.close(recovery_handle)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
+def test_windows_handle_disposition_flags_exact_object_and_unsupported(
+    tmp_path,
+    monkeypatch,
+):
+    target = tmp_path / "readonly.txt"
+    target.write_bytes(b"delete me")
+    target.chmod(0o444)
+    ops = upgrade_config.WindowsHandleOps()
+    handle = ops.open_absolute(str(target), directory=False, delete=True)
+    ops.set_delete_disposition(handle)
+    assert (
+        ops.last_disposition_flags
+        == upgrade_config._WINDOWS_DISPOSITION_REQUIRED_FLAGS
+    )
+    ops.close(handle)
+    assert not target.exists()
+
+    unsupported = tmp_path / "unsupported.txt"
+    unsupported.write_bytes(b"preserve")
+    unsupported_handle = ops.open_absolute(
+        str(unsupported),
+        directory=False,
+        delete=True,
+    )
+    monkeypatch.setattr(
+        ops,
+        "_set_file_information",
+        lambda *_args: (False, upgrade_config._ERROR_NOT_SUPPORTED),
+    )
+    try:
+        with pytest.raises(
+            upgrade_config.WindowsDeleteUnsupported,
+            match="unsupported_filesystem",
+        ):
+            ops.set_delete_disposition(unsupported_handle)
+    finally:
+        ops.close(unsupported_handle)
+    assert unsupported.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
+def test_windows_handle_manifest_enumeration_and_leaf_close_order(tmp_path):
+    root = tmp_path / "artifact"
+    leaf_parent = root / "nested"
+    leaf_parent.mkdir(parents=True)
+    (root / "root-file.txt").write_bytes(b"root")
+    (leaf_parent / "leaf.txt").write_bytes(b"leaf")
+
+    events = []
+    ops = upgrade_config.WindowsHandleOps(event_sink=events.append)
+    root_handle = ops.open_absolute(str(root), directory=True, delete=True)
+    manifest = ops.capture_manifest(root_handle, directory=True)
+    manifest_paths = [entry[0] for entry in manifest]
+    assert manifest_paths == ["nested", r"nested\leaf.txt", "root-file.txt"]
+    for _relative_path, manifest_entry in manifest:
+        assert len(manifest_entry) == 7
+        assert len(manifest_entry[1]) == 16
+
+    ops.delete_descendants(root_handle)
+    ops.set_delete_disposition(root_handle)
+    ops.close(root_handle)
+    assert not root.exists()
+
+    disposition_positions = {
+        event[1]: index
+        for index, event in enumerate(events)
+        if event[0] == "disposition"
+    }
+    close_positions = {
+        event[1]: index
+        for index, event in enumerate(events)
+        if event[0] == "close"
+    }
+    leaf_handles = [
+        event[1]
+        for event in events
+        if len(event) == 3
+        and event[0] == "opened_relative"
+        and event[2] == "leaf.txt"
+    ]
+    nested_handles = [
+        event[1]
+        for event in events
+        if len(event) == 3
+        and event[0] == "opened_relative"
+        and event[2] == "nested"
+    ]
+    assert len(leaf_handles) == len(nested_handles) == 2
+    cleanup_leaf = leaf_handles[-1]
+    cleanup_nested = nested_handles[-1]
+    assert disposition_positions[cleanup_leaf] < close_positions[cleanup_leaf]
+    assert close_positions[cleanup_leaf] < disposition_positions[cleanup_nested]
+    assert disposition_positions[cleanup_nested] < close_positions[cleanup_nested]
 
 
 class DummyLogger:

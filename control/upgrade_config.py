@@ -1,4 +1,5 @@
 import hashlib
+import ctypes
 import ntpath
 import os
 import shutil
@@ -7,6 +8,8 @@ import subprocess
 import sys
 import tempfile
 from contextlib import contextmanager
+from ctypes import wintypes
+from typing import NamedTuple
 
 from base.json_merge import merge_json_files_with_reason
 
@@ -16,6 +19,938 @@ from consts.program_config import BACKUP_AI_MODEL_CONFIG_PATH, BACKUP_SCANNER_BA
 from consts.program_config import DEFAULT_TARGET_DIR
 
 from load_yml.load_yml import Readyml
+
+
+_DELETE = 0x00010000
+_SYNCHRONIZE = 0x00100000
+_FILE_LIST_DIRECTORY = 0x00000001
+_FILE_READ_ATTRIBUTES = 0x00000080
+_GENERIC_READ = 0x80000000
+_FILE_SHARE_READ = 0x00000001
+_FILE_SHARE_WRITE = 0x00000002
+_FILE_SHARE_DELETE = 0x00000004
+_OPEN_EXISTING = 3
+_FILE_ATTRIBUTE_DIRECTORY = 0x00000010
+_FILE_ATTRIBUTE_NORMAL = 0x00000080
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+
+_FILE_ID_INFO_CLASS = 18
+_FILE_BASIC_INFO_CLASS = 0
+_FILE_STANDARD_INFO_CLASS = 1
+_FILE_ATTRIBUTE_TAG_INFO_CLASS = 9
+_FILE_ID_EXTD_DIRECTORY_INFO_CLASS = 19
+_FILE_ID_EXTD_DIRECTORY_RESTART_INFO_CLASS = 20
+_FILE_RENAME_INFO_CLASS = 3
+_FILE_DISPOSITION_INFO_EX_CLASS = 21
+
+_FILE_OPEN = 1
+_FILE_DIRECTORY_FILE = 0x00000001
+_FILE_NON_DIRECTORY_FILE = 0x00000040
+_FILE_OPEN_REPARSE_POINT = 0x00200000
+_FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020
+_OBJ_CASE_INSENSITIVE = 0x00000040
+
+_FILE_DISPOSITION_DELETE = 0x00000001
+_FILE_DISPOSITION_POSIX_SEMANTICS = 0x00000002
+_FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE = 0x00000010
+_WINDOWS_DISPOSITION_REQUIRED_FLAGS = (
+    _FILE_DISPOSITION_DELETE
+    | _FILE_DISPOSITION_POSIX_SEMANTICS
+    | _FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE
+)
+
+_STATUS_SUCCESS = 0x00000000
+_STATUS_NO_SUCH_FILE = 0xC000000F
+_STATUS_OBJECT_NAME_NOT_FOUND = 0xC0000034
+_STATUS_OBJECT_NAME_COLLISION = 0xC0000035
+_STATUS_OBJECT_PATH_NOT_FOUND = 0xC000003A
+_STATUS_NOT_SUPPORTED = 0xC00000BB
+_STATUS_INVALID_DEVICE_REQUEST = 0xC0000010
+
+_ERROR_INVALID_FUNCTION = 1
+_ERROR_FILE_NOT_FOUND = 2
+_ERROR_PATH_NOT_FOUND = 3
+_ERROR_ACCESS_DENIED = 5
+_ERROR_NO_MORE_FILES = 18
+_ERROR_NOT_SUPPORTED = 50
+_ERROR_FILE_EXISTS = 80
+_ERROR_INVALID_PARAMETER = 87
+_ERROR_ALREADY_EXISTS = 183
+
+_INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+
+class _FILE_ID_128(ctypes.Structure):
+    _fields_ = (("Identifier", ctypes.c_ubyte * 16),)
+
+
+class _FILE_ID_INFO(ctypes.Structure):
+    _fields_ = (
+        ("VolumeSerialNumber", ctypes.c_uint64),
+        ("FileId", _FILE_ID_128),
+    )
+
+
+class _FILE_BASIC_INFO(ctypes.Structure):
+    _fields_ = (
+        ("CreationTime", ctypes.c_int64),
+        ("LastAccessTime", ctypes.c_int64),
+        ("LastWriteTime", ctypes.c_int64),
+        ("ChangeTime", ctypes.c_int64),
+        ("FileAttributes", ctypes.c_uint32),
+    )
+
+
+class _FILE_STANDARD_INFO(ctypes.Structure):
+    _fields_ = (
+        ("AllocationSize", ctypes.c_int64),
+        ("EndOfFile", ctypes.c_int64),
+        ("NumberOfLinks", ctypes.c_uint32),
+        ("DeletePending", ctypes.c_ubyte),
+        ("Directory", ctypes.c_ubyte),
+    )
+
+
+class _FILE_ATTRIBUTE_TAG_INFO(ctypes.Structure):
+    _fields_ = (
+        ("FileAttributes", ctypes.c_uint32),
+        ("ReparseTag", ctypes.c_uint32),
+    )
+
+
+class _FILE_RENAME_INFO_HEADER(ctypes.Structure):
+    _fields_ = (
+        ("Flags", ctypes.c_uint32),
+        ("RootDirectory", ctypes.c_void_p),
+        ("FileNameLength", ctypes.c_uint32),
+        ("FileName", ctypes.c_uint16 * 1),
+    )
+
+
+class _FILE_DISPOSITION_INFO_EX(ctypes.Structure):
+    _fields_ = (("Flags", ctypes.c_uint32),)
+
+
+class _UNICODE_STRING(ctypes.Structure):
+    _fields_ = (
+        ("Length", ctypes.c_uint16),
+        ("MaximumLength", ctypes.c_uint16),
+        ("Buffer", ctypes.c_void_p),
+    )
+
+
+class _OBJECT_ATTRIBUTES(ctypes.Structure):
+    _fields_ = (
+        ("Length", ctypes.c_uint32),
+        ("RootDirectory", ctypes.c_void_p),
+        ("ObjectName", ctypes.POINTER(_UNICODE_STRING)),
+        ("Attributes", ctypes.c_uint32),
+        ("SecurityDescriptor", ctypes.c_void_p),
+        ("SecurityQualityOfService", ctypes.c_void_p),
+    )
+
+
+class _IO_STATUS_BLOCK_UNION(ctypes.Union):
+    _fields_ = (
+        ("Status", ctypes.c_long),
+        ("Pointer", ctypes.c_void_p),
+    )
+
+
+class _IO_STATUS_BLOCK(ctypes.Structure):
+    _anonymous_ = ("Result",)
+    _fields_ = (
+        ("Result", _IO_STATUS_BLOCK_UNION),
+        ("Information", ctypes.c_size_t),
+    )
+
+
+class _WindowsDirectoryEntry(NamedTuple):
+    name: str
+    file_id_128: bytes
+    file_attributes: int
+    reparse_tag: int
+    size: int
+    last_write_time: int
+
+
+class WindowsDeleteFailure(Exception):
+    def __init__(self, category, *_sensitive_details):
+        self.category = str(category)
+        super().__init__(self.category)
+
+
+class WindowsDeleteUnsupported(WindowsDeleteFailure):
+    pass
+
+
+class WindowsHandleOwner:
+    def __init__(self, close):
+        self._close = close
+        self._handles = []
+
+    def acquire(self, handle):
+        self._handles.append(handle)
+        return handle
+
+    def release(self, handle):
+        for index in range(len(self._handles) - 1, -1, -1):
+            if self._handles[index] == handle:
+                return self._handles.pop(index)
+        return None
+
+    def close_all(self):
+        first_error = None
+        while self._handles:
+            handle = self._handles.pop()
+            try:
+                self._close(handle)
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exception_type, _exception, _traceback):
+        try:
+            self.close_all()
+        except BaseException:
+            if exception_type is None:
+                raise
+        return False
+
+
+class WindowsHandleOps:
+    _UNSUPPORTED_WINERRORS = frozenset(
+        (
+            _ERROR_INVALID_FUNCTION,
+            _ERROR_NOT_SUPPORTED,
+            _ERROR_INVALID_PARAMETER,
+        )
+    )
+    _UNSUPPORTED_NTSTATUSES = frozenset(
+        (
+            _STATUS_NOT_SUPPORTED,
+            _STATUS_INVALID_DEVICE_REQUEST,
+        )
+    )
+    _ABSENT_NTSTATUSES = frozenset(
+        (
+            _STATUS_NO_SUCH_FILE,
+            _STATUS_OBJECT_NAME_NOT_FOUND,
+        )
+    )
+
+    def __init__(self, platform_name=None, event_sink=None):
+        self._platform_name = os.name if platform_name is None else platform_name
+        self._event_sink = event_sink
+        self._bindings_loaded = False
+        self._bindings_available = None
+        self.unsupported_category = None
+        self.last_open_protocol = None
+        self.last_rename = None
+        self.last_disposition_flags = None
+
+    @staticmethod
+    def _handle_value(handle):
+        if isinstance(handle, int):
+            return handle
+        value = getattr(handle, "value", handle)
+        return value
+
+    @staticmethod
+    def _unsigned_status(status):
+        return int(status) & 0xFFFFFFFF
+
+    def _emit(self, event):
+        if self._event_sink is not None:
+            self._event_sink(event)
+
+    def _load_bindings(self):
+        if self._bindings_loaded:
+            return bool(self._bindings_available)
+        self._bindings_loaded = True
+        try:
+            if self._platform_name != "nt":
+                self._bindings_available = False
+                return False
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+
+            self._create_file = kernel32.CreateFileW
+            self._create_file.argtypes = (
+                wintypes.LPCWSTR,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                wintypes.LPVOID,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                wintypes.HANDLE,
+            )
+            self._create_file.restype = wintypes.HANDLE
+
+            self._close_handle = kernel32.CloseHandle
+            self._close_handle.argtypes = (wintypes.HANDLE,)
+            self._close_handle.restype = wintypes.BOOL
+
+            self._get_file_information = (
+                kernel32.GetFileInformationByHandleEx
+            )
+            self._get_file_information.argtypes = (
+                wintypes.HANDLE,
+                ctypes.c_int,
+                wintypes.LPVOID,
+                wintypes.DWORD,
+            )
+            self._get_file_information.restype = wintypes.BOOL
+
+            self._set_file_information_native = (
+                kernel32.SetFileInformationByHandle
+            )
+            self._set_file_information_native.argtypes = (
+                wintypes.HANDLE,
+                ctypes.c_int,
+                wintypes.LPVOID,
+                wintypes.DWORD,
+            )
+            self._set_file_information_native.restype = wintypes.BOOL
+
+            self._set_file_pointer = kernel32.SetFilePointerEx
+            self._set_file_pointer.argtypes = (
+                wintypes.HANDLE,
+                ctypes.c_int64,
+                ctypes.POINTER(ctypes.c_int64),
+                wintypes.DWORD,
+            )
+            self._set_file_pointer.restype = wintypes.BOOL
+
+            self._read_file = kernel32.ReadFile
+            self._read_file.argtypes = (
+                wintypes.HANDLE,
+                wintypes.LPVOID,
+                wintypes.DWORD,
+                ctypes.POINTER(wintypes.DWORD),
+                wintypes.LPVOID,
+            )
+            self._read_file.restype = wintypes.BOOL
+
+            self._nt_create_file = ntdll.NtCreateFile
+            self._nt_create_file.argtypes = (
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.c_uint32,
+                ctypes.POINTER(_OBJECT_ATTRIBUTES),
+                ctypes.POINTER(_IO_STATUS_BLOCK),
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+            )
+            self._nt_create_file.restype = ctypes.c_long
+
+            self._nt_set_file_information = ntdll.NtSetInformationFile
+            self._nt_set_file_information.argtypes = (
+                wintypes.HANDLE,
+                ctypes.POINTER(_IO_STATUS_BLOCK),
+                wintypes.LPVOID,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+            )
+            self._nt_set_file_information.restype = ctypes.c_long
+        except BaseException:
+            self._bindings_available = False
+            return False
+
+        self._bindings_available = True
+        return True
+
+    def is_supported(self):
+        self.unsupported_category = None
+        if self._platform_name != "nt":
+            self.unsupported_category = "unsupported_platform"
+            return False
+        try:
+            if sys.getwindowsversion().build < 16299:
+                self.unsupported_category = "unsupported_windows_version"
+                return False
+        except (AttributeError, OSError):
+            self.unsupported_category = "unsupported_platform"
+            return False
+        if not self._load_bindings():
+            self.unsupported_category = "unsupported_api"
+            return False
+        return True
+
+    def _require_supported(self):
+        if not self.is_supported():
+            raise WindowsDeleteUnsupported(
+                self.unsupported_category or "unsupported_api"
+            )
+
+    @staticmethod
+    def _desired_access(*, directory, delete):
+        access = _FILE_READ_ATTRIBUTES
+        if directory:
+            access |= _FILE_LIST_DIRECTORY
+        else:
+            access |= _GENERIC_READ
+        if delete:
+            access |= _DELETE
+        return access
+
+    @staticmethod
+    def _open_flags(*, directory):
+        flags = _FILE_FLAG_OPEN_REPARSE_POINT
+        if directory:
+            flags |= _FILE_FLAG_BACKUP_SEMANTICS
+        return flags
+
+    def open_absolute(self, path, *, directory, delete=False):
+        self._require_supported()
+        desired_access = self._desired_access(
+            directory=directory,
+            delete=delete,
+        )
+        share_mode = _FILE_SHARE_READ | _FILE_SHARE_WRITE
+        flags = self._open_flags(directory=directory)
+        self.last_open_protocol = {
+            "relative": False,
+            "desired_access": desired_access,
+            "share_mode": share_mode,
+            "flags": flags,
+        }
+        handle = self._create_file(
+            os.fspath(path),
+            desired_access,
+            share_mode,
+            None,
+            _OPEN_EXISTING,
+            flags,
+            None,
+        )
+        handle = self._handle_value(handle)
+        if handle in (None, _INVALID_HANDLE_VALUE):
+            error_number = ctypes.get_last_error()
+            if error_number in self._UNSUPPORTED_WINERRORS:
+                raise WindowsDeleteUnsupported("unsupported_filesystem")
+            raise WindowsDeleteFailure("absolute_open_failed")
+        self._emit(("opened_absolute", handle, bool(directory)))
+        return handle
+
+    def _nt_open_relative(
+        self,
+        parent_handle,
+        name,
+        *,
+        directory,
+        delete,
+        desired_access=None,
+        synchronous=False,
+    ):
+        if desired_access is None:
+            desired_access = self._desired_access(
+                directory=directory,
+                delete=delete,
+            )
+        name_buffer = ctypes.create_unicode_buffer(str(name))
+        name_length = len(str(name).encode("utf-16-le"))
+        unicode_name = _UNICODE_STRING(
+            name_length,
+            name_length + 2,
+            ctypes.cast(name_buffer, ctypes.c_void_p),
+        )
+        object_attributes = _OBJECT_ATTRIBUTES(
+            ctypes.sizeof(_OBJECT_ATTRIBUTES),
+            self._handle_value(parent_handle),
+            ctypes.pointer(unicode_name),
+            _OBJ_CASE_INSENSITIVE,
+            None,
+            None,
+        )
+        io_status = _IO_STATUS_BLOCK()
+        opened_handle = ctypes.c_void_p()
+        create_options = _FILE_OPEN_REPARSE_POINT
+        if synchronous:
+            desired_access |= _SYNCHRONIZE
+            create_options |= _FILE_SYNCHRONOUS_IO_NONALERT
+        if directory is True:
+            create_options |= _FILE_DIRECTORY_FILE
+        elif directory is False:
+            create_options |= _FILE_NON_DIRECTORY_FILE
+        status = self._nt_create_file(
+            ctypes.byref(opened_handle),
+            desired_access,
+            ctypes.byref(object_attributes),
+            ctypes.byref(io_status),
+            None,
+            _FILE_ATTRIBUTE_NORMAL,
+            _FILE_SHARE_READ | _FILE_SHARE_WRITE,
+            _FILE_OPEN,
+            create_options,
+            None,
+            0,
+        )
+        unsigned_status = self._unsigned_status(status)
+        if unsigned_status == _STATUS_SUCCESS:
+            return opened_handle.value, unsigned_status
+        return None, unsigned_status
+
+    def open_relative(
+        self,
+        parent_handle,
+        name,
+        *,
+        directory,
+        delete=False,
+    ):
+        self._require_supported()
+        desired_access = self._desired_access(
+            directory=directory,
+            delete=delete,
+        ) | _SYNCHRONIZE
+        share_mode = _FILE_SHARE_READ | _FILE_SHARE_WRITE
+        flags = self._open_flags(directory=directory)
+        self.last_open_protocol = {
+            "relative": True,
+            "desired_access": desired_access,
+            "share_mode": share_mode,
+            "flags": flags,
+        }
+        handle, status = self._nt_open_relative(
+            parent_handle,
+            name,
+            directory=directory,
+            delete=delete,
+            desired_access=desired_access,
+            synchronous=True,
+        )
+        if handle is None:
+            if status in self._UNSUPPORTED_NTSTATUSES:
+                raise WindowsDeleteUnsupported("unsupported_filesystem")
+            raise WindowsDeleteFailure("relative_open_failed")
+        self._emit(("opened_relative", handle, str(name)))
+        return handle
+
+    def _query_information(self, handle, information_class, structure):
+        information = structure()
+        if not self._get_file_information(
+            handle,
+            information_class,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+        ):
+            error_number = ctypes.get_last_error()
+            if error_number in self._UNSUPPORTED_WINERRORS:
+                raise WindowsDeleteUnsupported("unsupported_filesystem")
+            raise WindowsDeleteFailure("identity_query_failed")
+        return information
+
+    def identity(self, handle):
+        self._require_supported()
+        file_id_info = self._query_information(
+            handle,
+            _FILE_ID_INFO_CLASS,
+            _FILE_ID_INFO,
+        )
+        tag_info = self._query_information(
+            handle,
+            _FILE_ATTRIBUTE_TAG_INFO_CLASS,
+            _FILE_ATTRIBUTE_TAG_INFO,
+        )
+        return (
+            int(file_id_info.VolumeSerialNumber),
+            bytes(file_id_info.FileId.Identifier),
+            int(tag_info.FileAttributes),
+            int(tag_info.ReparseTag),
+        )
+
+    def _query_stable_information(self, handle):
+        basic_info = self._query_information(
+            handle,
+            _FILE_BASIC_INFO_CLASS,
+            _FILE_BASIC_INFO,
+        )
+        standard_info = self._query_information(
+            handle,
+            _FILE_STANDARD_INFO_CLASS,
+            _FILE_STANDARD_INFO,
+        )
+        return (
+            int(basic_info.FileAttributes),
+            int(basic_info.LastWriteTime),
+            int(standard_info.EndOfFile),
+            bool(standard_info.Directory),
+        )
+
+    def enumerate(self, directory_handle):
+        self._require_supported()
+        entries = []
+        information_class = _FILE_ID_EXTD_DIRECTORY_RESTART_INFO_CLASS
+        while True:
+            buffer = ctypes.create_string_buffer(64 * 1024)
+            if not self._get_file_information(
+                directory_handle,
+                information_class,
+                buffer,
+                ctypes.sizeof(buffer),
+            ):
+                error_number = ctypes.get_last_error()
+                if error_number == _ERROR_NO_MORE_FILES:
+                    break
+                if error_number in self._UNSUPPORTED_WINERRORS:
+                    raise WindowsDeleteUnsupported("unsupported_filesystem")
+                raise WindowsDeleteFailure("directory_enumeration_failed")
+            information_class = _FILE_ID_EXTD_DIRECTORY_INFO_CLASS
+            offset = 0
+            while True:
+                next_offset = ctypes.c_uint32.from_buffer(
+                    buffer,
+                    offset,
+                ).value
+                last_write_time = ctypes.c_int64.from_buffer(
+                    buffer,
+                    offset + 24,
+                ).value
+                size = ctypes.c_int64.from_buffer(
+                    buffer,
+                    offset + 40,
+                ).value
+                file_attributes = ctypes.c_uint32.from_buffer(
+                    buffer,
+                    offset + 56,
+                ).value
+                name_length = ctypes.c_uint32.from_buffer(
+                    buffer,
+                    offset + 60,
+                ).value
+                reparse_tag = ctypes.c_uint32.from_buffer(
+                    buffer,
+                    offset + 68,
+                ).value
+                file_id = bytes(buffer[offset + 72 : offset + 88])
+                name = bytes(
+                    buffer[offset + 88 : offset + 88 + name_length]
+                ).decode("utf-16-le")
+                if name not in (".", ".."):
+                    entries.append(
+                        _WindowsDirectoryEntry(
+                            name,
+                            file_id,
+                            int(file_attributes),
+                            int(reparse_tag),
+                            int(size),
+                            int(last_write_time),
+                        )
+                    )
+                if next_offset == 0:
+                    break
+                offset += next_offset
+        entries.sort(key=lambda entry: entry.name.casefold())
+        return tuple(entries)
+
+    def read_digest(self, file_handle):
+        self._require_supported()
+        if not self._set_file_pointer(file_handle, 0, None, 0):
+            error_number = ctypes.get_last_error()
+            if error_number in self._UNSUPPORTED_WINERRORS:
+                raise WindowsDeleteUnsupported("unsupported_filesystem")
+            raise WindowsDeleteFailure("file_read_failed")
+        digest = hashlib.sha256()
+        while True:
+            buffer = ctypes.create_string_buffer(1024 * 1024)
+            bytes_read = wintypes.DWORD()
+            if not self._read_file(
+                file_handle,
+                buffer,
+                ctypes.sizeof(buffer),
+                ctypes.byref(bytes_read),
+                None,
+            ):
+                error_number = ctypes.get_last_error()
+                if error_number in self._UNSUPPORTED_WINERRORS:
+                    raise WindowsDeleteUnsupported("unsupported_filesystem")
+                raise WindowsDeleteFailure("file_read_failed")
+            if bytes_read.value == 0:
+                break
+            digest.update(buffer.raw[: bytes_read.value])
+        return digest.hexdigest()
+
+    def name_is_absent(self, parent_handle, name):
+        self._require_supported()
+        handle, status = self._nt_open_relative(
+            parent_handle,
+            name,
+            directory=None,
+            delete=False,
+            desired_access=_FILE_READ_ATTRIBUTES,
+        )
+        if handle is not None:
+            self.close(handle)
+            return False
+        if status in self._ABSENT_NTSTATUSES:
+            return True
+        if status == _STATUS_OBJECT_PATH_NOT_FOUND:
+            raise WindowsDeleteFailure("source_parent_changed")
+        if status in self._UNSUPPORTED_NTSTATUSES:
+            raise WindowsDeleteUnsupported("unsupported_filesystem")
+        raise WindowsDeleteFailure("source_absence_indeterminate")
+
+    def _set_file_information(
+        self,
+        handle,
+        information_class,
+        information,
+        information_size,
+    ):
+        if self._set_file_information_native(
+            handle,
+            information_class,
+            information,
+            information_size,
+        ):
+            return True, 0
+        return False, ctypes.get_last_error()
+
+    def rename_relative_no_replace(
+        self,
+        object_handle,
+        target_parent_handle,
+        target_name,
+    ):
+        self._require_supported()
+        encoded_name = str(target_name).encode("utf-16-le")
+        name_offset = _FILE_RENAME_INFO_HEADER.FileName.offset
+        buffer_size = (
+            ctypes.sizeof(_FILE_RENAME_INFO_HEADER) + len(encoded_name)
+        )
+        buffer = ctypes.create_string_buffer(buffer_size)
+        header = ctypes.cast(
+            buffer,
+            ctypes.POINTER(_FILE_RENAME_INFO_HEADER),
+        ).contents
+        header.Flags = 0
+        header.RootDirectory = self._handle_value(target_parent_handle)
+        header.FileNameLength = len(encoded_name)
+        if encoded_name:
+            ctypes.memmove(
+                ctypes.addressof(buffer) + name_offset,
+                encoded_name,
+                len(encoded_name),
+            )
+        self.last_rename = {
+            "root_directory": self._handle_value(target_parent_handle),
+            "replace": False,
+            "target_name": str(target_name),
+        }
+        io_status = _IO_STATUS_BLOCK()
+        status = self._unsigned_status(
+            self._nt_set_file_information(
+                object_handle,
+                ctypes.byref(io_status),
+                buffer,
+                ctypes.sizeof(buffer),
+                10,
+            )
+        )
+        if status == _STATUS_SUCCESS:
+            succeeded, error_number = True, 0
+        else:
+            succeeded, error_number = False, status
+        if succeeded:
+            self._emit(
+                (
+                    "rename",
+                    self._handle_value(object_handle),
+                    str(target_name),
+                )
+            )
+            return
+        if error_number in (
+            _ERROR_FILE_EXISTS,
+            _ERROR_ALREADY_EXISTS,
+            _STATUS_OBJECT_NAME_COLLISION,
+        ):
+            raise WindowsDeleteFailure("rename_collision")
+        if (
+            error_number in self._UNSUPPORTED_WINERRORS
+            or error_number in self._UNSUPPORTED_NTSTATUSES
+        ):
+            raise WindowsDeleteUnsupported("unsupported_filesystem")
+        raise WindowsDeleteFailure("rename_failed")
+
+    def set_delete_disposition(self, handle):
+        self._require_supported()
+        disposition = _FILE_DISPOSITION_INFO_EX(
+            _WINDOWS_DISPOSITION_REQUIRED_FLAGS
+        )
+        self.last_disposition_flags = int(disposition.Flags)
+        succeeded, error_number = self._set_file_information(
+            handle,
+            _FILE_DISPOSITION_INFO_EX_CLASS,
+            ctypes.byref(disposition),
+            ctypes.sizeof(disposition),
+        )
+        if succeeded:
+            self._emit(("disposition", self._handle_value(handle)))
+            return
+        if error_number in self._UNSUPPORTED_WINERRORS:
+            raise WindowsDeleteUnsupported("unsupported_filesystem")
+        raise WindowsDeleteFailure("delete_disposition_failed")
+
+    def close(self, handle):
+        self._require_supported()
+        handle_value = self._handle_value(handle)
+        if not self._close_handle(handle_value):
+            ctypes.get_last_error()
+            raise WindowsDeleteFailure("handle_close_failed")
+        self._emit(("close", handle_value))
+
+    @staticmethod
+    def _entry_matches_identity(entry, identity):
+        attribute_mask = (
+            _FILE_ATTRIBUTE_DIRECTORY | _FILE_ATTRIBUTE_REPARSE_POINT
+        )
+        return (
+            entry.file_id_128 == identity[1]
+            and entry.file_attributes & attribute_mask
+            == identity[2] & attribute_mask
+            and entry.reparse_tag == identity[3]
+        )
+
+    def manifest_entry(self, handle):
+        identity_before = self.identity(handle)
+        (
+            file_attributes,
+            last_write_time,
+            size,
+            is_directory,
+        ) = self._query_stable_information(handle)
+        is_reparse = bool(
+            file_attributes & _FILE_ATTRIBUTE_REPARSE_POINT
+        )
+        digest = None
+        if not is_directory and not is_reparse:
+            digest = self.read_digest(handle)
+        identity_after = self.identity(handle)
+        stable_after = self._query_stable_information(handle)
+        if identity_after != identity_before or stable_after != (
+            file_attributes,
+            last_write_time,
+            size,
+            is_directory,
+        ):
+            raise WindowsDeleteFailure("manifest_changed")
+        return (
+            identity_before[0],
+            identity_before[1],
+            file_attributes,
+            identity_before[3],
+            size,
+            last_write_time,
+            digest,
+        )
+
+    def capture_manifest(self, root_handle, *, directory):
+        if not directory:
+            return (("", self.manifest_entry(root_handle)),)
+
+        manifest = []
+
+        def walk(parent_handle, relative_parent):
+            for entry in self.enumerate(parent_handle):
+                is_directory = bool(
+                    entry.file_attributes & _FILE_ATTRIBUTE_DIRECTORY
+                )
+                child_handle = self.open_relative(
+                    parent_handle,
+                    entry.name,
+                    directory=is_directory,
+                )
+                try:
+                    child_identity = self.identity(child_handle)
+                    if not self._entry_matches_identity(
+                        entry,
+                        child_identity,
+                    ):
+                        raise WindowsDeleteFailure(
+                            "enumerated_identity_changed"
+                        )
+                    relative_name = (
+                        entry.name
+                        if not relative_parent
+                        else relative_parent + "\\" + entry.name
+                    )
+                    manifest.append(
+                        (
+                            relative_name,
+                            self.manifest_entry(child_handle),
+                        )
+                    )
+                    if (
+                        is_directory
+                        and not entry.file_attributes
+                        & _FILE_ATTRIBUTE_REPARSE_POINT
+                    ):
+                        walk(child_handle, relative_name)
+                finally:
+                    self.close(child_handle)
+
+        walk(root_handle, "")
+        manifest.sort(key=lambda item: item[0].casefold())
+        return tuple(manifest)
+
+    def delete_descendants(self, root_handle):
+        def delete_children(parent_handle):
+            initial_entries = self.enumerate(parent_handle)
+            for entry in initial_entries:
+                is_directory = bool(
+                    entry.file_attributes & _FILE_ATTRIBUTE_DIRECTORY
+                )
+                child_handle = self.open_relative(
+                    parent_handle,
+                    entry.name,
+                    directory=is_directory,
+                    delete=True,
+                )
+                disposition_accepted = False
+                try:
+                    child_identity = self.identity(child_handle)
+                    if not self._entry_matches_identity(
+                        entry,
+                        child_identity,
+                    ):
+                        raise WindowsDeleteFailure(
+                            "enumerated_identity_changed"
+                        )
+                    if (
+                        is_directory
+                        and not entry.file_attributes
+                        & _FILE_ATTRIBUTE_REPARSE_POINT
+                    ):
+                        delete_children(child_handle)
+                        if self.enumerate(child_handle):
+                            raise WindowsDeleteFailure(
+                                "directory_not_empty"
+                            )
+                    self.set_delete_disposition(child_handle)
+                    disposition_accepted = True
+                finally:
+                    self.close(child_handle)
+                if not disposition_accepted:
+                    raise WindowsDeleteFailure("cleanup_failed")
+
+            if self.enumerate(parent_handle):
+                raise WindowsDeleteFailure("directory_changed")
+
+        delete_children(root_handle)
 
 
 class ConfigManager(object):
