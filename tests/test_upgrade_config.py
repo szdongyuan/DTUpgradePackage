@@ -816,6 +816,90 @@ def test_windows_delete_transaction_absent_target_is_bound_noop(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
+def test_windows_delete_transaction_post_absence_close_failure_does_not_retain_artifact(
+    configured_tree,
+    monkeypatch,
+):
+    manager = make_manager()
+    target = configured_tree.roots["ui_config"] / "close-failure.bin"
+    target.write_bytes(b"delete-me")
+    source = configured_tree.config_dir / target.name
+    ops = upgrade_config.WindowsHandleOps()
+    snapshot, error = manager._preflight_ordinary_config_delete(
+        str(target),
+        str(source),
+        handle_ops=ops,
+    )
+    assert error is None
+
+    real_rename = ops.rename_relative_no_replace
+    artifact_names = []
+
+    def record_artifact_name(object_handle, parent_handle, target_name):
+        if target_name != snapshot.destination_name:
+            artifact_names.append(target_name)
+        return real_rename(object_handle, parent_handle, target_name)
+
+    monkeypatch.setattr(
+        ops,
+        "rename_relative_no_replace",
+        record_artifact_name,
+    )
+    real_name_is_absent = ops.name_is_absent
+    confirmed_absent_names = set()
+    both_names_confirmed_absent = {"value": False}
+
+    def record_confirmed_absence(parent_handle, name):
+        absent = real_name_is_absent(parent_handle, name)
+        if ops.last_disposition_flags is not None and absent:
+            confirmed_absent_names.add(name)
+            if (
+                snapshot.destination_name in confirmed_absent_names
+                and artifact_names
+                and artifact_names[-1] in confirmed_absent_names
+            ):
+                both_names_confirmed_absent["value"] = True
+        return absent
+
+    monkeypatch.setattr(ops, "name_is_absent", record_confirmed_absence)
+    real_close = ops.close
+    close_failure_injected = {"value": False}
+
+    def fail_first_ancestor_close_after_absence(handle):
+        if (
+            both_names_confirmed_absent["value"]
+            and not close_failure_injected["value"]
+        ):
+            close_failure_injected["value"] = True
+            real_close(handle)
+            raise upgrade_config.WindowsDeleteFailure(
+                "injected_ancestor_close_failure"
+            )
+        return real_close(handle)
+
+    monkeypatch.setattr(ops, "close", fail_first_ancestor_close_after_absence)
+
+    assert manager._delete_ordinary_config_compatibility(
+        snapshot,
+        handle_ops=ops,
+    ) is False
+
+    assert close_failure_injected["value"] is True
+    assert both_names_confirmed_absent["value"] is True
+    assert len(artifact_names) == 1
+    artifact_path = os.path.normpath(
+        os.path.join(snapshot.recovery_path, artifact_names[0])
+    )
+    assert not target.exists()
+    assert not os.path.lexists(artifact_path)
+    assert artifact_path not in manager._ordinary_config_delete_retained_artifacts
+    errors = logged_messages(manager, "error")
+    assert any("injected_ancestor_close_failure" in message for message in errors)
+    assert not any(artifact_path in message for message in errors)
+    assert not any("retained recovery object" in message for message in errors)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
 def test_windows_delete_transaction_source_appearance_and_target_change_fail_closed(
     configured_tree,
 ):

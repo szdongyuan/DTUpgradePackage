@@ -4422,6 +4422,8 @@ class ConfigManager(object):
                 self._ordinary_config_delete_retained_artifacts.discard(
                     os.path.normpath(artifact_path)
                 )
+                detached = False
+                artifact_path = None
                 owner.close_all()
                 self._report_best_effort(
                     "info",
