@@ -20,6 +20,86 @@ class WindowsHandleInstrumentationSignal(BaseException):
     pass
 
 
+def _assert_disposed_handles_close_before_parent(events):
+    active_by_handle = {}
+    active_in_acquisition_order = []
+    acquisitions = []
+
+    for position, event in enumerate(events):
+        event_kind = event[0]
+        if event_kind in ("opened_absolute", "opened_relative"):
+            handle = event[1]
+            assert handle not in active_by_handle
+            acquisition = {
+                "handle": handle,
+                "parent": (
+                    active_in_acquisition_order[-1]
+                    if event_kind == "opened_relative"
+                    else None
+                ),
+                "disposition": None,
+                "close": None,
+            }
+            acquisitions.append(acquisition)
+            active_by_handle[handle] = acquisition
+            active_in_acquisition_order.append(acquisition)
+        elif event_kind == "disposition":
+            acquisition = active_by_handle[event[1]]
+            assert acquisition["disposition"] is None
+            acquisition["disposition"] = position
+        elif event_kind == "close":
+            acquisition = active_by_handle.pop(event[1])
+            acquisition["close"] = position
+            active_in_acquisition_order.remove(acquisition)
+
+    disposed_acquisitions = [
+        acquisition
+        for acquisition in acquisitions
+        if acquisition["disposition"] is not None
+    ]
+    assert disposed_acquisitions
+    for acquisition in disposed_acquisitions:
+        assert acquisition["disposition"] < acquisition["close"]
+        parent = acquisition["parent"]
+        if parent is not None:
+            assert parent["disposition"] is not None
+            assert acquisition["close"] < parent["disposition"]
+            assert parent["disposition"] < parent["close"]
+
+
+def test_windows_handle_close_order_assertion_tracks_reused_handle_generations():
+    events = [
+        ("opened_absolute", 100, True),
+        ("opened_relative", 200, "nested"),
+        ("opened_relative", 300, "leaf.txt"),
+        ("disposition", 300),
+        ("close", 300),
+        ("disposition", 200),
+        ("close", 200),
+        ("opened_relative", 300, "root-file.txt"),
+        ("disposition", 300),
+        ("close", 300),
+        ("disposition", 100),
+        ("close", 100),
+    ]
+
+    disposition_positions = {
+        event[1]: index
+        for index, event in enumerate(events)
+        if event[0] == "disposition"
+    }
+    close_positions = {
+        event[1]: index
+        for index, event in enumerate(events)
+        if event[0] == "close"
+    }
+    assert not (
+        close_positions[300] < disposition_positions[200]
+    ), "the old raw-handle maps must reproduce the false ordering failure"
+
+    _assert_disposed_handles_close_before_parent(events)
+
+
 def test_windows_handle_ctypes_layouts_are_stable():
     assert ctypes.sizeof(upgrade_config._FILE_ID_128) == 16
     assert upgrade_config._FILE_ID_INFO.FileId.offset == 8
@@ -461,16 +541,6 @@ def test_windows_handle_manifest_enumeration_and_leaf_close_order(tmp_path):
         owner.close_all()
     assert not root.exists()
 
-    disposition_positions = {
-        event[1]: index
-        for index, event in enumerate(events)
-        if event[0] == "disposition"
-    }
-    close_positions = {
-        event[1]: index
-        for index, event in enumerate(events)
-        if event[0] == "close"
-    }
     leaf_handles = [
         event[1]
         for event in events
@@ -486,11 +556,7 @@ def test_windows_handle_manifest_enumeration_and_leaf_close_order(tmp_path):
         and event[2] == "nested"
     ]
     assert len(leaf_handles) == len(nested_handles) == 2
-    cleanup_leaf = leaf_handles[-1]
-    cleanup_nested = nested_handles[-1]
-    assert disposition_positions[cleanup_leaf] < close_positions[cleanup_leaf]
-    assert close_positions[cleanup_leaf] < disposition_positions[cleanup_nested]
-    assert disposition_positions[cleanup_nested] < close_positions[cleanup_nested]
+    _assert_disposed_handles_close_before_parent(events)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
