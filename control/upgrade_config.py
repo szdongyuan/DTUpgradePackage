@@ -4360,6 +4360,57 @@ class ConfigManager(object):
             f"{normalized_path}",
         )
 
+    def _delete_interrupted_restore_location(
+        self,
+        ops,
+        owner,
+        snapshot,
+        artifact_handle,
+        artifact_name,
+        destination_handles,
+        recovery_handles,
+    ):
+        destination_parent_handle = destination_handles[-1]
+        recovery_handle = recovery_handles[-1]
+        recovery_is_absent = ops.name_is_absent(
+            recovery_handle,
+            artifact_name,
+        )
+        if (
+            not recovery_is_absent
+            and self._delete_verify_named_identity(
+                ops,
+                owner,
+                recovery_handle,
+                artifact_name,
+                snapshot,
+            )
+        ):
+            return "recovery"
+
+        destination_is_absent = ops.name_is_absent(
+            destination_parent_handle,
+            snapshot.destination_name,
+        )
+        if (
+            recovery_is_absent
+            and not destination_is_absent
+            and self._delete_verify_named_identity(
+                ops,
+                owner,
+                destination_parent_handle,
+                snapshot.destination_name,
+                snapshot,
+            )
+            and self._delete_artifact_is_intact(
+                ops,
+                artifact_handle,
+                snapshot,
+            )
+        ):
+            return "destination"
+        return "indeterminate"
+
     def _delete_ordinary_config_compatibility(
         self,
         snapshot,
@@ -4397,6 +4448,8 @@ class ConfigManager(object):
         detached = False
         root_disposition_accepted = False
         failure_category = "transaction_failed"
+        propagated_error = None
+        propagated_traceback = None
 
         owner = WindowsHandleOwner(ops.close)
         try:
@@ -4601,27 +4654,132 @@ class ConfigManager(object):
                     f"{snapshot.destination_path}",
                 )
                 return True
-        except WindowsDeleteFailure as error:
-            failure_category = error.category
+        except BaseException as error:
+            if isinstance(error, WindowsDeleteFailure):
+                failure_category = error.category
+            else:
+                failure_category = "transaction_failed"
+                if not isinstance(
+                    error,
+                    (OSError, TypeError, ValueError),
+                ):
+                    propagated_error = error
+                    propagated_traceback = error.__traceback__
             restore_result = _OrdinaryConfigDeleteRestoreResult(
                 False,
                 None,
             )
             if (
                 detached
+                and root_disposition_accepted
+                and artifact_name is not None
+            ):
+                try:
+                    artifact_path_is_valid = not ops.name_is_absent(
+                        recovery_handle,
+                        artifact_name,
+                    )
+                except BaseException:
+                    artifact_path_is_valid = False
+                if not artifact_path_is_valid:
+                    detached = False
+                    artifact_path = None
+            if (
+                detached
                 and not root_disposition_accepted
                 and artifact_handle is not None
             ):
-                restore_result = self._delete_try_local_restore(
-                    ops,
-                    owner,
-                    snapshot,
-                    artifact_handle,
-                    artifact_name,
-                    source_handles,
-                    destination_handles,
-                    recovery_handles,
-                )
+                try:
+                    restore_result = self._delete_try_local_restore(
+                        ops,
+                        owner,
+                        snapshot,
+                        artifact_handle,
+                        artifact_name,
+                        source_handles,
+                        destination_handles,
+                        recovery_handles,
+                    )
+                except BaseException as recovery_error:
+                    if (
+                        propagated_error is None
+                        or (
+                            not isinstance(recovery_error, Exception)
+                            and isinstance(propagated_error, Exception)
+                        )
+                    ):
+                        propagated_error = recovery_error
+                        propagated_traceback = (
+                            recovery_error.__traceback__
+                        )
+                    try:
+                        interrupted_location = (
+                            self._delete_interrupted_restore_location(
+                                ops,
+                                owner,
+                                snapshot,
+                                artifact_handle,
+                                artifact_name,
+                                destination_handles,
+                                recovery_handles,
+                            )
+                        )
+                    except BaseException:
+                        interrupted_location = "indeterminate"
+
+                    if interrupted_location == "destination":
+                        restore_result = (
+                            _OrdinaryConfigDeleteRestoreResult(
+                                True,
+                                None,
+                                False,
+                            )
+                        )
+                    elif interrupted_location == "recovery":
+                        try:
+                            restore_result = (
+                                self._delete_try_local_restore(
+                                    ops,
+                                    owner,
+                                    snapshot,
+                                    artifact_handle,
+                                    artifact_name,
+                                    source_handles,
+                                    destination_handles,
+                                    recovery_handles,
+                                )
+                            )
+                        except BaseException:
+                            try:
+                                interrupted_location = (
+                                    self._delete_interrupted_restore_location(
+                                        ops,
+                                        owner,
+                                        snapshot,
+                                        artifact_handle,
+                                        artifact_name,
+                                        destination_handles,
+                                        recovery_handles,
+                                    )
+                                )
+                            except BaseException:
+                                interrupted_location = "indeterminate"
+                            if interrupted_location == "destination":
+                                restore_result = (
+                                    _OrdinaryConfigDeleteRestoreResult(
+                                        True,
+                                        None,
+                                        False,
+                                    )
+                                )
+                            elif interrupted_location == "recovery":
+                                restore_result = (
+                                    _OrdinaryConfigDeleteRestoreResult(
+                                        False,
+                                        artifact_path,
+                                        False,
+                                    )
+                                )
             if restore_result.restored:
                 detached = False
                 artifact_path = None
@@ -4636,15 +4794,18 @@ class ConfigManager(object):
                 artifact_path = None
             elif detached and artifact_path is not None:
                 self._delete_retain_location(artifact_path)
-        except (OSError, TypeError, ValueError):
-            failure_category = "transaction_failed"
-            if detached and artifact_path is not None:
-                self._delete_retain_location(artifact_path)
         finally:
             try:
                 owner.close_all()
-            except WindowsDeleteFailure as error:
-                failure_category = error.category
+            except BaseException as close_error:
+                if isinstance(close_error, WindowsDeleteFailure):
+                    failure_category = close_error.category
+                elif propagated_error is None:
+                    propagated_error = close_error
+                    propagated_traceback = close_error.__traceback__
+
+        if propagated_error is not None:
+            raise propagated_error.with_traceback(propagated_traceback)
 
         self._report_best_effort(
             "error",

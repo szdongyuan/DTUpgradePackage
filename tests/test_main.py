@@ -195,6 +195,7 @@ def test_run_upgrade_uses_default_logger_and_orders_commit_before_cleanup(monkey
 @pytest.mark.parametrize(
     "failure_stage",
     [
+        "config_transaction",
         "executable",
         "program",
         "version_persistence",
@@ -321,6 +322,34 @@ def test_real_compatibility_delete_is_restored_after_later_stage_failure(
             supplied_logger,
             current_version,
         )
+        if failure_stage == "config_transaction":
+            real_named_identity = manager._delete_verify_named_identity
+            injected = {"done": False}
+
+            def interrupt_post_detach_verification(
+                ops,
+                owner,
+                parent_handle,
+                name,
+                snapshot,
+            ):
+                if not injected["done"] and name != ui_pic.name:
+                    injected["done"] = True
+                    observe_failure("config_transaction")
+                    raise RuntimeError(
+                        "injected config transaction failure"
+                    )
+                return real_named_identity(
+                    ops,
+                    owner,
+                    parent_handle,
+                    name,
+                    snapshot,
+                )
+
+            manager._delete_verify_named_identity = (
+                interrupt_post_detach_verification
+            )
         managers.append(manager)
         return manager
 

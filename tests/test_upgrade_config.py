@@ -67,6 +67,18 @@ def _assert_disposed_handles_close_before_parent(events):
             assert parent["disposition"] < parent["close"]
 
 
+def _assert_opened_handles_close_in_reverse_order(events):
+    active_handles = []
+    for event in events:
+        if event[0] in ("opened_absolute", "opened_relative"):
+            active_handles.append(event[1])
+        elif event[0] == "close":
+            if event[1] in active_handles:
+                assert event[1] == active_handles[-1]
+                active_handles.pop()
+    assert active_handles == []
+
+
 def test_windows_handle_close_order_assertion_tracks_reused_handle_generations():
     events = [
         ("opened_absolute", 100, True),
@@ -1301,6 +1313,291 @@ def test_windows_delete_transaction_post_rename_failure_restores_locally(
     assert target.read_bytes() == b"restore-me"
     assert not list((configured_tree.backup_dir / "recovery").iterdir())
     assert not any("delete_compatibility success" in message for message in logged_messages(manager))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
+@pytest.mark.parametrize(
+    "exception_type",
+    [RuntimeError, KeyboardInterrupt, SystemExit],
+)
+@pytest.mark.parametrize(
+    "failure_phase",
+    ["post_detach_verification", "cleanup", "local_recovery"],
+)
+def test_windows_delete_transaction_post_detach_throwables_recover_before_reraise(
+    configured_tree,
+    monkeypatch,
+    exception_type,
+    failure_phase,
+):
+    manager = make_manager()
+    target = configured_tree.roots["ui_config"] / (
+        f"interrupted-{failure_phase}-{exception_type.__name__}"
+    )
+    target.mkdir()
+    (target / "payload.bin").write_bytes(b"recoverable")
+    original_identity = (target.stat().st_dev, target.stat().st_ino)
+    source = configured_tree.config_dir / target.name
+    events = []
+    ops = upgrade_config.WindowsHandleOps(event_sink=events.append)
+    snapshot, error = manager._preflight_ordinary_config_delete(
+        str(target),
+        str(source),
+        handle_ops=ops,
+    )
+    assert error is None
+    events.clear()
+    injected = {"done": False}
+    injected_message = (
+        f"injected {failure_phase} {exception_type.__name__}"
+    )
+
+    if failure_phase == "post_detach_verification":
+        real_named_identity = manager._delete_verify_named_identity
+
+        def interrupt_post_detach_named_identity(
+            current_ops,
+            owner,
+            parent_handle,
+            name,
+            current_snapshot,
+        ):
+            if not injected["done"] and name != snapshot.destination_name:
+                injected["done"] = True
+                raise exception_type(injected_message)
+            return real_named_identity(
+                current_ops,
+                owner,
+                parent_handle,
+                name,
+                current_snapshot,
+            )
+
+        monkeypatch.setattr(
+            manager,
+            "_delete_verify_named_identity",
+            interrupt_post_detach_named_identity,
+        )
+    elif failure_phase == "cleanup":
+        real_delete_descendants = ops.delete_descendants
+
+        def interrupt_cleanup(*args, **kwargs):
+            if not injected["done"]:
+                injected["done"] = True
+                raise exception_type(injected_message)
+            return real_delete_descendants(*args, **kwargs)
+
+        monkeypatch.setattr(
+            ops,
+            "delete_descendants",
+            interrupt_cleanup,
+        )
+    else:
+        real_target_manifest = manager._delete_target_manifest
+        verification_failed = {"done": False}
+
+        def fail_post_detach_verification(*args, **kwargs):
+            if (
+                not verification_failed["done"]
+                and ops.last_rename is not None
+                and ops.last_rename["target_name"]
+                != snapshot.destination_name
+            ):
+                verification_failed["done"] = True
+                raise upgrade_config.WindowsDeleteFailure(
+                    "injected_post_detach_verification"
+                )
+            return real_target_manifest(*args, **kwargs)
+
+        monkeypatch.setattr(
+            manager,
+            "_delete_target_manifest",
+            fail_post_detach_verification,
+        )
+        real_rename = ops.rename_relative_no_replace
+
+        def interrupt_first_local_restore(
+            object_handle,
+            parent_handle,
+            target_name,
+        ):
+            if (
+                not injected["done"]
+                and verification_failed["done"]
+                and target_name == snapshot.destination_name
+            ):
+                injected["done"] = True
+                raise exception_type(injected_message)
+            return real_rename(
+                object_handle,
+                parent_handle,
+                target_name,
+            )
+
+        monkeypatch.setattr(
+            ops,
+            "rename_relative_no_replace",
+            interrupt_first_local_restore,
+        )
+
+    close_failure_injected = {"done": False}
+    if not issubclass(exception_type, Exception):
+        artifact_root_handle = {"value": None}
+        active_rename = ops.rename_relative_no_replace
+
+        def record_artifact_root_handle(
+            object_handle,
+            parent_handle,
+            target_name,
+        ):
+            if (
+                artifact_root_handle["value"] is None
+                and target_name != snapshot.destination_name
+            ):
+                artifact_root_handle["value"] = object_handle
+            return active_rename(
+                object_handle,
+                parent_handle,
+                target_name,
+            )
+
+        monkeypatch.setattr(
+            ops,
+            "rename_relative_no_replace",
+            record_artifact_root_handle,
+        )
+        real_close = ops.close
+
+        def fail_artifact_close_after_recovery(handle):
+            if (
+                not close_failure_injected["done"]
+                and injected["done"]
+                and target.exists()
+                and handle == artifact_root_handle["value"]
+            ):
+                close_failure_injected["done"] = True
+                real_close(handle)
+                raise RuntimeError("injected close failure")
+            return real_close(handle)
+
+        monkeypatch.setattr(
+            ops,
+            "close",
+            fail_artifact_close_after_recovery,
+        )
+
+    with pytest.raises(exception_type, match=injected_message):
+        manager._delete_ordinary_config_compatibility(
+            snapshot,
+            handle_ops=ops,
+        )
+
+    assert injected["done"] is True
+    assert close_failure_injected["done"] is (
+        not issubclass(exception_type, Exception)
+    )
+    assert target.is_dir()
+    assert (target / "payload.bin").read_bytes() == b"recoverable"
+    assert (target.stat().st_dev, target.stat().st_ino) == original_identity
+    assert not list((configured_tree.backup_dir / "recovery").iterdir())
+    assert manager._ordinary_config_delete_retained_artifacts == set()
+    assert not any(
+        "retained recovery object" in message
+        for message in logged_messages(manager, "error")
+    )
+    assert not any(
+        "delete_compatibility success" in message
+        for message in logged_messages(manager)
+    )
+    _assert_opened_handles_close_in_reverse_order(events)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
+@pytest.mark.parametrize(
+    "exception_type",
+    [RuntimeError, KeyboardInterrupt, SystemExit],
+)
+def test_windows_delete_transaction_disposed_root_throwable_never_retains_stale_artifact(
+    configured_tree,
+    monkeypatch,
+    exception_type,
+):
+    manager = make_manager()
+    target = configured_tree.roots["ui_config"] / (
+        f"disposed-root-{exception_type.__name__}.bin"
+    )
+    target.write_bytes(b"delete-completely")
+    source = configured_tree.config_dir / target.name
+    events = []
+    ops = upgrade_config.WindowsHandleOps(event_sink=events.append)
+    snapshot, error = manager._preflight_ordinary_config_delete(
+        str(target),
+        str(source),
+        handle_ops=ops,
+    )
+    assert error is None
+    events.clear()
+    artifact_root_handle = {"value": None}
+    artifact_name = {"value": None}
+    real_rename = ops.rename_relative_no_replace
+
+    def record_detach(object_handle, parent_handle, target_name):
+        artifact_root_handle["value"] = object_handle
+        artifact_name["value"] = target_name
+        return real_rename(
+            object_handle,
+            parent_handle,
+            target_name,
+        )
+
+    monkeypatch.setattr(
+        ops,
+        "rename_relative_no_replace",
+        record_detach,
+    )
+    real_close = ops.close
+    injected_message = f"injected disposed root {exception_type.__name__}"
+    injected = {"done": False}
+
+    def interrupt_after_disposed_root_close(handle):
+        if (
+            not injected["done"]
+            and handle == artifact_root_handle["value"]
+            and ops.last_disposition_flags is not None
+        ):
+            injected["done"] = True
+            real_close(handle)
+            raise exception_type(injected_message)
+        return real_close(handle)
+
+    monkeypatch.setattr(
+        ops,
+        "close",
+        interrupt_after_disposed_root_close,
+    )
+
+    with pytest.raises(exception_type, match=injected_message):
+        manager._delete_ordinary_config_compatibility(
+            snapshot,
+            handle_ops=ops,
+        )
+
+    artifact_path = os.path.normpath(
+        os.path.join(snapshot.recovery_path, artifact_name["value"])
+    )
+    assert injected["done"] is True
+    assert not target.exists()
+    assert not os.path.lexists(artifact_path)
+    assert artifact_path not in manager._ordinary_config_delete_retained_artifacts
+    assert not any(
+        artifact_path in message
+        for message in logged_messages(manager, "error")
+    )
+    assert not any(
+        "retained recovery object" in message
+        for message in logged_messages(manager, "error")
+    )
+    _assert_opened_handles_close_in_reverse_order(events)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
