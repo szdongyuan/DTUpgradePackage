@@ -4999,10 +4999,13 @@ class ConfigManager(object):
                         )
                 except BaseException:
                     pass
-                if artifact_state.path_valid:
-                    artifact_name = artifact_state.name
-                    artifact_path = artifact_state.path
-                    detached = True
+            if (
+                artifact_state is not None
+                and artifact_state.path_valid
+            ):
+                artifact_name = artifact_state.name
+                artifact_path = artifact_state.path
+                detached = True
             restore_result = _OrdinaryConfigDeleteRestoreResult(
                 False,
                 None,
