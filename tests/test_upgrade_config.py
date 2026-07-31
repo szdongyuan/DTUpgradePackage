@@ -14,6 +14,10 @@ from base.json_merge import merge_json_files_with_reason as real_merge_json_file
 from control import upgrade_config
 
 
+class WindowsHandleInstrumentationSignal(BaseException):
+    pass
+
+
 def test_windows_handle_ctypes_layouts_are_stable():
     assert ctypes.sizeof(upgrade_config._FILE_ID_128) == 16
     assert upgrade_config._FILE_ID_INFO.FileId.offset == 8
@@ -160,9 +164,30 @@ def test_windows_handle_target_access_and_relative_open_do_not_follow_reparse(
 
     ops = upgrade_config.WindowsHandleOps()
     parent_handle = ops.open_absolute(str(parent), directory=True)
+    absolute_child_handle = ops.open_absolute(
+        str(child),
+        directory=False,
+        delete=True,
+    )
     child_handle = None
     junction_handle = None
     try:
+        absolute_audit = ops.last_open_protocol
+        assert absolute_audit["desired_access"] == (
+            upgrade_config._DELETE
+            | upgrade_config._FILE_READ_DATA
+            | upgrade_config._FILE_READ_ATTRIBUTES
+        )
+        assert not absolute_audit["desired_access"] & upgrade_config._GENERIC_READ
+        assert not absolute_audit["desired_access"] & upgrade_config._READ_CONTROL
+        assert not absolute_audit["desired_access"] & upgrade_config._FILE_READ_EA
+        assert not absolute_audit["desired_access"] & upgrade_config._SYNCHRONIZE
+        assert ops.read_digest(absolute_child_handle) == hashlib.sha256(
+            b"child-data"
+        ).hexdigest()
+        ops.close(absolute_child_handle)
+        absolute_child_handle = None
+
         child_handle = ops.open_relative(
             parent_handle,
             child.name,
@@ -174,9 +199,12 @@ def test_windows_handle_target_access_and_relative_open_do_not_follow_reparse(
         assert audit["desired_access"] == (
             upgrade_config._DELETE
             | upgrade_config._FILE_READ_ATTRIBUTES
-            | upgrade_config._GENERIC_READ
+            | upgrade_config._FILE_READ_DATA
             | upgrade_config._SYNCHRONIZE
         )
+        assert not audit["desired_access"] & upgrade_config._GENERIC_READ
+        assert not audit["desired_access"] & upgrade_config._READ_CONTROL
+        assert not audit["desired_access"] & upgrade_config._FILE_READ_EA
         assert not audit["share_mode"] & upgrade_config._FILE_SHARE_DELETE
         assert audit["flags"] & upgrade_config._FILE_FLAG_OPEN_REPARSE_POINT
         assert ops.read_digest(child_handle) == hashlib.sha256(
@@ -193,11 +221,79 @@ def test_windows_handle_target_access_and_relative_open_do_not_follow_reparse(
         assert junction_identity[2] & upgrade_config._FILE_ATTRIBUTE_REPARSE_POINT
         assert junction_identity[3] != 0
     finally:
+        if absolute_child_handle is not None:
+            ops.close(absolute_child_handle)
         if junction_handle is not None:
             ops.close(junction_handle)
         if child_handle is not None:
             ops.close(child_handle)
         ops.close(parent_handle)
+
+
+@pytest.mark.parametrize(
+    "sink_error",
+    [RuntimeError, WindowsHandleInstrumentationSignal],
+)
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
+def test_windows_handle_instrumentation_is_best_effort_across_native_mutations(
+    tmp_path,
+    sink_error,
+):
+    source_parent = tmp_path / "source"
+    recovery_parent = tmp_path / "recovery"
+    source_parent.mkdir()
+    recovery_parent.mkdir()
+    relative_child = source_parent / "relative.txt"
+    relative_child.write_bytes(b"relative")
+    rename_source = source_parent / "rename.txt"
+    rename_source.write_bytes(b"rename")
+
+    def raising_sink(_event):
+        raise sink_error("instrumentation failed")
+
+    ops = upgrade_config.WindowsHandleOps(event_sink=raising_sink)
+    source_parent_handle = ops.open_absolute(
+        str(source_parent),
+        directory=True,
+    )
+    recovery_parent_handle = ops.open_absolute(
+        str(recovery_parent),
+        directory=True,
+    )
+    relative_handle = ops.open_relative(
+        source_parent_handle,
+        relative_child.name,
+        directory=False,
+        delete=True,
+    )
+    rename_handle = ops.open_absolute(
+        str(rename_source),
+        directory=False,
+        delete=True,
+    )
+
+    assert ops.identity(relative_handle)[1]
+    assert ops.identity(rename_handle)[1]
+    ops.set_delete_disposition(relative_handle)
+    ops.close(relative_handle)
+    assert not relative_child.exists()
+
+    ops.rename_relative_no_replace(
+        rename_handle,
+        recovery_parent_handle,
+        "artifact.txt",
+    )
+    assert not rename_source.exists()
+    assert ops.identity(rename_handle)[1]
+    ops.set_delete_disposition(rename_handle)
+    ops.close(rename_handle)
+    assert not (recovery_parent / "artifact.txt").exists()
+
+    ops.close(recovery_parent_handle)
+    ops.close(source_parent_handle)
+    rebound = tmp_path / "source-rebound"
+    os.rename(source_parent, rebound)
+    assert rebound.is_dir()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")

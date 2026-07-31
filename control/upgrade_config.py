@@ -23,7 +23,10 @@ from load_yml.load_yml import Readyml
 
 _DELETE = 0x00010000
 _SYNCHRONIZE = 0x00100000
+_READ_CONTROL = 0x00020000
+_FILE_READ_DATA = 0x00000001
 _FILE_LIST_DIRECTORY = 0x00000001
+_FILE_READ_EA = 0x00000008
 _FILE_READ_ATTRIBUTES = 0x00000080
 _GENERIC_READ = 0x80000000
 _FILE_SHARE_READ = 0x00000001
@@ -269,7 +272,10 @@ class WindowsHandleOps:
 
     def _emit(self, event):
         if self._event_sink is not None:
-            self._event_sink(event)
+            try:
+                self._event_sink(event)
+            except BaseException:
+                pass
 
     def _load_bindings(self):
         if self._bindings_loaded:
@@ -401,7 +407,7 @@ class WindowsHandleOps:
         if directory:
             access |= _FILE_LIST_DIRECTORY
         else:
-            access |= _GENERIC_READ
+            access |= _FILE_READ_DATA
         if delete:
             access |= _DELETE
         return access
