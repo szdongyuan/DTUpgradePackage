@@ -4756,32 +4756,103 @@ class ConfigManager(object):
             and first_key == second_key
         ), None
 
+    def _destination_paths_are_related(self, first_path, second_path):
+        paths_are_aliases, identity_error = (
+            self._destination_paths_are_aliases(
+                first_path,
+                second_path,
+            )
+        )
+        if identity_error is not None or paths_are_aliases:
+            return paths_are_aliases, identity_error
+
+        first_exists, first_state_error = self._destination_entry_state(
+            first_path
+        )
+        if first_state_error is not None:
+            return False, first_state_error
+        second_exists, second_state_error = self._destination_entry_state(
+            second_path
+        )
+        if second_state_error is not None:
+            return False, second_state_error
+        first_key, first_key_error = self._destination_identity_key(
+            first_path,
+            first_exists,
+        )
+        if first_key_error is not None:
+            return False, first_key_error
+        second_key, second_key_error = self._destination_identity_key(
+            second_path,
+            second_exists,
+        )
+        if second_key_error is not None:
+            return False, second_key_error
+
+        try:
+            common_path = os.path.normcase(
+                os.path.normpath(
+                    os.path.commonpath([first_key, second_key])
+                )
+            )
+        except (OSError, TypeError, ValueError):
+            return False, "identity_check_failed"
+        return common_path in (first_key, second_key), None
+
+    def _preflight_ordinary_config_delete_conflicts(self, operations):
+        if not any(
+            operation["kind"] == "delete"
+            for operation in operations
+        ):
+            return True
+
+        for first_index, first_operation in enumerate(operations):
+            for second_operation in operations[first_index + 1 :]:
+                paths_are_related, identity_error = (
+                    self._destination_paths_are_related(
+                        first_operation["destination_path"],
+                        second_operation["destination_path"],
+                    )
+                )
+                if identity_error is not None:
+                    self._report_best_effort(
+                        "error",
+                        "delete_compatibility:"
+                        "target_identity_check_failed",
+                    )
+                    return False
+                if paths_are_related:
+                    self._report_best_effort(
+                        "error",
+                        "delete_compatibility:target_conflict",
+                    )
+                    return False
+        return True
+
     def _report_json_merge(self, level, message):
         print(message)
         getattr(self.logger, level)(message)
 
-    def _preflight_json_merge_conflicts(self, entries, config_entries):
-        config_target_paths = []
-        for config_entry in config_entries:
-            target_path, path_error = (
-                self._resolve_ordinary_config_destination(config_entry)
-            )
-            if path_error is not None:
-                self._report_ordinary_config_destination_error(path_error)
-                return False
-            config_target_paths.append(target_path)
-
+    def _preflight_json_merge_conflicts(self, entries, config_operations):
         for entry in entries:
             target_path = self._json_merge_manifest_path_key(entry["target"])
             if target_path is None:
                 continue
-            for config_target_path in config_target_paths:
-                paths_are_aliases, identity_error = (
-                    self._destination_paths_are_aliases(
-                        target_path,
-                        config_target_path,
+            for operation in config_operations:
+                if operation["kind"] == "delete":
+                    paths_conflict, identity_error = (
+                        self._destination_paths_are_related(
+                            target_path,
+                            operation["destination_path"],
+                        )
                     )
-                )
+                else:
+                    paths_conflict, identity_error = (
+                        self._destination_paths_are_aliases(
+                            target_path,
+                            operation["destination_path"],
+                        )
+                    )
                 if identity_error is not None:
                     error_category = (
                         "destination_alias_dangling_link"
@@ -4793,12 +4864,22 @@ class ConfigManager(object):
                         f"json_merge error: {error_category}",
                     )
                     return False
-                if not paths_are_aliases:
+                if not paths_conflict:
                     continue
-                self._report_json_merge(
-                    "error",
-                    "json_merge error: target_conflicts_with_config",
-                )
+                if operation["kind"] == "delete":
+                    self._report_best_effort(
+                        "error",
+                        "delete_compatibility:json_merge_conflict",
+                    )
+                    self._report_json_merge(
+                        "error",
+                        "json_merge error: target_conflicts_with_config",
+                    )
+                else:
+                    self._report_json_merge(
+                        "error",
+                        "json_merge error: target_conflicts_with_config",
+                    )
                 return False
         return True
 
@@ -4889,13 +4970,8 @@ class ConfigManager(object):
                         f"json_merge schema error: {schema_error}",
                     )
                     return False
-                if not self._preflight_json_merge_conflicts(
-                    json_merge_entries,
-                    config_file_source_path,
-                ):
-                    return False
 
-                config_updates = []
+                config_operations = []
                 for config_file_path in config_file_source_path:
                     target_file_path, path_error = (
                         self._resolve_ordinary_config_destination(
@@ -4903,6 +4979,36 @@ class ConfigManager(object):
                         )
                     )
                     if path_error is not None:
+                        if path_error == "symlink_escape":
+                            lexical_target = os.path.abspath(
+                                os.path.join(
+                                    DEFAULT_TARGET_DIR,
+                                    config_file_path,
+                                )
+                            )
+                            (
+                                delete_source_path,
+                                delete_source_error,
+                            ) = self._resolve_ordinary_config_source(
+                                lexical_target
+                            )
+                            if delete_source_error == "missing_path":
+                                _, delete_error = (
+                                    self._preflight_ordinary_config_delete(
+                                        lexical_target,
+                                        delete_source_path,
+                                    )
+                                )
+                                if (
+                                    delete_error
+                                    == "unsupported_destination_reparse"
+                                ):
+                                    self._report_best_effort(
+                                        "error",
+                                        "delete_compatibility:"
+                                        f"{delete_error}",
+                                    )
+                                    return False
                         self._report_ordinary_config_destination_error(
                             path_error
                         )
@@ -4912,59 +5018,116 @@ class ConfigManager(object):
                             target_file_path
                         )
                     )
+                    if source_error == "missing_path":
+                        snapshot, delete_error = (
+                            self._preflight_ordinary_config_delete(
+                                target_file_path,
+                                new_config_file_path,
+                            )
+                        )
+                        if delete_error is not None:
+                            self._report_best_effort(
+                                "error",
+                                "delete_compatibility:"
+                                f"{delete_error}",
+                            )
+                            return False
+                        config_operations.append(
+                            {
+                                "kind": "delete",
+                                "relative_path": config_file_path,
+                                "destination_path": target_file_path,
+                                "source_path": new_config_file_path,
+                                "snapshot": snapshot,
+                            }
+                        )
+                        continue
                     if source_error is not None:
                         self._report_ordinary_config_source_error(
                             source_error
                         )
                         return False
-                    config_updates.append(
-                        (
-                            config_file_path,
-                            new_config_file_path,
-                            target_file_path,
-                        )
+                    config_operations.append(
+                        {
+                            "kind": "replace",
+                            "relative_path": config_file_path,
+                            "destination_path": target_file_path,
+                            "source_path": new_config_file_path,
+                        }
                     )
 
-                if self.backup_config_file(config_file_source_path):
-                    for (
-                        config_file_path,
-                        new_config_file_path,
-                        target_file_path,
-                    ) in config_updates:
+                if not self._preflight_ordinary_config_delete_conflicts(
+                    config_operations
+                ):
+                    return False
+                if not self._preflight_json_merge_conflicts(
+                    json_merge_entries,
+                    config_operations,
+                ):
+                    return False
+
+                for operation in config_operations:
+                    if operation["kind"] == "delete":
                         self._report_best_effort(
                             "info",
-                            f"更新配置文件: {config_file_path}",
+                            "delete_compatibility selected: "
+                            f"{operation['relative_path']}",
                         )
-                        (
-                            new_config_file_path,
-                            source_error,
-                        ) = self._resolve_ordinary_config_source(
-                            target_file_path
-                        )
-                        if source_error is not None:
-                            self._report_ordinary_config_source_error(
-                                source_error
-                            )
-                            return False
-                        if not self._replace_with_staged_ordinary_config(
-                            new_config_file_path,
-                            target_file_path,
-                        ):
-                            self._report_best_effort(
-                                "error",
-                                "配置文件升级失败",
-                            )
-                            return False
-                        self._report_best_effort(
-                            "info",
-                            "配置文件升级成功",
-                        )
-                else:
+
+                backup_paths = [
+                    operation["relative_path"]
+                    for operation in config_operations
+                    if operation["kind"] == "replace"
+                    or operation["snapshot"].destination_exists
+                    or operation["snapshot"].managed_root_exists
+                ]
+                if backup_paths and not self.backup_config_file(
+                    backup_paths
+                ):
                     self._report_best_effort(
                         "error",
                         "配置文件备份错误",
                     )
                     return False
+
+                for operation in config_operations:
+                    config_file_path = operation["relative_path"]
+                    target_file_path = operation["destination_path"]
+                    if operation["kind"] == "delete":
+                        if not self._delete_ordinary_config_compatibility(
+                            operation["snapshot"]
+                        ):
+                            return False
+                        continue
+
+                    self._report_best_effort(
+                        "info",
+                        f"更新配置文件: {config_file_path}",
+                    )
+                    (
+                        new_config_file_path,
+                        source_error,
+                    ) = self._resolve_ordinary_config_source(
+                        target_file_path
+                    )
+                    if source_error is not None:
+                        self._report_ordinary_config_source_error(
+                            source_error
+                        )
+                        return False
+                    if not self._replace_with_staged_ordinary_config(
+                        new_config_file_path,
+                        target_file_path,
+                    ):
+                        self._report_best_effort(
+                            "error",
+                            "配置文件升级失败",
+                        )
+                        return False
+                    self._report_best_effort(
+                        "info",
+                        "配置文件升级成功",
+                    )
 
                 if not self._apply_json_merges(json_merge_entries):
                     return False
