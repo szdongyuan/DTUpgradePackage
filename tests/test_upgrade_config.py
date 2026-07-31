@@ -6,6 +6,7 @@ import os
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
+from ctypes import wintypes
 
 import pytest
 import yaml
@@ -439,17 +440,24 @@ def test_windows_handle_manifest_enumeration_and_leaf_close_order(tmp_path):
 
     events = []
     ops = upgrade_config.WindowsHandleOps(event_sink=events.append)
-    root_handle = ops.open_absolute(str(root), directory=True, delete=True)
-    manifest = ops.capture_manifest(root_handle, directory=True)
-    manifest_paths = [entry[0] for entry in manifest]
-    assert manifest_paths == ["nested", r"nested\leaf.txt", "root-file.txt"]
-    for _relative_path, manifest_entry in manifest:
-        assert len(manifest_entry) == 7
-        assert len(manifest_entry[1]) == 16
+    owner = upgrade_config.WindowsHandleOwner(ops.close)
+    root_handle = owner.acquire(
+        ops.open_absolute(str(root), directory=True, delete=True)
+    )
+    try:
+        manifest = ops.capture_manifest(root_handle, directory=True)
+        manifest_paths = [entry[0] for entry in manifest]
+        assert manifest_paths == ["nested", r"nested\leaf.txt", "root-file.txt"]
+        for _relative_path, manifest_entry in manifest:
+            assert len(manifest_entry) == 7
+            assert len(manifest_entry[1]) == 16
 
-    ops.delete_descendants(root_handle)
-    ops.set_delete_disposition(root_handle)
-    ops.close(root_handle)
+        ops.delete_descendants(root_handle, manifest)
+        ops.set_delete_disposition(root_handle)
+        owner.release(root_handle)
+        ops.close(root_handle)
+    finally:
+        owner.close_all()
     assert not root.exists()
 
     disposition_positions = {
@@ -482,6 +490,141 @@ def test_windows_handle_manifest_enumeration_and_leaf_close_order(tmp_path):
     assert disposition_positions[cleanup_leaf] < close_positions[cleanup_leaf]
     assert close_positions[cleanup_leaf] < disposition_positions[cleanup_nested]
     assert disposition_positions[cleanup_nested] < close_positions[cleanup_nested]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
+def test_windows_handle_cleanup_rejects_same_object_leaf_content_change(
+    tmp_path,
+):
+    root = tmp_path / "artifact"
+    root.mkdir()
+    leaf = root / "leaf.txt"
+    original_contents = b"original"
+    changed_contents = b"mutated!"
+    assert len(original_contents) == len(changed_contents)
+    leaf.write_bytes(original_contents)
+
+    ops = upgrade_config.WindowsHandleOps()
+    owner = upgrade_config.WindowsHandleOwner(ops.close)
+    root_handle = owner.acquire(
+        ops.open_absolute(str(root), directory=True, delete=True)
+    )
+    writer_handle = None
+    mutation_completed = False
+    try:
+        expected_manifest = ops.capture_manifest(
+            root_handle,
+            directory=True,
+        )
+        assert expected_manifest[0][1][6] == hashlib.sha256(
+            original_contents
+        ).hexdigest()
+
+        writer_handle = ops._handle_value(
+            ops._create_file(
+                str(leaf),
+                0x40000000,
+                (
+                    upgrade_config._FILE_SHARE_READ
+                    | upgrade_config._FILE_SHARE_WRITE
+                    | upgrade_config._FILE_SHARE_DELETE
+                ),
+                None,
+                upgrade_config._OPEN_EXISTING,
+                upgrade_config._FILE_FLAG_OPEN_REPARSE_POINT,
+                None,
+            )
+        )
+        assert writer_handle not in (
+            None,
+            upgrade_config._INVALID_HANDLE_VALUE,
+        )
+        owner.acquire(writer_handle)
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        write_file = kernel32.WriteFile
+        write_file.argtypes = (
+            wintypes.HANDLE,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+            wintypes.LPVOID,
+        )
+        write_file.restype = wintypes.BOOL
+        flush_file_buffers = kernel32.FlushFileBuffers
+        flush_file_buffers.argtypes = (wintypes.HANDLE,)
+        flush_file_buffers.restype = wintypes.BOOL
+        set_file_time = kernel32.SetFileTime
+        set_file_time.argtypes = (
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+        )
+        set_file_time.restype = wintypes.BOOL
+        expected_last_write = expected_manifest[0][1][5]
+        expected_last_write_time = wintypes.FILETIME(
+            expected_last_write & 0xFFFFFFFF,
+            expected_last_write >> 32,
+        )
+
+        def mutate_after_cleanup_open(event):
+            nonlocal mutation_completed
+            if (
+                mutation_completed
+                or len(event) != 3
+                or event[0] != "opened_relative"
+                or event[2] != leaf.name
+            ):
+                return
+            assert ops._set_file_pointer(writer_handle, 0, None, 0)
+            write_buffer = ctypes.create_string_buffer(changed_contents)
+            bytes_written = wintypes.DWORD()
+            assert write_file(
+                writer_handle,
+                write_buffer,
+                len(changed_contents),
+                ctypes.byref(bytes_written),
+                None,
+            )
+            assert bytes_written.value == len(changed_contents)
+            assert flush_file_buffers(writer_handle)
+            assert set_file_time(
+                writer_handle,
+                None,
+                None,
+                ctypes.byref(expected_last_write_time),
+            )
+            mutation_completed = True
+
+        ops._event_sink = mutate_after_cleanup_open
+
+        with pytest.raises(
+            upgrade_config.WindowsDeleteFailure,
+            match="manifest_changed",
+        ):
+            ops.delete_descendants(root_handle, expected_manifest)
+        assert mutation_completed is True
+        assert ops.name_is_absent(root_handle, leaf.name) is False
+        verification_handle = owner.acquire(
+            ops.open_relative(
+                root_handle,
+                leaf.name,
+                directory=False,
+            )
+        )
+        changed_manifest = ops.manifest_entry(verification_handle)
+        owner.release(verification_handle)
+        ops.close(verification_handle)
+        assert changed_manifest[:6] == expected_manifest[0][1][:6]
+        assert changed_manifest[6] == hashlib.sha256(
+            changed_contents
+        ).hexdigest()
+        assert changed_manifest[6] != expected_manifest[0][1][6]
+    finally:
+        owner.close_all()
+
+    assert leaf.read_bytes() == changed_contents
 
 
 class DummyLogger:

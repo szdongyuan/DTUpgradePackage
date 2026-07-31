@@ -913,50 +913,191 @@ class WindowsHandleOps:
         manifest.sort(key=lambda item: item[0].casefold())
         return tuple(manifest)
 
-    def delete_descendants(self, root_handle):
-        def delete_children(parent_handle):
-            initial_entries = self.enumerate(parent_handle)
-            for entry in initial_entries:
+    @staticmethod
+    def _identity_matches_manifest(identity, manifest_entry):
+        return identity == (
+            manifest_entry[0],
+            manifest_entry[1],
+            manifest_entry[2],
+            manifest_entry[3],
+        )
+
+    @staticmethod
+    def _directory_entry_matches_manifest(
+        directory_entry,
+        manifest_entry,
+        *,
+        stable_metadata,
+    ):
+        if (
+            directory_entry.file_id_128 != manifest_entry[1]
+            or directory_entry.file_attributes != manifest_entry[2]
+            or directory_entry.reparse_tag != manifest_entry[3]
+        ):
+            return False
+        if not stable_metadata:
+            return True
+        return (
+            directory_entry.size == manifest_entry[4]
+            and directory_entry.last_write_time == manifest_entry[5]
+        )
+
+    @staticmethod
+    def _expected_manifest_children(expected_manifest):
+        manifest_by_path = {}
+        children_by_parent = {}
+        for relative_path, manifest_entry in expected_manifest:
+            if (
+                not isinstance(relative_path, str)
+                or not relative_path
+                or len(manifest_entry) != 7
+            ):
+                raise WindowsDeleteFailure("invalid_expected_manifest")
+            components = relative_path.split("\\")
+            if any(not component for component in components):
+                raise WindowsDeleteFailure("invalid_expected_manifest")
+            canonical_path = relative_path.casefold()
+            if canonical_path in manifest_by_path:
+                raise WindowsDeleteFailure("invalid_expected_manifest")
+            manifest_by_path[canonical_path] = manifest_entry
+            parent_path = "\\".join(components[:-1]).casefold()
+            children = children_by_parent.setdefault(parent_path, {})
+            canonical_name = components[-1].casefold()
+            if canonical_name in children:
+                raise WindowsDeleteFailure("invalid_expected_manifest")
+            children[canonical_name] = (
+                components[-1],
+                relative_path,
+                manifest_entry,
+            )
+
+        for canonical_path in manifest_by_path:
+            if "\\" not in canonical_path:
+                continue
+            parent_path = canonical_path.rsplit("\\", 1)[0]
+            parent_manifest = manifest_by_path.get(parent_path)
+            if (
+                parent_manifest is None
+                or not parent_manifest[2] & _FILE_ATTRIBUTE_DIRECTORY
+                or parent_manifest[2] & _FILE_ATTRIBUTE_REPARSE_POINT
+            ):
+                raise WindowsDeleteFailure("invalid_expected_manifest")
+        return children_by_parent
+
+    def delete_descendants(self, root_handle, expected_manifest):
+        children_by_parent = self._expected_manifest_children(
+            expected_manifest
+        )
+
+        def enumerate_by_name(parent_handle):
+            entries_by_name = {}
+            for entry in self.enumerate(parent_handle):
+                canonical_name = entry.name.casefold()
+                if canonical_name in entries_by_name:
+                    raise WindowsDeleteFailure("directory_changed")
+                entries_by_name[canonical_name] = entry
+            return entries_by_name
+
+        def delete_children(parent_handle, parent_path):
+            expected_children = children_by_parent.get(
+                parent_path.casefold(),
+                {},
+            )
+            initial_entries = enumerate_by_name(parent_handle)
+            if set(initial_entries) != set(expected_children):
+                raise WindowsDeleteFailure("directory_changed")
+
+            remaining_names = set(expected_children)
+            for canonical_name in sorted(expected_children):
+                (
+                    expected_name,
+                    child_path,
+                    expected_entry,
+                ) = expected_children[canonical_name]
+                enumerated_entry = initial_entries[canonical_name]
+                if not self._directory_entry_matches_manifest(
+                    enumerated_entry,
+                    expected_entry,
+                    stable_metadata=True,
+                ):
+                    raise WindowsDeleteFailure("manifest_changed")
+
                 is_directory = bool(
-                    entry.file_attributes & _FILE_ATTRIBUTE_DIRECTORY
+                    expected_entry[2] & _FILE_ATTRIBUTE_DIRECTORY
                 )
+                is_reparse = bool(
+                    expected_entry[2] & _FILE_ATTRIBUTE_REPARSE_POINT
+                )
+                is_traversed_directory = is_directory and not is_reparse
                 child_handle = self.open_relative(
                     parent_handle,
-                    entry.name,
+                    expected_name,
                     directory=is_directory,
                     delete=True,
                 )
                 disposition_accepted = False
                 try:
                     child_identity = self.identity(child_handle)
-                    if not self._entry_matches_identity(
-                        entry,
-                        child_identity,
-                    ):
-                        raise WindowsDeleteFailure(
-                            "enumerated_identity_changed"
-                        )
                     if (
-                        is_directory
-                        and not entry.file_attributes
-                        & _FILE_ATTRIBUTE_REPARSE_POINT
+                        not self._entry_matches_identity(
+                            enumerated_entry,
+                            child_identity,
+                        )
+                        or not self._identity_matches_manifest(
+                            child_identity,
+                            expected_entry,
+                        )
                     ):
-                        delete_children(child_handle)
+                        raise WindowsDeleteFailure("manifest_changed")
+
+                    if self.manifest_entry(child_handle) != expected_entry:
+                        raise WindowsDeleteFailure("manifest_changed")
+
+                    if is_traversed_directory:
+                        delete_children(child_handle, child_path)
                         if self.enumerate(child_handle):
                             raise WindowsDeleteFailure(
                                 "directory_not_empty"
                             )
+
+                    current_entries = enumerate_by_name(parent_handle)
+                    if set(current_entries) != remaining_names:
+                        raise WindowsDeleteFailure("directory_changed")
+                    current_entry = current_entries.get(canonical_name)
+                    if (
+                        current_entry is None
+                        or not self._directory_entry_matches_manifest(
+                            current_entry,
+                            expected_entry,
+                            stable_metadata=not is_traversed_directory,
+                        )
+                    ):
+                        raise WindowsDeleteFailure("manifest_changed")
+
+                    if is_traversed_directory:
+                        if not self._identity_matches_manifest(
+                            self.identity(child_handle),
+                            expected_entry,
+                        ):
+                            raise WindowsDeleteFailure("manifest_changed")
+                    elif (
+                        self.manifest_entry(child_handle)
+                        != expected_entry
+                    ):
+                        raise WindowsDeleteFailure("manifest_changed")
+
                     self.set_delete_disposition(child_handle)
                     disposition_accepted = True
                 finally:
                     self.close(child_handle)
                 if not disposition_accepted:
                     raise WindowsDeleteFailure("cleanup_failed")
+                remaining_names.remove(canonical_name)
 
             if self.enumerate(parent_handle):
                 raise WindowsDeleteFailure("directory_changed")
 
-        delete_children(root_handle)
+        delete_children(root_handle, "")
 
 
 class ConfigManager(object):
