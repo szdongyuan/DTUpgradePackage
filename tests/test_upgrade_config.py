@@ -66,7 +66,7 @@ def test_delete_artifact_ledger_collision_excludes_only_colliding_candidate():
     assert state.plausible_candidates == (initial,)
 
 
-def test_delete_artifact_ledger_verified_commit_retires_prior_candidates():
+def test_delete_artifact_ledger_verified_commit_keeps_indeterminate_prior_until_excluded():
     state = upgrade_config._OrdinaryConfigDeleteArtifactState()
     initial = state.stage_pending(
         "initial",
@@ -87,7 +87,11 @@ def test_delete_artifact_ledger_verified_commit_retires_prior_candidates():
     assert committed.rename_accepted is True
     assert state.current_candidate is committed
     assert state.path == "recovery/preservation"
-    assert initial.conclusively_excluded is True
+    assert initial.conclusively_excluded is False
+    assert state.plausible_candidates == (initial, committed)
+
+    state.exclude_candidate(initial)
+
     assert state.plausible_candidates == (committed,)
 
 
@@ -129,6 +133,54 @@ def test_delete_artifact_ledger_conclusive_deletion_retires_every_candidate():
     assert state.current_candidate is None
     assert state.pending_candidate is None
     assert state.path_valid is False
+
+
+def test_delete_artifact_ledger_returns_all_normalized_plausible_paths():
+    state = upgrade_config._OrdinaryConfigDeleteArtifactState()
+    exact = state.stage_pending(
+        "exact",
+        os.path.join("recovery", "exact"),
+        phase="initial_detach",
+        retain_only=False,
+    )
+    state.commit_pending()
+    duplicate = upgrade_config._OrdinaryConfigDeleteArtifactCandidate(
+        "duplicate",
+        os.path.join("recovery", "nested", "..", "exact"),
+        phase="preservation",
+        retain_only=True,
+    )
+    indeterminate = upgrade_config._OrdinaryConfigDeleteArtifactCandidate(
+        "indeterminate",
+        os.path.join("recovery", "indeterminate"),
+        phase="preservation",
+        retain_only=True,
+    )
+    collision = upgrade_config._OrdinaryConfigDeleteArtifactCandidate(
+        "collision",
+        os.path.join("recovery", "collision"),
+        phase="preservation",
+        retain_only=True,
+    )
+    state.candidates.extend((duplicate, indeterminate, collision))
+    state.exclude_candidate(collision)
+
+    assert state.plausible_candidate_paths == (
+        os.path.normpath(exact.path),
+        os.path.normpath(indeterminate.path),
+    )
+
+
+def test_delete_restore_result_carries_ordered_retained_paths():
+    result = upgrade_config._OrdinaryConfigDeleteRestoreResult(
+        False,
+        ("recovery/exact", "recovery/indeterminate"),
+    )
+
+    assert result.retained_paths == (
+        "recovery/exact",
+        "recovery/indeterminate",
+    )
 
 
 def _assert_disposed_handles_close_before_parent(events):
@@ -2181,6 +2233,168 @@ def test_windows_delete_failed_preservation_retains_prior_accepted_candidate(
     assert manager.restore_config() is True
     assert target.read_bytes() == b"recoverable"
     assert Path(initial_path).read_bytes() == b"recoverable"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
+def test_windows_delete_registers_every_plausible_candidate_through_global_rollback(
+    configured_tree,
+    monkeypatch,
+):
+    manager = make_manager()
+    target = (
+        configured_tree.roots["ui_config"]
+        / "multiple-plausible-candidates.bin"
+    )
+    target.write_bytes(b"recoverable")
+    source = configured_tree.config_dir / target.name
+    ops = upgrade_config.WindowsHandleOps()
+    snapshot, error = manager._preflight_ordinary_config_delete(
+        str(target),
+        str(source),
+        handle_ops=ops,
+    )
+    assert error is None
+    assert manager.backup_config_file(
+        [f"ui/ui_config/{target.name}"]
+    ) is True
+
+    indeterminate_name = f".{target.name}.recovery-indeterminate"
+    indeterminate_path = os.path.normpath(
+        os.path.join(snapshot.recovery_path, indeterminate_name)
+    )
+    collision_name = f".{target.name}.recovery-unrelated"
+    collision_path = os.path.normpath(
+        os.path.join(snapshot.recovery_path, collision_name)
+    )
+    real_stage_pending = (
+        upgrade_config._OrdinaryConfigDeleteArtifactState.stage_pending
+    )
+    injected_candidates = {"done": False}
+
+    def stage_with_prior_candidates(
+        artifact_state,
+        name,
+        path,
+        *,
+        phase,
+        retain_only,
+    ):
+        candidate = real_stage_pending(
+            artifact_state,
+            name,
+            path,
+            phase=phase,
+            retain_only=retain_only,
+        )
+        if phase == "initial_detach" and not injected_candidates["done"]:
+            injected_candidates["done"] = True
+            os.link(target, indeterminate_path)
+            Path(collision_path).write_bytes(b"unrelated collision")
+            indeterminate = (
+                upgrade_config._OrdinaryConfigDeleteArtifactCandidate(
+                    indeterminate_name,
+                    indeterminate_path,
+                    phase="earlier_recovery",
+                    retain_only=True,
+                )
+            )
+            indeterminate.indeterminate = True
+            collision = (
+                upgrade_config._OrdinaryConfigDeleteArtifactCandidate(
+                    collision_name,
+                    collision_path,
+                    phase="collision",
+                    retain_only=True,
+                )
+            )
+            collision.indeterminate = True
+            artifact_state.candidates.extend(
+                (indeterminate, collision)
+            )
+        return candidate
+
+    monkeypatch.setattr(
+        upgrade_config._OrdinaryConfigDeleteArtifactState,
+        "stage_pending",
+        stage_with_prior_candidates,
+    )
+    real_named_identity = manager._delete_verify_named_identity
+
+    def keep_one_candidate_indeterminate(
+        current_ops,
+        owner,
+        parent_handle,
+        name,
+        current_snapshot,
+    ):
+        if name == indeterminate_name:
+            raise WindowsHandleInstrumentationSignal(
+                "injected indeterminate candidate identity"
+            )
+        return real_named_identity(
+            current_ops,
+            owner,
+            parent_handle,
+            name,
+            current_snapshot,
+        )
+
+    monkeypatch.setattr(
+        manager,
+        "_delete_verify_named_identity",
+        keep_one_candidate_indeterminate,
+    )
+    real_rename = ops.rename_relative_no_replace
+    rename_calls = []
+    boundary_message = "injected accepted initial rename"
+
+    def accept_initial_then_fail_later_renames(
+        object_handle,
+        parent_handle,
+        target_name,
+    ):
+        rename_calls.append(target_name)
+        if len(rename_calls) == 1:
+            real_rename(object_handle, parent_handle, target_name)
+            raise RuntimeError(boundary_message)
+        raise upgrade_config.WindowsDeleteFailure("access_denied")
+
+    monkeypatch.setattr(
+        ops,
+        "rename_relative_no_replace",
+        accept_initial_then_fail_later_renames,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_delete_reconcile_pending_rename",
+        lambda *args, **kwargs: "indeterminate",
+    )
+
+    with pytest.raises(RuntimeError, match=boundary_message):
+        manager._delete_ordinary_config_compatibility(
+            snapshot,
+            handle_ops=ops,
+        )
+
+    exact_path = os.path.normpath(
+        os.path.join(snapshot.recovery_path, rename_calls[0])
+    )
+    assert manager._ordinary_config_delete_retained_artifacts == {
+        exact_path,
+        indeterminate_path,
+    }
+    errors = logged_messages(manager, "error")
+    for plausible_path in (exact_path, indeterminate_path):
+        assert Path(plausible_path).read_bytes() == b"recoverable"
+        assert any(plausible_path in message for message in errors)
+    assert Path(collision_path).read_bytes() == b"unrelated collision"
+    assert collision_path not in manager._ordinary_config_delete_retained_artifacts
+    assert not any(collision_path in message for message in errors)
+
+    assert manager.restore_config() is True
+    assert target.read_bytes() == b"recoverable"
+    assert Path(exact_path).read_bytes() == b"recoverable"
+    assert Path(indeterminate_path).read_bytes() == b"recoverable"
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
