@@ -1478,6 +1478,278 @@ def test_missing_ordinary_source_fails_before_backup_or_target_mutation(
     )
 
 
+def test_missing_ordinary_source_returns_candidate_and_missing_path(
+    configured_tree,
+):
+    manager = make_manager()
+    destination = configured_tree.roots["ui_pic"]
+    expected_candidate = configured_tree.config_dir / "ui_pic"
+
+    source_path, error = manager._resolve_ordinary_config_source(destination)
+
+    assert source_path == str(expected_candidate)
+    assert error == "missing_path"
+
+
+@pytest.mark.parametrize("missing_parent", ["resources", "config"])
+def test_ordinary_source_missing_parent_is_fatal(
+    configured_tree,
+    missing_parent,
+):
+    manager = make_manager()
+    configured_tree.config_dir.rmdir()
+    if missing_parent == "resources":
+        configured_tree.config_dir.parent.rmdir()
+
+    source_path, error = manager._resolve_ordinary_config_source(
+        configured_tree.roots["ui_pic"]
+    )
+
+    assert source_path is None
+    assert error == "missing_parent"
+
+
+def test_dangling_ordinary_source_is_not_missing(
+    configured_tree,
+    monkeypatch,
+):
+    manager = make_manager()
+    source_path = configured_tree.config_dir / "ui_pic"
+    real_lexists = os.path.lexists
+    real_lstat = os.lstat
+    real_stat = os.stat
+
+    def dangling_lexists(path):
+        if os.path.normcase(os.path.abspath(path)) == os.path.normcase(
+            os.path.abspath(source_path)
+        ):
+            return True
+        return real_lexists(path)
+
+    def dangling_lstat(path, *args, **kwargs):
+        if os.path.normcase(os.path.abspath(path)) == os.path.normcase(
+            os.path.abspath(source_path)
+        ):
+            return SimpleNamespace(
+                st_mode=upgrade_config.stat.S_IFLNK,
+                st_file_attributes=0,
+            )
+        return real_lstat(path, *args, **kwargs)
+
+    def dangling_stat(path, *args, **kwargs):
+        if os.path.normcase(os.path.abspath(path)) == os.path.normcase(
+            os.path.abspath(source_path)
+        ):
+            raise FileNotFoundError("dangling source")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(upgrade_config.os.path, "lexists", dangling_lexists)
+    monkeypatch.setattr(upgrade_config.os, "lstat", dangling_lstat)
+    monkeypatch.setattr(upgrade_config.os, "stat", dangling_stat)
+
+    resolved_source, error = manager._resolve_ordinary_config_source(
+        configured_tree.roots["ui_pic"]
+    )
+
+    assert resolved_source is None
+    assert error == "dangling_link"
+
+
+def test_reparse_ordinary_source_is_not_missing(
+    configured_tree,
+    monkeypatch,
+):
+    manager = make_manager()
+    source_path = configured_tree.config_dir / "ui_pic"
+    real_lexists = os.path.lexists
+    real_lstat = os.lstat
+
+    def reparse_lexists(path):
+        if os.path.normcase(os.path.abspath(path)) == os.path.normcase(
+            os.path.abspath(source_path)
+        ):
+            return True
+        return real_lexists(path)
+
+    def reparse_lstat(path, *args, **kwargs):
+        if os.path.normcase(os.path.abspath(path)) == os.path.normcase(
+            os.path.abspath(source_path)
+        ):
+            return SimpleNamespace(
+                st_mode=upgrade_config.stat.S_IFREG,
+                st_file_attributes=getattr(
+                    upgrade_config.stat,
+                    "FILE_ATTRIBUTE_REPARSE_POINT",
+                    0x400,
+                ),
+            )
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(upgrade_config.os.path, "lexists", reparse_lexists)
+    monkeypatch.setattr(upgrade_config.os, "lstat", reparse_lstat)
+
+    resolved_source, error = manager._resolve_ordinary_config_source(
+        configured_tree.roots["ui_pic"]
+    )
+
+    assert resolved_source is None
+    assert error == "unsupported_type"
+
+
+def test_ordinary_source_inconsistent_absence_is_fatal(
+    configured_tree,
+    monkeypatch,
+):
+    manager = make_manager()
+    source_path = configured_tree.config_dir / "ui_pic"
+    source_path.write_text("replacement", encoding="utf-8")
+    real_lexists = os.path.lexists
+
+    def inconsistent_lexists(path):
+        if os.path.normcase(os.path.abspath(path)) == os.path.normcase(
+            os.path.abspath(source_path)
+        ):
+            return False
+        return real_lexists(path)
+
+    monkeypatch.setattr(upgrade_config.os.path, "lexists", inconsistent_lexists)
+
+    resolved_source, error = manager._resolve_ordinary_config_source(
+        configured_tree.roots["ui_pic"]
+    )
+
+    assert resolved_source is None
+    assert error == "identity_check_failed"
+
+
+def test_ordinary_source_permission_failure_is_fatal(
+    configured_tree,
+    monkeypatch,
+):
+    manager = make_manager()
+    source_path = configured_tree.config_dir / "ui_pic"
+    source_path.write_text("replacement", encoding="utf-8")
+    real_lstat = os.lstat
+
+    def permission_denied_lstat(path, *args, **kwargs):
+        if os.path.normcase(os.path.abspath(path)) == os.path.normcase(
+            os.path.abspath(source_path)
+        ):
+            raise PermissionError("source identity denied")
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(upgrade_config.os, "lstat", permission_denied_lstat)
+
+    resolved_source, error = manager._resolve_ordinary_config_source(
+        configured_tree.roots["ui_pic"]
+    )
+
+    assert resolved_source is None
+    assert error == "identity_check_failed"
+
+
+def test_ordinary_source_unsupported_type_is_fatal(
+    configured_tree,
+    monkeypatch,
+):
+    manager = make_manager()
+    source_path = configured_tree.config_dir / "ui_pic"
+    real_lexists = os.path.lexists
+    real_lstat = os.lstat
+
+    def source_lexists(path):
+        if os.path.normcase(os.path.abspath(path)) == os.path.normcase(
+            os.path.abspath(source_path)
+        ):
+            return True
+        return real_lexists(path)
+
+    def unsupported_lstat(path, *args, **kwargs):
+        if os.path.normcase(os.path.abspath(path)) == os.path.normcase(
+            os.path.abspath(source_path)
+        ):
+            return SimpleNamespace(st_mode=0, st_file_attributes=0)
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(upgrade_config.os.path, "lexists", source_lexists)
+    monkeypatch.setattr(upgrade_config.os, "lstat", unsupported_lstat)
+
+    resolved_source, error = manager._resolve_ordinary_config_source(
+        configured_tree.roots["ui_pic"]
+    )
+
+    assert resolved_source is None
+    assert error == "unsupported_type"
+
+
+def test_ordinary_source_invalid_destination_is_fatal():
+    manager = make_manager()
+
+    source_path, error = manager._resolve_ordinary_config_source(None)
+
+    assert source_path is None
+    assert error == "invalid_path"
+
+
+@pytest.mark.parametrize(
+    "source_error",
+    [
+        "dangling_link",
+        "identity_check_failed",
+        "unsupported_type",
+        "invalid_path",
+        "symlink_escape",
+        "missing_parent",
+    ],
+)
+def test_ordinary_source_non_missing_errors_fail_before_backup_or_mutation(
+    configured_tree,
+    monkeypatch,
+    source_error,
+):
+    target_root = configured_tree.roots["ui_pic"]
+    original_target_tree = snapshot_tree(target_root)
+    manager = configure_manifest_manager(
+        configured_tree,
+        [
+            (
+                "1.0",
+                {
+                    "config": ["ui/ui_pic"],
+                    "json_merge": [],
+                },
+            )
+        ],
+    )
+    events = []
+    monkeypatch.setattr(
+        manager,
+        "_resolve_ordinary_config_source",
+        lambda _destination: (None, source_error),
+    )
+    monkeypatch.setattr(
+        manager,
+        "backup_config_file",
+        lambda _paths: events.append("backup") or True,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_replace_with_staged_ordinary_config",
+        lambda _source, _destination: events.append("replace") or True,
+    )
+
+    assert manager.update_config_file() is False
+
+    assert events == []
+    assert snapshot_tree(target_root) == original_target_tree
+    assert manager.ui_pic_flag is True
+    assert not configured_tree.backups["ui_pic"].exists()
+    assert any(
+        f"ordinary_config error: source_path:{source_error}" in message
+        for message in logged_messages(manager, "error")
+    )
+
+
 def test_existing_config_actions_run_before_json_merge_actions(
     configured_tree,
     monkeypatch,

@@ -2121,6 +2121,93 @@ class ConfigManager(object):
         message = f"ordinary_config error: destination_path:{error}"
         self._report_best_effort("error", message)
 
+    def _ordinary_config_source_parent_chain_state(self, lexical_root):
+        try:
+            trusted_root = os.path.abspath(DEFAULT_DIR)
+            expected_root = os.path.abspath(
+                os.path.join(trusted_root, "resources", "config")
+            )
+        except (OSError, TypeError, ValueError):
+            return None, "invalid_path"
+
+        if os.path.normcase(os.path.normpath(lexical_root)) != os.path.normcase(
+            os.path.normpath(expected_root)
+        ):
+            return None, "outside_allowed_root"
+
+        chain = []
+        for parent_path in (
+            trusted_root,
+            os.path.join(trusted_root, "resources"),
+            expected_root,
+        ):
+            try:
+                lexical_exists = os.path.lexists(parent_path)
+            except (OSError, TypeError, ValueError):
+                return None, "identity_check_failed"
+
+            try:
+                parent_stat = os.lstat(parent_path)
+            except FileNotFoundError:
+                if lexical_exists is False:
+                    return None, "missing_parent"
+                return None, "identity_check_failed"
+            except (OSError, TypeError, ValueError):
+                return None, "identity_check_failed"
+
+            if lexical_exists is False:
+                return None, "identity_check_failed"
+            if self._snapshot_entry_is_link_or_reparse(parent_stat):
+                return None, "symlink_escape"
+            if not stat.S_ISDIR(parent_stat.st_mode):
+                return None, "identity_check_failed"
+
+            chain.append(
+                (
+                    os.path.normcase(os.path.normpath(parent_path)),
+                    parent_stat.st_dev,
+                    parent_stat.st_ino,
+                    parent_stat.st_mode,
+                    getattr(parent_stat, "st_file_attributes", None),
+                    getattr(parent_stat, "st_reparse_tag", None),
+                )
+            )
+
+        return tuple(chain), None
+
+    def _ordinary_config_source_entry_state(self, lexical_path):
+        try:
+            lexical_exists = os.path.lexists(lexical_path)
+        except (OSError, TypeError, ValueError):
+            return None, "identity_check_failed"
+
+        try:
+            source_stat = os.lstat(lexical_path)
+        except FileNotFoundError:
+            if lexical_exists is False:
+                return None, "missing_path"
+            return None, "identity_check_failed"
+        except (OSError, TypeError, ValueError):
+            return None, "identity_check_failed"
+
+        if lexical_exists is False:
+            return None, "identity_check_failed"
+        if self._snapshot_entry_is_link_or_reparse(source_stat):
+            if stat.S_ISLNK(source_stat.st_mode):
+                try:
+                    os.stat(lexical_path)
+                except FileNotFoundError:
+                    return None, "dangling_link"
+                except (OSError, TypeError, ValueError):
+                    return None, "identity_check_failed"
+            return None, "unsupported_type"
+        if not (
+            stat.S_ISREG(source_stat.st_mode)
+            or stat.S_ISDIR(source_stat.st_mode)
+        ):
+            return None, "unsupported_type"
+        return source_stat, None
+
     def _resolve_ordinary_config_source(self, destination_path):
         try:
             lexical_root = os.path.abspath(CONFIG_DIR)
@@ -2128,26 +2215,43 @@ class ConfigManager(object):
             lexical_path = os.path.abspath(
                 os.path.join(lexical_root, source_name)
             )
-            resolved_root = os.path.realpath(lexical_root)
-            resolved_path = os.path.realpath(lexical_path)
-        except (OSError, ValueError):
+        except (OSError, TypeError, ValueError):
             return None, "invalid_path"
 
         if not self._path_is_contained(lexical_path, lexical_root):
             return None, "outside_allowed_root"
+
+        parent_chain, parent_error = (
+            self._ordinary_config_source_parent_chain_state(lexical_root)
+        )
+        if parent_error is not None:
+            return None, parent_error
+
+        try:
+            resolved_root = os.path.realpath(lexical_root)
+            resolved_path = os.path.realpath(lexical_path)
+        except (OSError, TypeError, ValueError):
+            return None, "invalid_path"
+
         if not self._path_is_contained(resolved_path, resolved_root):
             return None, "symlink_escape"
 
-        try:
-            if not os.path.exists(lexical_path):
-                return None, "missing_path"
-            if not (
-                os.path.isfile(lexical_path)
-                or os.path.isdir(lexical_path)
-            ):
-                return None, "unsupported_type"
-        except OSError:
-            return None, "invalid_path"
+        _, source_error = self._ordinary_config_source_entry_state(
+            lexical_path
+        )
+
+        confirmed_parent_chain, confirmed_parent_error = (
+            self._ordinary_config_source_parent_chain_state(lexical_root)
+        )
+        if confirmed_parent_error is not None:
+            return None, confirmed_parent_error
+        if confirmed_parent_chain != parent_chain:
+            return None, "identity_check_failed"
+
+        if source_error == "missing_path":
+            return lexical_path, source_error
+        if source_error is not None:
+            return None, source_error
         return lexical_path, None
 
     def _report_ordinary_config_source_error(self, error):
