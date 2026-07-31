@@ -4555,6 +4555,19 @@ class ConfigManager(object):
                     continue
             except BaseException:
                 pass
+            else:
+                artifact_state.commit_pending()
+                try:
+                    self._delete_verify_named_identity(
+                        ops,
+                        owner,
+                        recovery_handle,
+                        candidate,
+                        snapshot,
+                    )
+                except BaseException:
+                    pass
+                return True
             try:
                 candidate_matches = self._delete_verify_named_identity(
                     ops,
@@ -4950,6 +4963,46 @@ class ConfigManager(object):
                 ):
                     propagated_error = error
                     propagated_traceback = error.__traceback__
+            if (
+                artifact_state is not None
+                and artifact_state.pending_name is not None
+                and artifact_handle is not None
+            ):
+                try:
+                    rename_location = (
+                        self._delete_reconcile_pending_rename(
+                            ops,
+                            owner,
+                            snapshot,
+                            original_parent_handle=(
+                                destination_parent_handle
+                            ),
+                            original_name=snapshot.destination_name,
+                            candidate_parent_handle=recovery_handle,
+                            candidate_name=(
+                                artifact_state.pending_name
+                            ),
+                        )
+                    )
+                    if rename_location == "candidate":
+                        artifact_state.commit_pending()
+                    elif rename_location == "original":
+                        artifact_state.mark_original_name()
+                    else:
+                        self._delete_preserve_indeterminate_exact_handle(
+                            ops,
+                            owner,
+                            snapshot,
+                            artifact_handle,
+                            recovery_handle,
+                            artifact_state,
+                        )
+                except BaseException:
+                    pass
+                if artifact_state.path_valid:
+                    artifact_name = artifact_state.name
+                    artifact_path = artifact_state.path
+                    detached = True
             restore_result = _OrdinaryConfigDeleteRestoreResult(
                 False,
                 None,
@@ -4974,42 +5027,60 @@ class ConfigManager(object):
                 and not root_disposition_accepted
                 and artifact_handle is not None
             ):
-                try:
-                    restore_result = self._delete_try_local_restore(
-                        ops,
-                        owner,
-                        snapshot,
-                        artifact_handle,
-                        artifact_name,
-                        source_handles,
-                        destination_handles,
-                        recovery_handles,
-                        artifact_state,
-                    )
-                except BaseException as recovery_error:
-                    if (
-                        propagated_error is None
-                        or (
-                            not isinstance(recovery_error, Exception)
-                            and isinstance(propagated_error, Exception)
-                        )
-                    ):
-                        propagated_error = recovery_error
-                        propagated_traceback = (
-                            recovery_error.__traceback__
-                        )
+                if (
+                    artifact_state.retain_only
+                    and artifact_state.path_valid
+                ):
                     restore_result = (
-                        self._delete_recover_after_restore_interruption(
+                        _OrdinaryConfigDeleteRestoreResult(
+                            False,
+                            artifact_state.path,
+                            False,
+                        )
+                    )
+                else:
+                    try:
+                        restore_result = self._delete_try_local_restore(
                             ops,
                             owner,
                             snapshot,
                             artifact_handle,
-                            artifact_state,
+                            artifact_name,
                             source_handles,
                             destination_handles,
                             recovery_handles,
+                            artifact_state,
                         )
-                    )
+                    except BaseException as recovery_error:
+                        if (
+                            propagated_error is None
+                            or (
+                                not isinstance(
+                                    recovery_error,
+                                    Exception,
+                                )
+                                and isinstance(
+                                    propagated_error,
+                                    Exception,
+                                )
+                            )
+                        ):
+                            propagated_error = recovery_error
+                            propagated_traceback = (
+                                recovery_error.__traceback__
+                            )
+                        restore_result = (
+                            self._delete_recover_after_restore_interruption(
+                                ops,
+                                owner,
+                                snapshot,
+                                artifact_handle,
+                                artifact_state,
+                                source_handles,
+                                destination_handles,
+                                recovery_handles,
+                            )
+                        )
             if restore_result.restored:
                 detached = False
                 artifact_path = None

@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from ctypes import wintypes
@@ -1596,6 +1597,90 @@ def test_windows_delete_initial_detach_return_throwable_restores_exact_object(
     "exception_type",
     [RuntimeError, KeyboardInterrupt, SystemExit],
 )
+def test_windows_delete_initial_detach_caller_line_throwable_restores_exact_object(
+    configured_tree,
+    exception_type,
+):
+    manager = make_manager()
+    target = configured_tree.roots["ui_config"] / (
+        f"initial-caller-line-{exception_type.__name__}.bin"
+    )
+    target.write_bytes(b"recoverable")
+    original_identity = (target.stat().st_dev, target.stat().st_ino)
+    source = configured_tree.config_dir / target.name
+    events = []
+    ops = upgrade_config.WindowsHandleOps(event_sink=events.append)
+    snapshot, error = manager._preflight_ordinary_config_delete(
+        str(target),
+        str(source),
+        handle_ops=ops,
+    )
+    assert error is None
+    assert manager.backup_config_file(
+        [f"ui/ui_config/{target.name}"]
+    ) is True
+    events.clear()
+    injected = {"done": False, "candidate_path": None}
+    injected_message = (
+        f"injected initial caller line {exception_type.__name__}"
+    )
+    delete_code = (
+        manager._delete_ordinary_config_compatibility.__func__.__code__
+    )
+
+    def interrupt_after_native_return(frame, event, arg):
+        if frame.f_code is not delete_code or event != "line":
+            return interrupt_after_native_return
+        artifact_state = frame.f_locals.get("artifact_state")
+        if (
+            injected["done"]
+            or artifact_state is None
+            or artifact_state.pending_name is None
+            or artifact_state.path_valid
+            or frame.f_locals.get("detached")
+            or ops.last_rename is None
+            or ops.last_rename["target_name"]
+            != artifact_state.pending_name
+            or not os.path.isfile(artifact_state.pending_path)
+        ):
+            return interrupt_after_native_return
+        injected["done"] = True
+        injected["candidate_path"] = artifact_state.pending_path
+        raise exception_type(injected_message)
+
+    previous_trace = sys.gettrace()
+    try:
+        sys.settrace(interrupt_after_native_return)
+        with pytest.raises(exception_type, match=injected_message):
+            manager._delete_ordinary_config_compatibility(
+                snapshot,
+                handle_ops=ops,
+            )
+    finally:
+        sys.settrace(previous_trace)
+
+    candidate_path = os.path.normpath(injected["candidate_path"])
+    assert injected["done"] is True
+    assert target.read_bytes() == b"recoverable"
+    assert (target.stat().st_dev, target.stat().st_ino) == original_identity
+    assert not os.path.lexists(candidate_path)
+    assert manager._ordinary_config_delete_retained_artifacts == set()
+    assert not any(
+        candidate_path in message
+        for message in logged_messages(manager, "error")
+    )
+    _assert_opened_handles_close_in_reverse_order(events)
+
+    if exception_type is RuntimeError:
+        assert manager.restore_config() is True
+        assert target.read_bytes() == b"recoverable"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
+@pytest.mark.parametrize(
+    "exception_type",
+    [RuntimeError, KeyboardInterrupt, SystemExit],
+)
 def test_windows_delete_initial_detach_collision_throwable_never_tracks_unrelated_candidate(
     configured_tree,
     monkeypatch,
@@ -1668,6 +1753,141 @@ def test_windows_delete_initial_detach_collision_throwable_never_tracks_unrelate
         for message in logged_messages(manager, "error")
     )
     _assert_opened_handles_close_in_reverse_order(events)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
+@pytest.mark.parametrize(
+    ("verification_throwable", "boundary_throwable"),
+    [
+        (None, RuntimeError),
+        (RuntimeError, KeyboardInterrupt),
+        (KeyboardInterrupt, SystemExit),
+        (SystemExit, KeyboardInterrupt),
+    ],
+)
+def test_windows_delete_indeterminate_preservation_keeps_successful_rename_candidate(
+    configured_tree,
+    monkeypatch,
+    verification_throwable,
+    boundary_throwable,
+):
+    manager = make_manager()
+    suffix = (
+        "false"
+        if verification_throwable is None
+        else verification_throwable.__name__
+    )
+    target = configured_tree.roots["ui_config"] / (
+        f"preservation-verification-{suffix}.bin"
+    )
+    target.write_bytes(b"recoverable")
+    original_identity = (target.stat().st_dev, target.stat().st_ino)
+    source = configured_tree.config_dir / target.name
+    events = []
+    ops = upgrade_config.WindowsHandleOps(event_sink=events.append)
+    snapshot, error = manager._preflight_ordinary_config_delete(
+        str(target),
+        str(source),
+        handle_ops=ops,
+    )
+    assert error is None
+    assert manager.backup_config_file(
+        [f"ui/ui_config/{target.name}"]
+    ) is True
+    events.clear()
+    real_rename = ops.rename_relative_no_replace
+    rename_calls = []
+    boundary_message = "injected initial rename boundary"
+
+    def interrupt_initial_rename(
+        object_handle,
+        parent_handle,
+        target_name,
+    ):
+        rename_calls.append(target_name)
+        if len(rename_calls) == 1:
+            raise boundary_throwable(boundary_message)
+        return real_rename(
+            object_handle,
+            parent_handle,
+            target_name,
+        )
+
+    monkeypatch.setattr(
+        ops,
+        "rename_relative_no_replace",
+        interrupt_initial_rename,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_delete_reconcile_pending_rename",
+        lambda *args, **kwargs: "indeterminate",
+    )
+    verification_seen = {"done": False}
+    real_named_identity = manager._delete_verify_named_identity
+
+    def fail_preserved_candidate_verification(
+        current_ops,
+        owner,
+        parent_handle,
+        name,
+        current_snapshot,
+    ):
+        if not name.startswith(f".{target.name}.recovery-"):
+            return real_named_identity(
+                current_ops,
+                owner,
+                parent_handle,
+                name,
+                current_snapshot,
+            )
+        verification_seen["done"] = True
+        if verification_throwable is not None:
+            raise verification_throwable(
+                f"injected preservation verification {suffix}"
+            )
+        return False
+
+    monkeypatch.setattr(
+        manager,
+        "_delete_verify_named_identity",
+        fail_preserved_candidate_verification,
+    )
+
+    with pytest.raises(
+        boundary_throwable,
+        match=boundary_message,
+    ):
+        manager._delete_ordinary_config_compatibility(
+            snapshot,
+            handle_ops=ops,
+        )
+
+    assert verification_seen["done"] is True
+    assert len(rename_calls) == 2
+    assert rename_calls[0].startswith(f".{target.name}.delete-")
+    assert rename_calls[1].startswith(f".{target.name}.recovery-")
+    retained_path = os.path.normpath(
+        os.path.join(snapshot.recovery_path, rename_calls[1])
+    )
+    assert not target.exists()
+    assert Path(retained_path).read_bytes() == b"recoverable"
+    assert (os.stat(retained_path).st_dev, os.stat(retained_path).st_ino) == (
+        original_identity
+    )
+    assert manager._ordinary_config_delete_retained_artifacts == {
+        retained_path
+    }
+    assert any(
+        "retained recovery object" in message
+        and retained_path in message
+        for message in logged_messages(manager, "error")
+    )
+    _assert_opened_handles_close_in_reverse_order(events)
+
+    assert manager.restore_config() is True
+    assert target.read_bytes() == b"recoverable"
+    assert Path(retained_path).read_bytes() == b"recoverable"
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
