@@ -1130,11 +1130,36 @@ class _OrdinaryConfigDeleteRestoreResult(NamedTuple):
 
 
 class _OrdinaryConfigDeleteArtifactState:
-    def __init__(self, name, path):
+    def __init__(self, name=None, path=None):
         self.name = name
         self.path = path
-        self.path_valid = True
+        self.path_valid = name is not None and path is not None
         self.retain_only = False
+        self.pending_name = None
+        self.pending_path = None
+        self.pending_retain_only = False
+
+    def stage_pending(self, name, path, *, retain_only):
+        self.pending_name = name
+        self.pending_path = path
+        self.pending_retain_only = retain_only
+
+    def clear_pending(self):
+        self.pending_name = None
+        self.pending_path = None
+        self.pending_retain_only = False
+
+    def commit_pending(self):
+        self.name = self.pending_name
+        self.path = self.pending_path
+        self.path_valid = True
+        self.retain_only = self.pending_retain_only
+        self.clear_pending()
+
+    def mark_original_name(self):
+        self.path_valid = False
+        self.retain_only = False
+        self.clear_pending()
 
 
 class _OrdinaryConfigDeleteSnapshot(NamedTuple):
@@ -4231,6 +4256,11 @@ class ConfigManager(object):
                 candidate,
             )
             rename_accepted = False
+            artifact_state.stage_pending(
+                candidate,
+                candidate_path,
+                retain_only=True,
+            )
             try:
                 self._delete_validate_before_recovery_redetach_attempt(
                     ops,
@@ -4245,11 +4275,9 @@ class ConfigManager(object):
                     candidate,
                 )
                 rename_accepted = True
-                artifact_state.name = candidate
-                artifact_state.path = candidate_path
-                artifact_state.path_valid = True
-                artifact_state.retain_only = True
+                artifact_state.commit_pending()
             except WindowsDeleteFailure as error:
+                artifact_state.clear_pending()
                 if error.category == "rename_collision":
                     continue
                 self._report_best_effort(
@@ -4262,6 +4290,31 @@ class ConfigManager(object):
                     None,
                     False,
                 )
+            except BaseException:
+                rename_location = self._delete_reconcile_pending_rename(
+                    ops,
+                    owner,
+                    snapshot,
+                    original_parent_handle=destination_parent_handle,
+                    original_name=snapshot.destination_name,
+                    candidate_parent_handle=recovery_handle,
+                    candidate_name=candidate,
+                )
+                if rename_location == "candidate":
+                    rename_accepted = True
+                    artifact_state.commit_pending()
+                elif rename_location == "original":
+                    artifact_state.mark_original_name()
+                else:
+                    self._delete_preserve_indeterminate_exact_handle(
+                        ops,
+                        owner,
+                        snapshot,
+                        artifact_handle,
+                        recovery_handle,
+                        artifact_state,
+                    )
+                raise
 
             try:
                 destination_is_absent = ops.name_is_absent(
@@ -4428,6 +4481,97 @@ class ConfigManager(object):
         ):
             return "destination"
         return "indeterminate"
+
+    def _delete_reconcile_pending_rename(
+        self,
+        ops,
+        owner,
+        snapshot,
+        *,
+        original_parent_handle,
+        original_name,
+        candidate_parent_handle,
+        candidate_name,
+    ):
+        try:
+            candidate_matches = self._delete_verify_named_identity(
+                ops,
+                owner,
+                candidate_parent_handle,
+                candidate_name,
+                snapshot,
+            )
+        except BaseException:
+            candidate_matches = None
+        try:
+            original_matches = self._delete_verify_named_identity(
+                ops,
+                owner,
+                original_parent_handle,
+                original_name,
+                snapshot,
+            )
+        except BaseException:
+            original_matches = None
+
+        if original_matches is True:
+            return "original"
+        if candidate_matches is True and original_matches is False:
+            return "candidate"
+        return "indeterminate"
+
+    def _delete_preserve_indeterminate_exact_handle(
+        self,
+        ops,
+        owner,
+        snapshot,
+        artifact_handle,
+        recovery_handle,
+        artifact_state,
+    ):
+        while True:
+            candidate = (
+                f".{snapshot.destination_name}.recovery-"
+                f"{uuid.uuid4().hex}"
+            )
+            candidate_path = os.path.join(
+                snapshot.recovery_path,
+                candidate,
+            )
+            artifact_state.stage_pending(
+                candidate,
+                candidate_path,
+                retain_only=True,
+            )
+            try:
+                ops.rename_relative_no_replace(
+                    artifact_handle,
+                    recovery_handle,
+                    candidate,
+                )
+            except WindowsDeleteFailure as error:
+                artifact_state.clear_pending()
+                if error.category == "rename_collision":
+                    continue
+            except BaseException:
+                pass
+            try:
+                candidate_matches = self._delete_verify_named_identity(
+                    ops,
+                    owner,
+                    recovery_handle,
+                    candidate,
+                    snapshot,
+                )
+            except BaseException:
+                candidate_matches = False
+            if candidate_matches:
+                artifact_state.commit_pending()
+                return True
+            artifact_state.clear_pending()
+            artifact_state.path_valid = False
+            artifact_state.retain_only = False
+            return False
 
     def _delete_recover_after_restore_interruption(
         self,
@@ -4633,10 +4777,15 @@ class ConfigManager(object):
                         "destination_changed"
                     )
 
+                artifact_state = _OrdinaryConfigDeleteArtifactState()
                 while True:
                     candidate = (
                         f".{snapshot.destination_name}.delete-"
                         f"{uuid.uuid4().hex}"
+                    )
+                    candidate_path = os.path.join(
+                        snapshot.recovery_path,
+                        candidate,
                     )
                     self._delete_validate_before_rename_attempt(
                         ops,
@@ -4647,6 +4796,11 @@ class ConfigManager(object):
                         destination_handles,
                         recovery_handles,
                     )
+                    artifact_state.stage_pending(
+                        candidate,
+                        candidate_path,
+                        retain_only=False,
+                    )
                     try:
                         ops.rename_relative_no_replace(
                             artifact_handle,
@@ -4654,20 +4808,47 @@ class ConfigManager(object):
                             candidate,
                         )
                     except WindowsDeleteFailure as error:
+                        artifact_state.clear_pending()
                         if error.category == "rename_collision":
                             continue
                         raise
-                    artifact_name = candidate
-                    artifact_path = os.path.join(
-                        snapshot.recovery_path,
-                        artifact_name,
-                    )
-                    artifact_state = (
-                        _OrdinaryConfigDeleteArtifactState(
-                            artifact_name,
-                            artifact_path,
+                    except BaseException:
+                        rename_location = (
+                            self._delete_reconcile_pending_rename(
+                                ops,
+                                owner,
+                                snapshot,
+                                original_parent_handle=(
+                                    destination_parent_handle
+                                ),
+                                original_name=(
+                                    snapshot.destination_name
+                                ),
+                                candidate_parent_handle=recovery_handle,
+                                candidate_name=candidate,
+                            )
                         )
-                    )
+                        if rename_location == "candidate":
+                            artifact_state.commit_pending()
+                        elif rename_location == "original":
+                            artifact_state.mark_original_name()
+                        else:
+                            self._delete_preserve_indeterminate_exact_handle(
+                                ops,
+                                owner,
+                                snapshot,
+                                artifact_handle,
+                                recovery_handle,
+                                artifact_state,
+                            )
+                        if artifact_state.path_valid:
+                            artifact_name = artifact_state.name
+                            artifact_path = artifact_state.path
+                            detached = True
+                        raise
+                    artifact_name = candidate
+                    artifact_path = candidate_path
+                    artifact_state.commit_pending()
                     detached = True
                     break
 

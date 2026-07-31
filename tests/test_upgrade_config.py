@@ -1517,9 +1517,167 @@ def test_windows_delete_transaction_post_detach_throwables_recover_before_rerais
     "exception_type",
     [RuntimeError, KeyboardInterrupt, SystemExit],
 )
+def test_windows_delete_initial_detach_return_throwable_restores_exact_object(
+    configured_tree,
+    monkeypatch,
+    exception_type,
+):
+    manager = make_manager()
+    target = configured_tree.roots["ui_config"] / (
+        f"initial-detach-return-{exception_type.__name__}.bin"
+    )
+    target.write_bytes(b"recoverable")
+    original_identity = (target.stat().st_dev, target.stat().st_ino)
+    source = configured_tree.config_dir / target.name
+    events = []
+    ops = upgrade_config.WindowsHandleOps(event_sink=events.append)
+    snapshot, error = manager._preflight_ordinary_config_delete(
+        str(target),
+        str(source),
+        handle_ops=ops,
+    )
+    assert error is None
+    assert manager.backup_config_file(
+        [f"ui/ui_config/{target.name}"]
+    ) is True
+    events.clear()
+    real_rename = ops.rename_relative_no_replace
+    accepted_candidate = {"name": None}
+    injected_message = (
+        f"injected initial detach return {exception_type.__name__}"
+    )
+
+    def rename_then_interrupt(object_handle, parent_handle, target_name):
+        result = real_rename(
+            object_handle,
+            parent_handle,
+            target_name,
+        )
+        if target_name != snapshot.destination_name:
+            accepted_candidate["name"] = target_name
+            raise exception_type(injected_message)
+        return result
+
+    monkeypatch.setattr(
+        ops,
+        "rename_relative_no_replace",
+        rename_then_interrupt,
+    )
+
+    with pytest.raises(exception_type, match=injected_message):
+        manager._delete_ordinary_config_compatibility(
+            snapshot,
+            handle_ops=ops,
+        )
+
+    candidate_path = os.path.normpath(
+        os.path.join(
+            snapshot.recovery_path,
+            accepted_candidate["name"],
+        )
+    )
+    assert target.read_bytes() == b"recoverable"
+    assert (target.stat().st_dev, target.stat().st_ino) == original_identity
+    assert not os.path.lexists(candidate_path)
+    assert manager._ordinary_config_delete_retained_artifacts == set()
+    assert not any(
+        candidate_path in message
+        for message in logged_messages(manager, "error")
+    )
+    _assert_opened_handles_close_in_reverse_order(events)
+
+    if exception_type is RuntimeError:
+        assert manager.restore_config() is True
+        assert target.read_bytes() == b"recoverable"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
+@pytest.mark.parametrize(
+    "exception_type",
+    [RuntimeError, KeyboardInterrupt, SystemExit],
+)
+def test_windows_delete_initial_detach_collision_throwable_never_tracks_unrelated_candidate(
+    configured_tree,
+    monkeypatch,
+    exception_type,
+):
+    manager = make_manager()
+    target = configured_tree.roots["ui_config"] / (
+        f"initial-collision-{exception_type.__name__}.bin"
+    )
+    target.write_bytes(b"exact target")
+    original_identity = (target.stat().st_dev, target.stat().st_ino)
+    source = configured_tree.config_dir / target.name
+    events = []
+    ops = upgrade_config.WindowsHandleOps(event_sink=events.append)
+    snapshot, error = manager._preflight_ordinary_config_delete(
+        str(target),
+        str(source),
+        handle_ops=ops,
+    )
+    assert error is None
+    monkeypatch.setattr(
+        upgrade_config.uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex="fixed"),
+    )
+    collision_path = (
+        Path(snapshot.recovery_path)
+        / f".{target.name}.delete-fixed"
+    )
+    collision_path.write_bytes(b"unrelated collision")
+    events.clear()
+    real_rename = ops.rename_relative_no_replace
+    injected_message = (
+        f"injected initial collision {exception_type.__name__}"
+    )
+
+    def collide_then_interrupt(
+        object_handle,
+        parent_handle,
+        target_name,
+    ):
+        try:
+            return real_rename(
+                object_handle,
+                parent_handle,
+                target_name,
+            )
+        except upgrade_config.WindowsDeleteFailure as error:
+            assert error.category == "rename_collision"
+            raise exception_type(injected_message)
+
+    monkeypatch.setattr(
+        ops,
+        "rename_relative_no_replace",
+        collide_then_interrupt,
+    )
+
+    with pytest.raises(exception_type, match=injected_message):
+        manager._delete_ordinary_config_compatibility(
+            snapshot,
+            handle_ops=ops,
+        )
+
+    assert target.read_bytes() == b"exact target"
+    assert (target.stat().st_dev, target.stat().st_ino) == original_identity
+    assert collision_path.read_bytes() == b"unrelated collision"
+    assert manager._ordinary_config_delete_retained_artifacts == set()
+    assert not any(
+        str(collision_path) in message
+        for message in logged_messages(manager, "error")
+    )
+    _assert_opened_handles_close_in_reverse_order(events)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
+@pytest.mark.parametrize(
+    "exception_type",
+    [RuntimeError, KeyboardInterrupt, SystemExit],
+)
 @pytest.mark.parametrize(
     "verification_phase",
-    ["named_identity", "manifest"],
+    ["rename_return", "named_identity", "manifest", "collision"],
 )
 def test_windows_delete_recovery_redetach_throwable_tracks_accepted_candidate(
     configured_tree,
@@ -1546,6 +1704,18 @@ def test_windows_delete_recovery_redetach_throwable_tracks_accepted_candidate(
         [f"ui/ui_config/{target.name}"]
     ) is True
     events.clear()
+    collision_contents = b"unrelated collision"
+    if verification_phase == "collision":
+        monkeypatch.setattr(
+            upgrade_config.uuid,
+            "uuid4",
+            lambda: SimpleNamespace(hex="fixed"),
+        )
+        collision_path = (
+            Path(snapshot.recovery_path)
+            / f".{target.name}.recovery-fixed"
+        )
+        collision_path.write_bytes(collision_contents)
 
     real_rename = ops.rename_relative_no_replace
     artifact_names = []
@@ -1553,11 +1723,30 @@ def test_windows_delete_recovery_redetach_throwable_tracks_accepted_candidate(
     def record_rename(object_handle, parent_handle, target_name):
         if target_name != snapshot.destination_name:
             artifact_names.append(target_name)
-        return real_rename(
-            object_handle,
-            parent_handle,
-            target_name,
-        )
+        try:
+            result = real_rename(
+                object_handle,
+                parent_handle,
+                target_name,
+            )
+        except upgrade_config.WindowsDeleteFailure as error:
+            if (
+                verification_phase == "collision"
+                and error.category == "rename_collision"
+                and target_name.startswith(
+                    f".{target.name}.recovery-"
+                )
+            ):
+                injected["done"] = True
+                raise exception_type(injected_message)
+            raise
+        if (
+            verification_phase == "rename_return"
+            and target_name.startswith(f".{target.name}.recovery-")
+        ):
+            injected["done"] = True
+            raise exception_type(injected_message)
+        return result
 
     monkeypatch.setattr(
         ops,
@@ -1653,6 +1842,20 @@ def test_windows_delete_recovery_redetach_throwable_tracks_accepted_candidate(
     assert artifact_names[0].startswith(f".{target.name}.delete-")
     assert artifact_names[1].startswith(f".{target.name}.recovery-")
     assert not os.path.lexists(stale_path)
+    if verification_phase == "collision":
+        assert target.read_bytes() == b"recoverable"
+        assert (
+            target.stat().st_dev,
+            target.stat().st_ino,
+        ) == original_identity
+        assert Path(actual_path).read_bytes() == collision_contents
+        assert manager._ordinary_config_delete_retained_artifacts == set()
+        assert not any(
+            actual_path in message or stale_path in message
+            for message in logged_messages(manager, "error")
+        )
+        _assert_opened_handles_close_in_reverse_order(events)
+        return
     assert os.path.isfile(actual_path)
     assert Path(actual_path).read_bytes() == b"recoverable"
     assert (os.stat(actual_path).st_dev, os.stat(actual_path).st_ino) == (
