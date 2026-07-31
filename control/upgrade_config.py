@@ -1126,6 +1126,7 @@ class _WindowsDeleteCapability(NamedTuple):
 class _OrdinaryConfigDeleteRestoreResult(NamedTuple):
     restored: bool
     retained_path: object
+    previous_artifact_path_valid: bool = True
 
 
 class _OrdinaryConfigDeleteSnapshot(NamedTuple):
@@ -4154,9 +4155,14 @@ class ConfigManager(object):
             )
             rename_back_completed = True
             if not ops.name_is_absent(recovery_handle, artifact_name):
-                return _OrdinaryConfigDeleteRestoreResult(
-                    False,
-                    snapshot.destination_path,
+                return self._delete_redetach_after_restore_failure(
+                    ops,
+                    owner,
+                    snapshot,
+                    artifact_handle,
+                    source_handles,
+                    destination_handles,
+                    recovery_handles,
                 )
             restored = self._delete_verify_named_identity(
                 ops,
@@ -4165,18 +4171,136 @@ class ConfigManager(object):
                 snapshot.destination_name,
                 snapshot,
             )
-            return _OrdinaryConfigDeleteRestoreResult(
-                restored,
-                None if restored else snapshot.destination_path,
+            if restored:
+                return _OrdinaryConfigDeleteRestoreResult(
+                    True,
+                    None,
+                    False,
+                )
+            return self._delete_redetach_after_restore_failure(
+                ops,
+                owner,
+                snapshot,
+                artifact_handle,
+                source_handles,
+                destination_handles,
+                recovery_handles,
             )
         except WindowsDeleteFailure:
+            if rename_back_completed:
+                return self._delete_redetach_after_restore_failure(
+                    ops,
+                    owner,
+                    snapshot,
+                    artifact_handle,
+                    source_handles,
+                    destination_handles,
+                    recovery_handles,
+                )
+            return _OrdinaryConfigDeleteRestoreResult(False, None)
+
+    def _delete_redetach_after_restore_failure(
+        self,
+        ops,
+        owner,
+        snapshot,
+        artifact_handle,
+        source_handles,
+        destination_handles,
+        recovery_handles,
+    ):
+        destination_parent_handle = destination_handles[-1]
+        recovery_handle = recovery_handles[-1]
+        while True:
+            candidate = (
+                f".{snapshot.destination_name}.recovery-"
+                f"{uuid.uuid4().hex}"
+            )
+            try:
+                self._delete_validate_before_rename_attempt(
+                    ops,
+                    owner,
+                    snapshot,
+                    artifact_handle,
+                    source_handles,
+                    destination_handles,
+                    recovery_handles,
+                )
+                ops.rename_relative_no_replace(
+                    artifact_handle,
+                    recovery_handle,
+                    candidate,
+                )
+            except WindowsDeleteFailure as error:
+                if error.category == "rename_collision":
+                    continue
+                self._report_best_effort(
+                    "error",
+                    "delete_compatibility recovery re-detach failed: "
+                    f"{error.category}; retained location indeterminate",
+                )
+                return _OrdinaryConfigDeleteRestoreResult(
+                    False,
+                    None,
+                    False,
+                )
+
+            candidate_path = os.path.join(
+                snapshot.recovery_path,
+                candidate,
+            )
+            try:
+                destination_is_absent = ops.name_is_absent(
+                    destination_parent_handle,
+                    snapshot.destination_name,
+                )
+                recovery_name_matches = (
+                    self._delete_verify_named_identity(
+                        ops,
+                        owner,
+                        recovery_handle,
+                        candidate,
+                        snapshot,
+                    )
+                )
+                artifact_is_intact = self._delete_artifact_is_intact(
+                    ops,
+                    artifact_handle,
+                    snapshot,
+                )
+            except WindowsDeleteFailure as error:
+                self._report_best_effort(
+                    "error",
+                    "delete_compatibility recovery re-detach "
+                    f"verification failed: {error.category}; "
+                    "retained location indeterminate",
+                )
+                return _OrdinaryConfigDeleteRestoreResult(
+                    False,
+                    None,
+                    False,
+                )
+
+            if not (
+                destination_is_absent
+                and recovery_name_matches
+                and artifact_is_intact
+            ):
+                self._report_best_effort(
+                    "error",
+                    "delete_compatibility recovery re-detach "
+                    "verification failed: recovery_binding_indeterminate; "
+                    "retained location indeterminate",
+                )
+                return _OrdinaryConfigDeleteRestoreResult(
+                    False,
+                    None,
+                    False,
+                )
             return _OrdinaryConfigDeleteRestoreResult(
                 False,
-                (
-                    snapshot.destination_path
-                    if rename_back_completed
-                    else None
-                ),
+                candidate_path,
+                False,
             )
 
     def _delete_retain_location(self, retained_path):
@@ -4459,6 +4583,9 @@ class ConfigManager(object):
                 self._delete_retain_location(
                     restore_result.retained_path
                 )
+                detached = False
+                artifact_path = None
+            elif not restore_result.previous_artifact_path_valid:
                 detached = False
                 artifact_path = None
             elif detached and artifact_path is not None:

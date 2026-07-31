@@ -1238,22 +1238,28 @@ def test_windows_delete_transaction_post_rename_failure_restores_locally(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
-def test_windows_delete_transaction_reports_actual_location_when_restore_verification_fails(
+def test_windows_delete_restore_verification_failure_redetaches_before_global_rollback(
     configured_tree,
     monkeypatch,
 ):
-    manager = make_manager()
     target = configured_tree.roots["ui_config"] / "restore-location.bin"
     target.write_bytes(b"recoverable")
-    source = configured_tree.config_dir / target.name
-    ops = upgrade_config.WindowsHandleOps()
-    snapshot, error = manager._preflight_ordinary_config_delete(
-        str(target),
-        str(source),
-        handle_ops=ops,
+    original_identity = (target.stat().st_dev, target.stat().st_ino)
+    manager = configure_manifest_manager(
+        configured_tree,
+        [
+            (
+                "1.0",
+                {
+                    "config": [
+                        "ui/ui_config/restore-location.bin",
+                    ],
+                    "json_merge": [],
+                },
+            )
+        ],
     )
-    assert error is None
-
+    ops = upgrade_config.WindowsHandleOps()
     real_target_manifest = manager._delete_target_manifest
     manifest_failure_injected = {"done": False}
 
@@ -1262,7 +1268,7 @@ def test_windows_delete_transaction_reports_actual_location_when_restore_verific
             not manifest_failure_injected["done"]
             and ops.last_rename is not None
             and ops.last_rename["target_name"]
-            != snapshot.destination_name
+            != target.name
         ):
             manifest_failure_injected["done"] = True
             raise upgrade_config.WindowsDeleteFailure(
@@ -1282,7 +1288,7 @@ def test_windows_delete_transaction_reports_actual_location_when_restore_verific
         name = args[3]
         named_identity_calls.append(name)
         if (
-            name == snapshot.destination_name
+            name == target.name
             and named_identity_calls.count(name) == 2
         ):
             return False
@@ -1297,7 +1303,7 @@ def test_windows_delete_transaction_reports_actual_location_when_restore_verific
     target_artifact_names = []
 
     def record_rename(object_handle, parent_handle, target_name):
-        if target_name != snapshot.destination_name:
+        if target_name != target.name:
             target_artifact_names.append(target_name)
         return real_rename(object_handle, parent_handle, target_name)
 
@@ -1306,26 +1312,48 @@ def test_windows_delete_transaction_reports_actual_location_when_restore_verific
         "rename_relative_no_replace",
         record_rename,
     )
+    real_delete = manager._delete_ordinary_config_compatibility
 
-    assert manager._delete_ordinary_config_compatibility(
-        snapshot,
-        handle_ops=ops,
-    ) is False
+    def delete_with_injected_ops(snapshot):
+        return real_delete(snapshot, handle_ops=ops)
+
+    monkeypatch.setattr(
+        manager,
+        "_delete_ordinary_config_compatibility",
+        delete_with_injected_ops,
+    )
+
+    assert manager.update_config_file() is False
+
+    assert not target.exists()
+    assert manifest_failure_injected["done"] is True
+    assert target.name in named_identity_calls
+    assert len(target_artifact_names) == 2
+    retained_paths = manager._ordinary_config_delete_retained_artifacts
+    assert len(retained_paths) == 1
+    retained_path = Path(next(iter(retained_paths)))
+    assert retained_path.parent == configured_tree.backup_dir / "recovery"
+    assert retained_path.read_bytes() == b"recoverable"
+    assert (retained_path.stat().st_dev, retained_path.stat().st_ino) == (
+        original_identity
+    )
+    errors = logged_messages(manager, "error")
+    assert any(str(retained_path) in message for message in errors)
+    assert not any(
+        str(target) in message and "retained" in message
+        for message in errors
+    )
+
+    assert manager.restore_config() is True
 
     assert target.read_bytes() == b"recoverable"
-    assert manifest_failure_injected["done"] is True
-    assert snapshot.destination_name in named_identity_calls
-    assert len(target_artifact_names) == 1
-    stale_artifact_path = os.path.normpath(
-        os.path.join(snapshot.recovery_path, target_artifact_names[0])
+    assert (
+        configured_tree.roots["ui_config"] / "marker.txt"
+    ).read_text(encoding="utf-8") == "original ui_config"
+    assert retained_path.read_bytes() == b"recoverable"
+    assert (retained_path.stat().st_dev, retained_path.stat().st_ino) == (
+        original_identity
     )
-    actual_path = os.path.normpath(str(target))
-    assert not os.path.lexists(stale_artifact_path)
-    assert actual_path in manager._ordinary_config_delete_retained_artifacts
-    assert stale_artifact_path not in manager._ordinary_config_delete_retained_artifacts
-    errors = logged_messages(manager, "error")
-    assert any(actual_path in message for message in errors)
-    assert not any(stale_artifact_path in message for message in errors)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
