@@ -1,124 +1,114 @@
-# Missing Config Source Delete Compatibility Implementation Plan
+# Windows Missing Config Source Delete Compatibility Implementation Plan
 
 > **For agentic workers:** REQUIRED: Use the `subagent-driven-development` skill to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Restore the legacy-compatible behavior where a manifest `config` entry with a verified-missing package source safely deletes its managed destination and allows the upgrade to continue.
+**Goal:** On Windows, make a verified-missing ordinary-config source safely delete its managed destination and continue the upgrade; fail closed before mutation on non-Windows.
 
-**Architecture:** Extend ordinary-config preflight to classify verified lexical source absence as a deletion operation while preserving all other source failures. Implement deletion as a destination-bound atomic rename to a recovery artifact followed by verified cleanup, then integrate it into the existing backup/rollback transaction. Existing-source staged replacement remains unchanged.
+**Architecture:** Keep source classification, Windows native-handle helpers, preflight snapshots, and manifest orchestration in `control/upgrade_config.py`, as required by the approved design. Preflight records a stable source/destination snapshot before backup; the deletion helper later reacquires and compares the same objects, then binds source, destination, recovery directory, descendants, rename, cleanup, and recovery to verified Windows handles. Existing-source staged replacement remains unchanged.
 
-**Tech Stack:** Python 3, pytest, PyYAML, PyInstaller, Windows/POSIX filesystem primitives
+**Tech Stack:** Python 3, ctypes Windows Native/Win32 APIs, pytest, PyYAML, PyInstaller
 
 ---
 
 ## File Structure
 
 - Modify `control/upgrade_config.py`
-  - classify lexical source state;
-  - normalize ordinary-config replacement/delete operations;
-  - reject delete-related target conflicts;
-  - implement bound atomic deletion and recovery;
-  - integrate deletion into `update_config_file()`.
+  - verified lexical source classification;
+  - lazy Windows API loading and small native handle helpers;
+  - native handle ownership and reverse-order cleanup;
+  - absolute and parent-handle-relative non-following opens;
+  - handle identity, enumeration, reading, rename, disposition, and name-state
+    primitives;
+  - immutable pre-backup deletion snapshots;
+  - exact-object compatibility deletion transaction;
+  - operation preflight and delete-related conflict detection;
+  - Windows platform/API gating;
+  - backup/no-op rules;
+  - transaction invocation and user-facing logging.
 - Modify `tests/test_upgrade_config.py`
-  - add source-state, deletion, race, recovery, rollback, conflict, and logging
-    regression tests;
-  - replace the old expectation that every missing ordinary source is fatal.
-- Build `dist/main.exe`
-  - generated deliverable only; do not commit the binary unless explicitly
-    requested.
+  - source classification, Windows-native handle, exact rename, cleanup,
+    recovery, race, manifest integration, rollback, conflict, platform,
+    logging, and no-mutation tests;
+  - deterministic fake-adapter state-machine tests where an actual race cannot
+    be scheduled reliably.
+- Generate `dist/main.exe`
+  - deliverable only; do not commit generated binary/build/cache/spec files.
 
 ## Task 1: Classify Verified-Missing Ordinary Sources
 
 **Files:**
-- Modify: `control/upgrade_config.py:2040-2151`
-- Test: `tests/test_upgrade_config.py:1430-1478`
-- Test: `tests/test_upgrade_config.py:3225-3315`
+- Modify: `control/upgrade_config.py`
+- Test: `tests/test_upgrade_config.py`
+
+This task is unchanged from the first plan and may already be present on a
+resumed implementation branch. If its commit and passing review are present,
+verify rather than reimplement it.
 
 - [ ] **Step 1: Write failing source-state tests**
 
-Add focused tests proving:
+Cover:
 
 ```python
-def test_missing_ordinary_source_is_verified_lexical_absence(...):
+def test_missing_ordinary_source_returns_candidate_and_missing_path(...):
     source_path, error = manager._resolve_ordinary_config_source(destination)
-    assert source_path == expected_missing_source
+    assert source_path == expected_candidate
     assert error == "missing_path"
 
 
-def test_dangling_ordinary_source_is_not_delete_compatible(...):
+def test_dangling_or_indeterminate_source_is_not_missing(...):
     source_path, error = manager._resolve_ordinary_config_source(destination)
     assert source_path is None
-    assert error == "dangling_link"
-
-
-def test_indeterminate_ordinary_source_identity_is_not_missing(...):
-    ...
-    assert error == "identity_check_failed"
+    assert error in {"dangling_link", "identity_check_failed"}
 ```
 
-Cover directory and file source candidates, dangling symlinks, junction/reparse
-points where supported, and injected `lexists`/`lstat` failures.
+Add direct resolver and end-to-end preflight coverage for dangling/reparse,
+permission/identity failures, unsupported types, invalid paths, and source
+escapes. Also cover a missing `resources` or `resources/config` parent and
+assert it returns a fatal `missing_parent` category rather than `missing_path`.
+Every non-`missing_path` result must fail before backup and preserve the target.
 
-Also add end-to-end `update_config_file()` tests for dangling/reparse,
-permission/indeterminate, unsupported-type, invalid-path, and symlink-escape
-source results. For every non-`missing_path` category, assert:
-
-```python
-assert manager.update_config_file() is False
-assert backup_calls == []
-assert snapshot_tree(target) == original_target_tree
-assert not any("按兼容模式删除" in message for message in logged_messages(manager))
-```
-
-- [ ] **Step 2: Run the focused tests and verify they fail**
-
-Run:
+- [ ] **Step 2: Run focused tests and verify RED**
 
 ```powershell
 $env:PYTHONPATH='.'
-python -m pytest -q --basetemp tests/.tmp/source-state `
-  tests/test_upgrade_config.py -k 'ordinary_source and (missing or dangling or indeterminate)'
-```
-
-Expected: new tests fail because missing sources currently return no candidate
-path and dangling/indeterminate source states are not fully distinguished.
-
-- [ ] **Step 3: Implement lexical source-state classification**
-
-Add a helper alongside `_destination_entry_state`:
-
-```python
-def _ordinary_config_source_entry_state(self, path):
-    # Return (False, None) only when lexists is false and lstat confirms
-    # FileNotFoundError. Return dangling_link for an existing lexical entry
-    # whose followed target is absent. Return identity_check_failed for
-    # indeterminate I/O/identity results.
-```
-
-Update `_resolve_ordinary_config_source()` so verified absence returns the
-expected in-root lexical candidate plus `missing_path`:
-
-```python
-if source_exists is False:
-    return lexical_path, "missing_path"
-if state_error is not None:
-    return None, state_error
-```
-
-Preserve lexical containment and resolved-path containment checks before
-classifying the source as delete-compatible. Existing supported sources still
-return `(lexical_path, None)`.
-
-- [ ] **Step 4: Run focused and existing source-security tests**
-
-Run:
-
-```powershell
-$env:PYTHONPATH='.'
-python -m pytest -q --basetemp tests/.tmp/source-state-pass `
+python -m pytest -q --basetemp .pytest-tmp-task1-red `
   tests/test_upgrade_config.py -k 'ordinary_source'
 ```
 
-Expected: all selected tests pass.
+Expected: new missing-source classification tests fail.
+
+- [ ] **Step 3: Implement twice-confirmed lexical absence**
+
+First verify every source-directory ancestor from the trusted updater root
+through `resources/config`; a missing, replaced, reparse, or indeterminate
+parent is fatal. Only after the expected parent directory is verified may the
+final source basename be classified.
+
+Add `_ordinary_config_source_entry_state()` so only:
+
+```python
+os.path.lexists(path) is False
+# plus
+os.lstat(path) raises FileNotFoundError
+```
+
+produces verified absence for the final basename beneath that verified parent.
+A `FileNotFoundError` caused by a missing parent must be reported as
+`missing_parent`, never `missing_path`. Dangling links, reparse points,
+inconsistent observations, permissions, and unexpected I/O fail closed.
+
+Return `(lexical_candidate, "missing_path")` only for verified absence.
+
+- [ ] **Step 4: Run focused and full tests**
+
+```powershell
+$env:PYTHONPATH='.'
+python -m pytest -q --basetemp .pytest-tmp-task1-green `
+  tests/test_upgrade_config.py -k 'ordinary_source'
+python -m pytest -q --basetemp .pytest-tmp-task1-full
+```
+
+Expected: focused and complete suites pass.
 
 - [ ] **Step 5: Commit Task 1**
 
@@ -127,335 +117,476 @@ git add control/upgrade_config.py tests/test_upgrade_config.py
 git commit -m "fix: classify missing ordinary config sources safely"
 ```
 
-## Task 2: Implement Destination-Bound Atomic Compatibility Deletion
+## Task 2: Build Windows Exact-Handle Primitives
 
 **Files:**
-- Modify: `control/upgrade_config.py:1284-1482`
-- Modify: `control/upgrade_config.py:1920-2011`
-- Test: `tests/test_upgrade_config.py` near existing ordinary-config replacement race tests
+- Modify: `control/upgrade_config.py`
+- Test: `tests/test_upgrade_config.py`
 
-- [ ] **Step 1: Write failing atomic-deletion tests**
+- [ ] **Step 1: Write failing adapter availability and handle-owner tests**
 
-Add direct helper tests for:
+Test that:
 
-- existing managed directory detaches and is fully removed;
-- existing managed file detaches and is fully removed;
-- an absent destination is a successful no-op;
-- source appearance immediately before mutation fails closed;
-- existing-target identity/content/type changes are rejected;
-- absent-to-present destination creation is rejected;
-- ancestor symlink/junction substitution cannot mutate an external target;
-- atomic detach failure preserves the destination;
-- post-detach verification failure restores only a verified artifact;
-- artifact substitution prevents local restoration and retains the artifact;
-- cleanup failure locally restores a still-intact artifact;
-- partial cleanup preserves the remaining artifact and returns failure;
-- absent-destination no-op logs a no-op message and never logs deletion
-  failure;
-- retained recovery artifacts log their exact path;
-- every deletion failure logs failure and does not log deletion success;
-- every acquired ancestor handle is released on success, failure, and
-  `BaseException`.
+- importing the module is safe on every platform;
+- `is_supported()` rejects non-Windows and missing APIs/filesystem support;
+- every acquired handle is closed exactly once in reverse order;
+- `BaseException` paths still close all handles;
+- native failures expose non-sensitive categories, not raw paths or file
+  contents.
 
-Use existing helpers such as `snapshot_tree`, `swap_artifacts`,
-`_ordinary_config_destination_binding`, `_atomic_move_no_replace`, and the
-replacement-race test patterns around
-`test_ordinary_config_concurrent_destination_change_is_preserved`.
+- [ ] **Step 2: Write failing Windows-native primitive tests**
 
-- [ ] **Step 2: Run atomic-deletion tests and verify they fail**
+On Windows 10 1709+ use real temporary directories to verify:
 
-Run:
+- destination/source/recovery directories open with
+  `FILE_SHARE_READ | FILE_SHARE_WRITE` and omit `FILE_SHARE_DELETE`;
+- destination/source/recovery ancestor handles request
+  `FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY`;
+- handles use `FILE_FLAG_BACKUP_SEMANTICS |
+  FILE_FLAG_OPEN_REPARSE_POINT`;
+- target-root and descendant handles request only the required combination of
+  `DELETE`, attribute, enumeration, and file-read rights, also omit
+  `FILE_SHARE_DELETE`, and always include `FILE_FLAG_OPEN_REPARSE_POINT`;
+- `FileIdInfo` returns volume serial plus 128-bit file ID;
+- an open ancestor handle prevents rename/rebinding;
+- `NtCreateFile` opens a child relative to a verified parent and does not follow
+  a reparse point;
+- final source absence distinguishes exact name-not-found statuses from access,
+  parent, reparse, and unexpected failures;
+- exact-handle rename resolves an artifact basename relative to the bound
+  recovery-directory handle through `FILE_RENAME_INFO.RootDirectory`;
+- replacement is disabled and collisions do not overwrite;
+- `FileDispositionInfoEx` receives the delete, POSIX-semantics, and
+  ignore-readonly flags;
+- every disposed leaf handle is closed before cleanup proceeds to its parent;
+- `FileDispositionInfoEx` deletes the exact opened object and unsupported
+  API/filesystem responses fail without path fallback.
 
-```powershell
-$env:PYTHONPATH='.'
-python -m pytest -q --basetemp tests/.tmp/delete-helper `
-  tests/test_upgrade_config.py -k 'ordinary_config_compatibility_delete'
-```
+Use `pytest.mark.skipif(os.name != "nt", ...)` only for genuinely native tests.
+Add deterministic structure/layout tests for ctypes definitions on non-Windows
+so accidental ABI changes are still detected.
 
-Expected: fail because the deletion helper does not exist.
-
-- [ ] **Step 3: Implement artifact verification and recovery helpers**
-
-Add focused helpers that reuse the existing ordinary-config binding model:
-
-```python
-def _ordinary_config_artifact_matches(
-    self,
-    artifact_path,
-    expected_manifest,
-):
-    ...
-
-
-def _recover_deleted_ordinary_config(
-    self,
-    artifact_path,
-    destination_path,
-    initial_binding,
-    expected_manifest,
-):
-    # Reacquire safe ancestor handles, require destination absence,
-    # revalidate the artifact, then atomically move with no replacement.
-    ...
-```
-
-Never restore an artifact whose identity/stable manifest cannot be proven to be
-the detached destination.
-
-- [ ] **Step 4: Implement `_delete_missing_source_ordinary_config`**
-
-The helper accepts the source candidate, destination, and preflight binding:
-
-```python
-def _delete_missing_source_ordinary_config(
-    self,
-    source_path,
-    destination_path,
-    initial_binding,
-):
-    ...
-```
-
-Required order:
-
-1. Revalidate the destination through
-   `_ordinary_config_destination_is_current`.
-2. Prove the expected source remains lexically absent.
-3. Acquire and retain ancestor-chain handles.
-4. Require `_ordinary_config_binding_matches(...)`.
-5. Return success immediately for a verified absent destination.
-6. Reserve a sibling `.<name>.delete-*` artifact path.
-7. Recheck source absence and bindings.
-8. Atomically move destination to the artifact with no replacement.
-9. Verify destination absence and artifact stable manifest.
-10. Clean the artifact with `_cleanup_snapshot_artifact` so ordinary-config
-    deletion follows the existing snapshot-artifact cleanup rules.
-11. On failure, perform only fully revalidated no-clobber local recovery;
-    otherwise retain/log the artifact and return `False`.
-12. Release handles in `finally`.
-
-Do not call `smart_remove(destination_path)` directly.
-
-- [ ] **Step 5: Run deletion-helper and existing replacement-race tests**
-
-Run:
+- [ ] **Step 3: Run Task 2 tests and verify RED**
 
 ```powershell
 $env:PYTHONPATH='.'
-python -m pytest -q --basetemp tests/.tmp/delete-helper-pass `
-  tests/test_upgrade_config.py -k 'ordinary_config_compatibility_delete or ordinary_config_concurrent or ordinary_config_recovery'
+python -m pytest -q --basetemp .pytest-tmp-winhandles-red `
+  tests/test_upgrade_config.py -k 'windows_handle'
 ```
 
-Expected: all selected tests pass.
+Expected: failures because the Windows adapter does not exist.
 
-- [ ] **Step 6: Commit Task 2**
+- [ ] **Step 4: Implement lazy native bindings**
+
+Implement small wrappers for:
+
+```python
+class WindowsDeleteUnsupported(Exception): ...
+class WindowsDeleteFailure(Exception):
+    category: str
+
+class WindowsHandleOwner:
+    def acquire(self, handle): ...
+    def release(self, handle): ...
+    def close_all(self): ...
+
+class WindowsHandleOps:
+    def is_supported(self): ...
+    def open_absolute(self, path, *, directory, delete=False): ...
+    def open_relative(self, parent_handle, name, *, directory, delete=False): ...
+    def identity(self, handle): ...
+    def enumerate(self, directory_handle): ...
+    def read_digest(self, file_handle): ...
+    def name_is_absent(self, parent_handle, name): ...
+    def rename_relative_no_replace(
+        self, object_handle, target_parent_handle, target_name
+    ): ...
+    def set_delete_disposition(self, handle): ...
+    def close(self, handle): ...
+```
+
+Keep these helpers private to `control/upgrade_config.py`. Load
+`kernel32`/`ntdll` only inside guarded Windows initialization. Define ctypes
+argument/restype layouts explicitly and call `ctypes.get_last_error()`
+immediately after failures.
+
+Define the `FileDispositionInfoEx` flag constants explicitly. The disposition
+wrapper must always combine delete, POSIX-semantics, and ignore-readonly for
+compatibility cleanup. Cleanup callers must close each successfully disposed
+descendant handle before processing its parent; no pathname-only fallback is
+allowed.
+
+- [ ] **Step 5: Implement identity-bound manifest primitives**
+
+Build handle-derived manifest entries containing:
+
+```python
+(
+    volume_serial,
+    file_id_128,
+    file_attributes,
+    reparse_tag,
+    size,
+    last_write_time,
+    digest_or_none,
+)
+```
+
+Enumerate/open children relative to their parent handle, compare the opened
+identity to the enumerated/captured identity, hash regular files from handles,
+and never traverse reparse entries.
+
+- [ ] **Step 6: Run native and full regression tests**
+
+```powershell
+$env:PYTHONPATH='.'
+python -m pytest -q --basetemp .pytest-tmp-winhandles-green `
+  tests/test_upgrade_config.py -k 'windows_handle'
+python -m pytest -q --basetemp .pytest-tmp-task2-full
+python -m compileall -q control tests
+git diff --check
+```
+
+Expected on the target Windows host: every Windows-native test executes and
+passes; the complete suite passes.
+
+- [ ] **Step 7: Commit Task 2**
 
 ```powershell
 git add control/upgrade_config.py tests/test_upgrade_config.py
-git commit -m "feat: add atomic ordinary config compatibility deletion"
+git commit -m "feat: add Windows exact-handle deletion primitives"
 ```
 
-## Task 3: Integrate Missing-Source Deletion into Manifest Execution
+## Task 3: Implement the Windows Compatibility Deletion Transaction
 
 **Files:**
-- Modify: `control/upgrade_config.py:2438-2646`
-- Test: `tests/test_upgrade_config.py:1392-1545`
-- Test: `tests/test_upgrade_config.py` near rollback and alias-preflight tests
+- Modify: `control/upgrade_config.py`
+- Test: `tests/test_upgrade_config.py`
 
-- [ ] **Step 1: Replace the old missing-source failure test**
+- [ ] **Step 1: Write failing pre-backup snapshot tests**
 
-Change `test_missing_ordinary_source_fails_before_backup_or_target_mutation`
-into end-to-end compatibility tests proving:
+Cover immutable preflight capture of:
+
+- the trusted updater/source directory chain through `resources/config`;
+- whether the destination and containing managed root exist;
+- every existing destination ancestor identity from managed root to parent;
+- destination identity/type and handle-derived stable content manifest;
+- destination-root reparse rejection;
+- recovery directory trust, volume identity, and native capability.
+
+Assert missing source parents, destination identity/content failures, and
+unsupported platform/API/filesystem states fail before backup or mutation.
+
+- [ ] **Step 2: Write failing transaction success/no-op tests**
+
+Cover:
+
+- existing file target;
+- existing directory tree target;
+- target already absent;
+- source appears at final bound check;
+- destination root is a reparse point;
+- recovery directory is outside the trusted updater root;
+- destination and recovery directory are on different volumes;
+- required API/filesystem support is missing.
+
+Assert exact success, no-op, or fail-closed categories and handle close order.
+
+- [ ] **Step 3: Write failing exact-object race tests**
+
+Use native sharing semantics plus deterministic adapter boundaries to prove:
+
+- swapping the target immediately before rename cannot redirect rename because
+  the exact already-open handle is renamed;
+- rebinding any destination ancestor fails while its no-delete-share handle is
+  held;
+- substituting `CONFIG_DIR` or a source ancestor cannot turn an existing source
+  into an absent source;
+- substituting `CONFIG_DIR`, a source ancestor, a destination ancestor, the
+  target identity/type, or target content between preflight and mutation is
+  rejected by comparison with the pre-backup snapshot;
+- artifact-name collision cannot overwrite an entry and retries with a new
+  collision-resistant basename; only a non-collision native error terminates
+  the allocation loop;
+- artifact name resolves relative to the held recovery-directory handle;
+- descendant substitution between enumeration and relative open is rejected;
+- substituting an artifact pathname cannot redirect exact-handle cleanup;
+- unexpected child creation causes re-enumeration/disposition failure, never a
+  false success.
+
+- [ ] **Step 4: Write failing recovery and partial-cleanup tests**
+
+Cover:
+
+- failure before rename leaves the target untouched;
+- post-rename manifest mismatch performs exact-handle no-clobber local restore;
+- intact cleanup failure restores locally;
+- partial cleanup retains the artifact under `BACKUP_DIR/recovery`;
+- failed local restoration retains and reports the exact recovery path;
+- recovery-artifact pathname substitution cannot satisfy local-restore checks;
+- local restoration is attempted only while the captured exact artifact handle
+  still matches its identity, the original destination is still absent, all
+  verified ancestor handles remain held, and the no-clobber rename is relative
+  to the bound destination-parent handle;
+- global managed-root restore does not remove the external recovery artifact;
+- if global rollback also fails, every remaining managed-root backup and
+  recovery artifact is retained and each path is logged for manual recovery;
+- root disposition/close/name-absence verification gates success logging;
+- no failure path emits a delete-success message.
+
+- [ ] **Step 5: Run transaction tests and verify RED**
+
+```powershell
+$env:PYTHONPATH='.'
+python -m pytest -q --basetemp .pytest-tmp-wintransaction-red `
+  tests/test_upgrade_config.py -k 'delete_snapshot or transaction or race or recovery'
+```
+
+Expected: fail because the transaction does not exist.
+
+- [ ] **Step 6: Implement preflight snapshot and deletion helper**
+
+Add an immutable `_OrdinaryConfigDeleteSnapshot` and a preflight helper that
+runs before backup. The snapshot records the exact source chain, destination
+ancestor chain, destination existence/identity/type/stable manifest, managed
+root state, recovery directory identity/volume, and capability result.
+
+The deletion helper accepts the snapshot and must:
+
+1. Reacquire and compare source, destination, and recovery ancestor chains to
+   the pre-backup snapshot.
+2. Reject missing-to-present, existing-to-absent, identity, type, and stable
+   content changes before mutation.
+3. Recheck final source absence relative to the held and snapshot-matched
+   `CONFIG_DIR` handle.
+4. Keep the snapshot-matched exact target handle open.
+5. Rename that exact target handle to a collision-resistant name relative to the
+   held recovery-directory handle without replacement.
+6. Verify destination-name absence and artifact identity/manifest while keeping
+   the same exact-object handle.
+7. Recursively enumerate/open/validate/delete descendants leaf-first by handle.
+8. Re-enumerate, arm `FileDispositionInfoEx` on the artifact root, close it,
+   and verify both bound names absent before success.
+9. Restore locally only while the same exact artifact handle matches the
+   captured identity, the destination name remains absent, and verified
+   ancestor handles remain held; perform a no-clobber handle-relative rename
+   back to the bound destination parent. Otherwise retain/report the recovery
+   artifact and return failure for global rollback.
+10. Close all handles in reverse acquisition order on every path.
+
+- [ ] **Step 7: Run focused, native race, and full suites**
+
+```powershell
+$env:PYTHONPATH='.'
+python -m pytest -q --basetemp .pytest-tmp-wintransaction-green `
+  tests/test_upgrade_config.py -k 'delete_snapshot or transaction or race or recovery'
+python -m pytest -q --basetemp .pytest-tmp-task3-full
+python -m compileall -q control tests
+git diff --check
+```
+
+Expected: all Windows-native transaction/race tests and the complete suite pass.
+
+- [ ] **Step 8: Commit Task 3**
+
+```powershell
+git add control/upgrade_config.py tests/test_upgrade_config.py
+git commit -m "feat: add Windows compatibility deletion transaction"
+```
+
+## Task 4: Integrate Deletion into Version Manifest Execution
+
+**Files:**
+- Modify: `control/upgrade_config.py`
+- Modify: `tests/test_upgrade_config.py`
+
+- [ ] **Step 1: Replace the old missing-source failure integration test**
+
+On Windows assert:
 
 ```python
 assert manager.update_config_file() is True
 assert not target.exists()
 assert backup_contains_original_target()
-assert "按兼容模式删除" in "\n".join(logged_messages(manager))
-assert "source_path:missing_path" not in "\n".join(
-    logged_messages(manager, "error")
-)
+assert compatibility_delete_log_present()
+assert missing_path_error_absent()
 ```
 
-Add cases for:
+Cover managed-root directory deletion (`ui/ui_pic`), file deletion,
+already-absent child, already-absent managed root, and absent descendant of an
+absent managed root.
 
-- `ui/ui_pic` managed-root directory deletion;
-- managed file deletion;
-- already-absent child no-op with normal root backup;
-- already-absent managed-root no-op without changing the root backup flag;
-- existing source still uses staged replacement;
-- backup failure prevents deletion;
-- deletion helper failure stops before JSON merges;
-- calling `restore_config()` after a later simulated failure restores the exact
-  deleted target tree;
-- recovery-artifact substitution causes the deletion helper to reject local
-  restoration, after which the top-level failure path invokes
-  `restore_config()` and restores the exact managed-root backup while retaining
-  and logging the substituted artifact;
-- successful flow leaves the backup available for normal top-level cleanup.
+- [ ] **Step 2: Write failing platform/API/reparse integration tests**
 
-For success, no-op, and failure cases, assert the required log separation:
+Assert before backup/mutation:
 
-```python
-assert successful_delete_has_explicit_compatibility_message()
-assert absent_noop_has_explicit_noop_message()
-assert failure_has_explicit_failure_message()
-assert failure_does_not_have_success_message()
-assert retained_artifact_log_contains_exact_path()
-```
+- non-Windows returns `delete_compatibility:unsupported_platform`;
+- missing Windows APIs/filesystem capability returns a safe category;
+- destination-root symlink/junction/reparse returns
+  `delete_compatibility:unsupported_destination_reparse`;
+- a missing source parent returns `source_path:missing_parent`, not a delete
+  operation;
+- all non-`missing_path` source errors retain their current fatal behavior.
 
-- [ ] **Step 2: Add failing delete-related conflict tests**
+- [ ] **Step 3: Write failing conflict-preflight tests**
 
-Within one manifest, require preflight failure before backup when a
-compatibility deletion conflicts with:
+When a delete is present in a containing version manifest, reject before backup:
 
-- the same target through a normalized alias;
-- a replacement descendant;
-- a replacement ancestor.
+- normalized duplicate ordinary-config targets;
+- delete/delete ancestor or descendant targets;
+- delete/replacement ancestor or descendant targets;
+- replacement/replacement ancestor or descendant targets whenever the same
+  operation set contains at least one delete;
+- identity-equivalent aliases for each of the preceding ordinary-config
+  conflicts after normalization and identity resolution;
+- delete equal to a JSON merge target;
+- delete above a JSON merge target;
+- delete below a JSON merge target.
 
-Also retain a replacement-only duplicate/ordering test to prove existing
-replacement semantics are unchanged.
+Keep a replacement-only ordering regression proving existing behavior is
+unchanged.
 
-- [ ] **Step 3: Run integration tests and verify they fail**
+- [ ] **Step 4: Write failing backup/rollback/logging tests**
 
-Run:
+Cover:
+
+- managed root exists: backup succeeds before transaction;
+- target and managed root absent: no backup and backup flag unchanged;
+- backup failure prevents transaction call;
+- destination ancestor, target identity/type/content, or source-chain changes
+  after preflight and before mutation fail against the snapshot without detach;
+- transaction failure prevents JSON merges and later stages;
+- later-stage failure invokes existing managed-root restore;
+- retained `BACKUP_DIR/recovery` artifact survives global managed-root restore;
+- success/no-op/failure/retained-artifact logs are distinct;
+- failure never emits configuration delete success.
+
+- [ ] **Step 5: Run integration tests and verify RED**
 
 ```powershell
 $env:PYTHONPATH='.'
-python -m pytest -q --basetemp tests/.tmp/delete-integration `
+python -m pytest -q --basetemp .pytest-tmp-integration-red `
   tests/test_upgrade_config.py -k 'missing_ordinary_source or compatibility_delete or delete_conflict'
 ```
 
-Expected: fail because `update_config_file()` still reports `missing_path`.
+Expected: fail because `update_config_file()` still reports missing source.
 
-- [ ] **Step 4: Normalize ordinary-config operations during preflight**
+- [ ] **Step 6: Normalize and preflight operations**
 
-Represent every validated entry as a small immutable tuple/dict containing:
+Represent validated actions as:
 
 ```python
 {
+    "kind": "replace" or "delete",
     "relative_path": config_file_path,
     "destination_path": target_file_path,
     "source_path": source_candidate,
-    "kind": "replace" or "delete",
-    "destination_binding": initial_binding,
 }
 ```
 
-Only `source_error == "missing_path"` produces `kind == "delete"`. All other
-source errors keep the existing fatal reporting.
+Only `source_error == "missing_path"` selects delete. Before backup:
 
-When any operation in the version is a delete, reject normalized/samefile and
-ancestor/descendant conflicts involving that delete before backup.
+- apply platform/API capability gating;
+- invoke the native preflight helper and retain its immutable snapshot on the
+  normalized delete operation;
+- reject target-root reparse entries;
+- reject delete-related ordinary and JSON merge equal/ancestor/descendant
+  conflicts;
+- preserve replacement-only sequencing.
 
-- [ ] **Step 5: Execute deletion after backup**
+- [ ] **Step 7: Invoke transaction after backup**
 
-After successful `backup_config_file()`:
+- Skip backup only when both target and containing managed root are recorded
+  absent in the preflight snapshot.
+- Otherwise use existing `backup_config_file`.
+- Pass the pre-backup snapshot to the dedicated deletion helper.
+- Reacquire and compare all snapshot identities/manifests, then revalidate
+  source through the bound `CONFIG_DIR` handle immediately before mutation.
+- Keep staged ordinary replacement unchanged.
+- Fail immediately on transaction failure so top-level rollback runs.
+- Apply JSON merges only after all ordinary actions succeed.
 
-- log that the missing source selected compatibility deletion;
-- call `_delete_missing_source_ordinary_config` for delete operations;
-- keep `_replace_with_staged_ordinary_config` for replacement operations;
-- fail immediately on deletion/replacement failure;
-- preserve existing ordering before JSON merge actions.
-
-For a verified-absent managed-root delete no-op, bypass the impossible snapshot
-of that absent root and leave its backup flag unchanged. Do not generalize this
-exception to replacement operations.
-
-- [ ] **Step 6: Run focused integration and rollback tests**
-
-Run:
+- [ ] **Step 8: Run focused and complete tests**
 
 ```powershell
 $env:PYTHONPATH='.'
-python -m pytest -q --basetemp tests/.tmp/delete-integration-pass `
+python -m pytest -q --basetemp .pytest-tmp-integration-green `
   tests/test_upgrade_config.py -k 'ordinary_config or config_update or restore'
+python -m pytest -q --basetemp .pytest-tmp-task4-full
+python -m compileall -q base consts control load_yml log_model main.py tests
+git diff --check
 ```
 
-Expected: all selected tests pass.
+Expected: focused and complete suites pass.
 
-- [ ] **Step 7: Commit Task 3**
+- [ ] **Step 9: Commit Task 4**
 
 ```powershell
 git add control/upgrade_config.py tests/test_upgrade_config.py
-git commit -m "feat: restore missing-source config deletion compatibility"
+git commit -m "feat: restore Windows missing-source config deletion"
 ```
 
-## Task 4: Full Verification and Executable Packaging
+## Task 5: Full Verification and Windows Executable Packaging
 
 **Files:**
 - Verify: `control/upgrade_config.py`
 - Verify: `tests/test_upgrade_config.py`
-- Verify: complete test suite
 - Generate: `dist/main.exe`
 
-- [ ] **Step 1: Run syntax compilation**
-
-Run:
+- [ ] **Step 1: Run complete source verification**
 
 ```powershell
-python -m compileall -q base consts control load_yml log_model main.py
-```
-
-Expected: exit code `0`.
-
-- [ ] **Step 2: Run the complete test suite**
-
-Run:
-
-```powershell
+python -m compileall -q base consts control load_yml log_model main.py tests
 $env:PYTHONPATH='.'
-python -m pytest -q --basetemp tests/.tmp/full-delete-compatibility
+python -m pytest -q --basetemp .pytest-tmp-final
+git diff --check
 ```
 
-Expected: all tests pass, with only environment-dependent symlink/junction
-tests skipped when unsupported.
+Expected: compile and all tests pass; Windows-native deletion/race tests execute
+without platform skips on the packaging host.
 
-- [ ] **Step 3: Verify working-tree scope**
-
-Run:
+- [ ] **Step 2: Audit implementation scope**
 
 ```powershell
 git status --short
-git diff --check
-git diff 00f2e78..HEAD --stat
+$implementationBase = git merge-base main HEAD
+git diff "$implementationBase..HEAD" --stat
+git log --oneline "$implementationBase..HEAD"
 ```
 
-Expected: implementation commits modify only
-`control/upgrade_config.py` and `tests/test_upgrade_config.py`; no unrelated
-user changes are included.
+Expected tracked implementation scope:
 
-- [ ] **Step 4: Build a clean one-file executable**
+- `control/upgrade_config.py`
+- `tests/test_upgrade_config.py`
 
-Run from the implementation worktree:
+No generated files or unrelated user changes are committed.
+
+- [ ] **Step 3: Build a clean one-file Windows executable**
 
 ```powershell
 pyinstaller --noconfirm --clean --onefile --console --name main main.py
 ```
 
-Expected: `dist/main.exe` exists and PyInstaller exits `0`.
+Expected: `dist/main.exe` exists and the build exits `0`.
 
-- [ ] **Step 5: Verify the generated executable identity**
-
-Run:
+- [ ] **Step 4: Record executable identity**
 
 ```powershell
 Get-Item dist/main.exe | Select-Object FullName,Length,LastWriteTime
 Get-FileHash -Algorithm SHA256 dist/main.exe
 ```
 
-Record the absolute path, size, build timestamp, and SHA-256 in the handoff.
-Do not run the executable against the user's production installation during
-automated verification.
+Record path, size, timestamp, and SHA-256 in the final handoff. Do not run the
+new executable against the production installation during automated testing.
 
-- [ ] **Step 6: Commit any final source/test-only corrections**
+- [ ] **Step 5: Commit final source/test corrections only**
 
-If verification required source or test corrections, commit only those files:
+If verification required corrections:
 
 ```powershell
 git add control/upgrade_config.py tests/test_upgrade_config.py
-git commit -m "test: verify missing-source deletion compatibility"
+git commit -m "test: verify Windows config deletion compatibility"
 ```
 
-Do not commit `build/`, `dist/`, generated `.spec`, cache, backup, or temporary
+Do not commit `build/`, `dist/`, generated `.spec`, caches, backups, or temporary
 test directories.
