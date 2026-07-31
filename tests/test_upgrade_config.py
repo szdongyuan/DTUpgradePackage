@@ -3116,9 +3116,25 @@ def test_delete_conflict_between_related_ordinary_targets_precedes_backup(
                 source.mkdir(exist_ok=True)
     backup_calls = []
     transaction_calls = []
+    preflight_calls = []
+    original_roots = {
+        name: snapshot_tree(root)
+        for name, root in configured_tree.roots.items()
+    }
     manager = configure_manifest_manager(
         configured_tree,
         [("1.0", {"config": config_entries, "json_merge": []})],
+    )
+    real_preflight = manager._preflight_ordinary_config_delete
+
+    def track_preflight(*args, **kwargs):
+        preflight_calls.append((args, kwargs))
+        return real_preflight(*args, **kwargs)
+
+    monkeypatch.setattr(
+        manager,
+        "_preflight_ordinary_config_delete",
+        track_preflight,
     )
     monkeypatch.setattr(
         manager,
@@ -3135,6 +3151,12 @@ def test_delete_conflict_between_related_ordinary_targets_precedes_backup(
 
     assert backup_calls == []
     assert transaction_calls == []
+    assert preflight_calls == []
+    assert not (configured_tree.backup_dir / "recovery").exists()
+    assert {
+        name: snapshot_tree(root)
+        for name, root in configured_tree.roots.items()
+    } == original_roots
     assert any(
         "delete_compatibility:target_conflict" in message
         for message in logged_messages(manager, "error")
@@ -3161,6 +3183,9 @@ def test_delete_conflict_with_equal_ancestor_or_descendant_json_merge_precedes_b
     patch = configured_tree.config_dir / "patch.json"
     patch.write_text("{}", encoding="utf-8")
     backup_calls = []
+    transaction_calls = []
+    preflight_calls = []
+    original_target = snapshot_tree(delete_target)
     manager = configure_manifest_manager(
         configured_tree,
         [
@@ -3178,15 +3203,35 @@ def test_delete_conflict_with_equal_ancestor_or_descendant_json_merge_precedes_b
             )
         ],
     )
+    real_preflight = manager._preflight_ordinary_config_delete
+
+    def track_preflight(*args, **kwargs):
+        preflight_calls.append((args, kwargs))
+        return real_preflight(*args, **kwargs)
+
+    monkeypatch.setattr(
+        manager,
+        "_preflight_ordinary_config_delete",
+        track_preflight,
+    )
     monkeypatch.setattr(
         manager,
         "backup_config_file",
         lambda paths: backup_calls.append(tuple(paths)) or True,
     )
+    monkeypatch.setattr(
+        manager,
+        "_delete_ordinary_config_compatibility",
+        lambda snapshot: transaction_calls.append(snapshot) or True,
+    )
 
     assert manager.update_config_file() is False
 
     assert backup_calls == []
+    assert transaction_calls == []
+    assert preflight_calls == []
+    assert not (configured_tree.backup_dir / "recovery").exists()
+    assert snapshot_tree(delete_target) == original_target
     assert any(
         "delete_compatibility:json_merge_conflict" in message
         for message in logged_messages(manager, "error")

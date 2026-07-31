@@ -4987,26 +4987,32 @@ class ConfigManager(object):
                                 )
                             )
                             (
-                                delete_source_path,
+                                _delete_source_path,
                                 delete_source_error,
                             ) = self._resolve_ordinary_config_source(
                                 lexical_target
                             )
                             if delete_source_error == "missing_path":
-                                _, delete_error = (
-                                    self._preflight_ordinary_config_delete(
-                                        lexical_target,
-                                        delete_source_path,
+                                try:
+                                    lexical_target_stat = os.lstat(
+                                        lexical_target
                                     )
-                                )
+                                except (
+                                    OSError,
+                                    TypeError,
+                                    ValueError,
+                                ):
+                                    lexical_target_stat = None
                                 if (
-                                    delete_error
-                                    == "unsupported_destination_reparse"
+                                    lexical_target_stat is not None
+                                    and self._snapshot_entry_is_link_or_reparse(
+                                        lexical_target_stat
+                                    )
                                 ):
                                     self._report_best_effort(
                                         "error",
                                         "delete_compatibility:"
-                                        f"{delete_error}",
+                                        "unsupported_destination_reparse",
                                     )
                                     return False
                         self._report_ordinary_config_destination_error(
@@ -5019,26 +5025,12 @@ class ConfigManager(object):
                         )
                     )
                     if source_error == "missing_path":
-                        snapshot, delete_error = (
-                            self._preflight_ordinary_config_delete(
-                                target_file_path,
-                                new_config_file_path,
-                            )
-                        )
-                        if delete_error is not None:
-                            self._report_best_effort(
-                                "error",
-                                "delete_compatibility:"
-                                f"{delete_error}",
-                            )
-                            return False
                         config_operations.append(
                             {
                                 "kind": "delete",
                                 "relative_path": config_file_path,
                                 "destination_path": target_file_path,
                                 "source_path": new_config_file_path,
-                                "snapshot": snapshot,
                             }
                         )
                         continue
@@ -5065,6 +5057,24 @@ class ConfigManager(object):
                     config_operations,
                 ):
                     return False
+
+                for operation in config_operations:
+                    if operation["kind"] != "delete":
+                        continue
+                    snapshot, delete_error = (
+                        self._preflight_ordinary_config_delete(
+                            operation["destination_path"],
+                            operation["source_path"],
+                        )
+                    )
+                    if delete_error is not None:
+                        self._report_best_effort(
+                            "error",
+                            "delete_compatibility:"
+                            f"{delete_error}",
+                        )
+                        return False
+                    operation["snapshot"] = snapshot
 
                 for operation in config_operations:
                     if operation["kind"] == "delete":

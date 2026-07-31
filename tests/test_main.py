@@ -191,6 +191,238 @@ def test_run_upgrade_uses_default_logger_and_orders_commit_before_cleanup(monkey
     ]
 
 
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
+@pytest.mark.parametrize(
+    "failure_stage",
+    [
+        "executable",
+        "program",
+        "version_persistence",
+    ],
+)
+def test_real_compatibility_delete_is_restored_after_later_stage_failure(
+    monkeypatch,
+    tmp_path,
+    failure_stage,
+):
+    target_dir = tmp_path / "target"
+    package_dir = tmp_path / "package"
+    config_dir = package_dir / "resources" / "config"
+    backup_dir = package_dir / "resources" / "backup"
+    ui_pic = target_dir / "ui" / "ui_pic"
+    ui_pic.mkdir(parents=True)
+    (ui_pic / "marker.txt").write_text("original", encoding="utf-8")
+    nested = ui_pic / "nested"
+    nested.mkdir()
+    (nested / "payload.bin").write_bytes(b"original payload")
+    config_dir.mkdir(parents=True)
+    original_tree = {
+        path.relative_to(ui_pic).as_posix(): (
+            "directory" if path.is_dir() else path.read_bytes()
+        )
+        for path in sorted(ui_pic.rglob("*"))
+    }
+    manifest = package_dir / "resources" / "version_1.0.yml"
+    manifest.write_text(
+        yaml.safe_dump(
+            {"config": ["ui/ui_pic"], "json_merge": []},
+            allow_unicode=True,
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    roots = {
+        "ui_pic": ui_pic,
+        "ui_config": target_dir / "ui" / "ui_config",
+        "ai_model": target_dir / "configs" / "aimodel_config",
+        "scanner": target_dir / "configs" / "scanner_barcode_config",
+    }
+    backups = {
+        "ui_pic": backup_dir / "ui_pic",
+        "ui_config": backup_dir / "ui_config",
+        "ai_model": backup_dir / "ai_model_config",
+        "scanner": backup_dir / "scanner_barcode_config",
+    }
+
+    def directory_path(path):
+        return str(path) + os.sep
+
+    monkeypatch.setattr(
+        upgrade_config,
+        "DEFAULT_DIR",
+        directory_path(package_dir),
+    )
+    monkeypatch.setattr(
+        upgrade_config,
+        "DEFAULT_TARGET_DIR",
+        directory_path(target_dir),
+    )
+    monkeypatch.setattr(
+        upgrade_config,
+        "CONFIG_DIR",
+        directory_path(config_dir),
+    )
+    monkeypatch.setattr(
+        upgrade_config,
+        "BACKUP_DIR",
+        directory_path(backup_dir),
+    )
+    monkeypatch.setattr(
+        upgrade_config,
+        "UI_PIC_PATH",
+        directory_path(roots["ui_pic"]),
+    )
+    monkeypatch.setattr(
+        upgrade_config,
+        "UI_CONFIG_PATH",
+        directory_path(roots["ui_config"]),
+    )
+    monkeypatch.setattr(
+        upgrade_config,
+        "AI_MODEL_CONFIG_PATH",
+        directory_path(roots["ai_model"]),
+    )
+    monkeypatch.setattr(
+        upgrade_config,
+        "SCANNER_BARCODE_CONFIG_PATH",
+        directory_path(roots["scanner"]),
+    )
+    monkeypatch.setattr(
+        upgrade_config,
+        "BACKUP_UI_PIC_PATH",
+        directory_path(backups["ui_pic"]),
+    )
+    monkeypatch.setattr(
+        upgrade_config,
+        "BACKUP_UI_CONFIG_PATH",
+        directory_path(backups["ui_config"]),
+    )
+    monkeypatch.setattr(
+        upgrade_config,
+        "BACKUP_AI_MODEL_CONFIG_PATH",
+        directory_path(backups["ai_model"]),
+    )
+    monkeypatch.setattr(
+        upgrade_config,
+        "BACKUP_SCANNER_BARCODE_CONFIG_PATH",
+        directory_path(backups["scanner"]),
+    )
+    monkeypatch.setattr(upgrade_config, "ALL_VERSIONS", ["1.0"])
+    monkeypatch.setattr(upgrade_config, "TARGET_VERSION", "1.0")
+
+    logger = RecordingLogger()
+    managers = []
+    failure_observed = []
+    database_events = []
+
+    def actual_config_manager(supplied_logger, current_version):
+        manager = upgrade_config.ConfigManager(
+            supplied_logger,
+            current_version,
+        )
+        managers.append(manager)
+        return manager
+
+    def observe_failure(stage):
+        assert stage == failure_stage
+        assert not ui_pic.exists()
+        failure_observed.append(stage)
+
+    class LaterFailureDataBaseManager:
+        def __init__(self, path):
+            self.path = path
+
+        @staticmethod
+        def backup_db():
+            database_events.append("backup")
+            return True
+
+        @staticmethod
+        def restore_db():
+            database_events.append("restore")
+            return True
+
+        def upgrade(self):
+            return True
+
+        def update_version(self):
+            if failure_stage == "version_persistence":
+                observe_failure("version_persistence")
+                return False
+            return True
+
+    class LaterFailureExeUpgradeManager:
+        def __init__(self, _logger, _versions):
+            pass
+
+        def run(self):
+            if failure_stage == "executable":
+                observe_failure("executable")
+                return False
+            return True
+
+    def later_failure_program(_logger):
+        if failure_stage == "program":
+            observe_failure("program")
+            return False, "injected program failure"
+        return True, "ok"
+
+    monkeypatch.setattr(
+        upgrade_main,
+        "DataBaseManager",
+        LaterFailureDataBaseManager,
+    )
+    monkeypatch.setattr(
+        upgrade_main,
+        "ConfigManager",
+        actual_config_manager,
+    )
+    monkeypatch.setattr(
+        upgrade_main,
+        "ExeUpgradeManager",
+        LaterFailureExeUpgradeManager,
+    )
+    monkeypatch.setattr(
+        upgrade_main,
+        "update_version_program",
+        later_failure_program,
+    )
+    monkeypatch.setattr(
+        upgrade_main,
+        "get_current_version",
+        lambda: "0.0",
+    )
+    monkeypatch.setattr(
+        upgrade_main,
+        "get_version_database_path",
+        lambda: "version.db",
+    )
+    monkeypatch.setattr(upgrade_main, "DATABASE_PATH", "database.db")
+    monkeypatch.setattr(upgrade_main, "BACKUP_DIR", str(backup_dir))
+
+    assert upgrade_main.run_upgrade(logger) is False
+
+    assert failure_observed == [failure_stage]
+    assert len(managers) == 1
+    assert managers[0]._ordinary_config_delete_retained_artifacts == set()
+    assert {
+        path.relative_to(ui_pic).as_posix(): (
+            "directory" if path.is_dir() else path.read_bytes()
+        )
+        for path in sorted(ui_pic.rglob("*"))
+    } == original_tree
+    assert not backups["ui_pic"].exists()
+    recovery_dir = backup_dir / "recovery"
+    assert recovery_dir.is_dir()
+    assert list(recovery_dir.iterdir()) == []
+    assert database_events == ["backup", "restore"]
+    assert not any(
+        "retained recovery object" in message
+        for _level, message in logger.messages
+    )
+
+
 def create_orchestration_version_db(
     path,
     *,
