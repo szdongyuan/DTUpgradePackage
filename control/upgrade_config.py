@@ -7,6 +7,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import uuid
 from contextlib import contextmanager
 from ctypes import wintypes
 from typing import NamedTuple
@@ -537,6 +538,22 @@ class WindowsHandleOps:
             delete=delete,
             desired_access=desired_access,
             synchronous=True,
+        )
+        if handle is None:
+            if status in self._UNSUPPORTED_NTSTATUSES:
+                raise WindowsDeleteUnsupported("unsupported_filesystem")
+            raise WindowsDeleteFailure("relative_open_failed")
+        self._emit(("opened_relative", handle, str(name)))
+        return handle
+
+    def open_relative_attributes(self, parent_handle, name):
+        self._require_supported()
+        handle, status = self._nt_open_relative(
+            parent_handle,
+            name,
+            directory=None,
+            delete=False,
+            desired_access=_FILE_READ_ATTRIBUTES,
         )
         if handle is None:
             if status in self._UNSUPPORTED_NTSTATUSES:
@@ -1100,6 +1117,26 @@ class WindowsHandleOps:
         delete_children(root_handle, "")
 
 
+class _OrdinaryConfigDeleteSnapshot(NamedTuple):
+    source_path: str
+    source_name: str
+    source_chain: tuple
+    destination_path: str
+    destination_name: str
+    destination_chain: tuple
+    destination_missing: tuple
+    destination_exists: bool
+    destination_directory: object
+    destination_identity: object
+    destination_manifest: object
+    managed_root_path: str
+    managed_root_exists: bool
+    recovery_path: str
+    recovery_chain: tuple
+    recovery_identity: tuple
+    capability: str
+
+
 class ConfigManager(object):
 
     def __init__(self, logger=None, current_version=None):
@@ -1112,6 +1149,7 @@ class ConfigManager(object):
         self.scannre_barcode_config_flag = True
         self.backup_file_path = list()
         self.upgrade_version_list = list()
+        self._ordinary_config_delete_retained_artifacts = set()
 
         self.init_upgrade_version_list()
 
@@ -3340,6 +3378,894 @@ class ConfigManager(object):
         message = f"ordinary_config error: source_path:{error}"
         self._report_best_effort("error", message)
 
+    @staticmethod
+    def _delete_normalized_path(path):
+        return os.path.normcase(os.path.normpath(os.path.abspath(path)))
+
+    def _delete_chain_paths(self, anchor_path, leaf_path):
+        try:
+            anchor_path = os.path.normpath(os.path.abspath(anchor_path))
+            leaf_path = os.path.normpath(os.path.abspath(leaf_path))
+            if not self._path_is_contained(leaf_path, anchor_path):
+                return None
+            relative_path = os.path.relpath(leaf_path, anchor_path)
+        except (OSError, TypeError, ValueError):
+            return None
+
+        paths = [anchor_path]
+        if relative_path != os.curdir:
+            current_path = anchor_path
+            for component in relative_path.split(os.sep):
+                current_path = os.path.join(current_path, component)
+                paths.append(current_path)
+        return tuple(paths)
+
+    @staticmethod
+    def _delete_identity_is_directory(identity):
+        return bool(identity[2] & _FILE_ATTRIBUTE_DIRECTORY)
+
+    @staticmethod
+    def _delete_identity_is_reparse(identity):
+        return bool(identity[2] & _FILE_ATTRIBUTE_REPARSE_POINT)
+
+    def _delete_capture_directory_chain(
+        self,
+        ops,
+        owner,
+        chain_paths,
+        *,
+        allow_missing_tail,
+    ):
+        if not chain_paths:
+            raise WindowsDeleteFailure("invalid_directory_chain")
+
+        handles = []
+        records = []
+        missing = ()
+        root_handle = owner.acquire(
+            ops.open_absolute(chain_paths[0], directory=True)
+        )
+        handles.append(root_handle)
+        root_identity = ops.identity(root_handle)
+        if (
+            not self._delete_identity_is_directory(root_identity)
+            or self._delete_identity_is_reparse(root_identity)
+        ):
+            raise WindowsDeleteFailure("directory_chain_changed")
+        records.append(
+            (
+                self._delete_normalized_path(chain_paths[0]),
+                root_identity,
+            )
+        )
+
+        parent_handle = root_handle
+        for index, chain_path in enumerate(chain_paths[1:], start=1):
+            component = os.path.basename(chain_path)
+            if ops.name_is_absent(parent_handle, component):
+                if not allow_missing_tail:
+                    raise WindowsDeleteFailure("directory_chain_missing")
+                missing = tuple(
+                    os.path.basename(path)
+                    for path in chain_paths[index:]
+                )
+                break
+            child_handle = owner.acquire(
+                ops.open_relative(
+                    parent_handle,
+                    component,
+                    directory=True,
+                )
+            )
+            handles.append(child_handle)
+            identity = ops.identity(child_handle)
+            if (
+                not self._delete_identity_is_directory(identity)
+                or self._delete_identity_is_reparse(identity)
+            ):
+                raise WindowsDeleteFailure("directory_chain_changed")
+            records.append(
+                (
+                    self._delete_normalized_path(chain_path),
+                    identity,
+                )
+            )
+            parent_handle = child_handle
+        return tuple(records), tuple(handles), missing
+
+    def _delete_prepare_recovery_chain(
+        self,
+        ops,
+        owner,
+        source_chain,
+        source_handles,
+    ):
+        trusted_root = os.path.normpath(os.path.abspath(DEFAULT_DIR))
+        recovery_path = os.path.normpath(
+            os.path.abspath(os.path.join(BACKUP_DIR, "recovery"))
+        )
+        chain_paths = self._delete_chain_paths(
+            trusted_root,
+            recovery_path,
+        )
+        if chain_paths is None:
+            raise WindowsDeleteFailure("untrusted_recovery_directory")
+
+        source_handles_by_path = {
+            path: handle
+            for (path, _identity), handle in zip(
+                source_chain,
+                source_handles,
+            )
+        }
+        records = []
+        handles = []
+        parent_handle = None
+        for index, chain_path in enumerate(chain_paths):
+            normalized_path = self._delete_normalized_path(chain_path)
+            existing_handle = source_handles_by_path.get(normalized_path)
+            if existing_handle is not None:
+                identity = ops.identity(existing_handle)
+                records.append((normalized_path, identity))
+                parent_handle = existing_handle
+                continue
+
+            if index == 0 or parent_handle is None:
+                raise WindowsDeleteFailure("untrusted_recovery_directory")
+            component = os.path.basename(chain_path)
+            if ops.name_is_absent(parent_handle, component):
+                try:
+                    os.mkdir(chain_path)
+                except FileExistsError:
+                    pass
+                except OSError:
+                    raise WindowsDeleteFailure(
+                        "recovery_directory_create_failed"
+                    )
+            handle = owner.acquire(
+                ops.open_relative(
+                    parent_handle,
+                    component,
+                    directory=True,
+                )
+            )
+            handles.append(handle)
+            identity = ops.identity(handle)
+            if (
+                not self._delete_identity_is_directory(identity)
+                or self._delete_identity_is_reparse(identity)
+            ):
+                raise WindowsDeleteFailure(
+                    "untrusted_recovery_directory"
+                )
+            records.append((normalized_path, identity))
+            parent_handle = handle
+
+        if not records or parent_handle is None:
+            raise WindowsDeleteFailure("untrusted_recovery_directory")
+        return (
+            recovery_path,
+            tuple(records),
+            tuple(handles),
+            parent_handle,
+        )
+
+    def _delete_managed_root(self, destination_path):
+        destination_path = self._delete_normalized_path(destination_path)
+        roots = (
+            UI_CONFIG_PATH,
+            UI_PIC_PATH,
+            AI_MODEL_CONFIG_PATH,
+            SCANNER_BARCODE_CONFIG_PATH,
+        )
+        return next(
+            (
+                os.path.normpath(os.path.abspath(root))
+                for root in roots
+                if self._path_is_contained(
+                    destination_path,
+                    self._delete_normalized_path(root),
+                )
+            ),
+            None,
+        )
+
+    def _delete_target_manifest(self, ops, handle, *, directory):
+        root_entry = ops.manifest_entry(handle)
+        descendants = ops.capture_manifest(
+            handle,
+            directory=directory,
+        )
+        return root_entry, descendants
+
+    def _preflight_ordinary_config_delete(
+        self,
+        destination_path,
+        source_path,
+        *,
+        handle_ops=None,
+    ):
+        ops = handle_ops or WindowsHandleOps()
+        if not ops.is_supported():
+            return None, (
+                ops.unsupported_category or "unsupported_api"
+            )
+
+        try:
+            destination_path = os.path.normpath(
+                os.path.abspath(destination_path)
+            )
+            source_path = os.path.normpath(os.path.abspath(source_path))
+            resolved_destination, destination_error = (
+                self._resolve_ordinary_config_destination(
+                    os.path.relpath(
+                        destination_path,
+                        DEFAULT_TARGET_DIR,
+                    )
+                )
+            )
+            if (
+                destination_error is not None
+                or self._delete_normalized_path(resolved_destination)
+                != self._delete_normalized_path(destination_path)
+            ):
+                try:
+                    destination_stat = os.lstat(destination_path)
+                except (OSError, TypeError, ValueError):
+                    destination_stat = None
+                if (
+                    destination_stat is not None
+                    and self._snapshot_entry_is_link_or_reparse(
+                        destination_stat
+                    )
+                ):
+                    return None, "unsupported_destination_reparse"
+                return None, (
+                    destination_error or "invalid_destination"
+                )
+
+            config_path = os.path.normpath(os.path.abspath(CONFIG_DIR))
+            expected_source = os.path.normpath(
+                os.path.abspath(
+                    os.path.join(
+                        config_path,
+                        os.path.basename(destination_path),
+                    )
+                )
+            )
+            if (
+                self._delete_normalized_path(source_path)
+                != self._delete_normalized_path(expected_source)
+            ):
+                return None, "invalid_source"
+
+            source_chain_paths = self._delete_chain_paths(
+                DEFAULT_DIR,
+                config_path,
+            )
+            if source_chain_paths is None:
+                return None, "invalid_source_chain"
+            managed_root_path = self._delete_managed_root(
+                destination_path
+            )
+            if managed_root_path is None:
+                return None, "outside_allowed_root"
+            destination_parent = os.path.dirname(destination_path)
+            destination_chain_paths = self._delete_chain_paths(
+                DEFAULT_TARGET_DIR,
+                destination_parent,
+            )
+            if destination_chain_paths is None:
+                return None, "invalid_destination_chain"
+
+            with WindowsHandleOwner(ops.close) as owner:
+                (
+                    source_chain,
+                    source_handles,
+                    source_missing,
+                ) = self._delete_capture_directory_chain(
+                    ops,
+                    owner,
+                    source_chain_paths,
+                    allow_missing_tail=False,
+                )
+                if source_missing:
+                    raise WindowsDeleteFailure("source_parent_changed")
+                config_handle = source_handles[-1]
+                if not ops.name_is_absent(
+                    config_handle,
+                    os.path.basename(source_path),
+                ):
+                    raise WindowsDeleteFailure("source_appeared")
+
+                (
+                    recovery_path,
+                    recovery_chain,
+                    _recovery_handles,
+                    recovery_handle,
+                ) = self._delete_prepare_recovery_chain(
+                    ops,
+                    owner,
+                    source_chain,
+                    source_handles,
+                )
+                recovery_identity = ops.identity(recovery_handle)
+
+                (
+                    destination_chain,
+                    destination_handles,
+                    destination_missing,
+                ) = self._delete_capture_directory_chain(
+                    ops,
+                    owner,
+                    destination_chain_paths,
+                    allow_missing_tail=True,
+                )
+                destination_exists = False
+                destination_directory = None
+                destination_identity = None
+                destination_manifest = None
+                target_handle = None
+                if not destination_missing:
+                    destination_parent_handle = (
+                        destination_handles[-1]
+                    )
+                    destination_name = os.path.basename(
+                        destination_path
+                    )
+                    destination_exists = not ops.name_is_absent(
+                        destination_parent_handle,
+                        destination_name,
+                    )
+                    if destination_exists:
+                        try:
+                            target_stat = os.lstat(destination_path)
+                        except (OSError, TypeError, ValueError):
+                            raise WindowsDeleteFailure(
+                                "destination_identity_failed"
+                            )
+                        destination_directory = stat.S_ISDIR(
+                            target_stat.st_mode
+                        )
+                        target_handle = owner.acquire(
+                            ops.open_relative(
+                                destination_parent_handle,
+                                destination_name,
+                                directory=destination_directory,
+                            )
+                        )
+                        destination_identity = ops.identity(
+                            target_handle
+                        )
+                        if self._delete_identity_is_reparse(
+                            destination_identity
+                        ):
+                            raise WindowsDeleteFailure(
+                                "unsupported_destination_reparse"
+                            )
+                        if (
+                            self._delete_identity_is_directory(
+                                destination_identity
+                            )
+                            is not destination_directory
+                        ):
+                            raise WindowsDeleteFailure(
+                                "destination_type_changed"
+                            )
+                        destination_manifest = (
+                            self._delete_target_manifest(
+                                ops,
+                                target_handle,
+                                directory=destination_directory,
+                            )
+                        )
+
+                normalized_managed_root = (
+                    self._delete_normalized_path(managed_root_path)
+                )
+                if (
+                    self._delete_normalized_path(destination_path)
+                    == normalized_managed_root
+                ):
+                    managed_root_exists = destination_exists
+                else:
+                    managed_root_exists = any(
+                        path == normalized_managed_root
+                        for path, _identity in destination_chain
+                    )
+
+                destination_volume = (
+                    destination_identity[0]
+                    if destination_identity is not None
+                    else destination_chain[-1][1][0]
+                )
+                if recovery_identity[0] != destination_volume:
+                    raise WindowsDeleteFailure(
+                        "recovery_volume_mismatch"
+                    )
+
+                snapshot = _OrdinaryConfigDeleteSnapshot(
+                    source_path,
+                    os.path.basename(source_path),
+                    source_chain,
+                    destination_path,
+                    os.path.basename(destination_path),
+                    destination_chain,
+                    destination_missing,
+                    destination_exists,
+                    destination_directory,
+                    destination_identity,
+                    destination_manifest,
+                    os.path.normpath(managed_root_path),
+                    managed_root_exists,
+                    recovery_path,
+                    recovery_chain,
+                    recovery_identity,
+                    "supported",
+                )
+                return snapshot, None
+        except WindowsDeleteFailure as error:
+            return None, error.category
+        except (OSError, TypeError, ValueError):
+            return None, "snapshot_failed"
+
+    def _delete_reacquire_chain(
+        self,
+        ops,
+        owner,
+        expected_chain,
+        expected_missing=(),
+    ):
+        if not expected_chain:
+            raise WindowsDeleteFailure("invalid_directory_chain")
+        paths = tuple(path for path, _identity in expected_chain)
+        if expected_missing:
+            current = paths[-1]
+            paths += tuple(
+                os.path.join(current, *expected_missing[: index + 1])
+                for index in range(len(expected_missing))
+            )
+        records, handles, missing = (
+            self._delete_capture_directory_chain(
+                ops,
+                owner,
+                paths,
+                allow_missing_tail=bool(expected_missing),
+            )
+        )
+        if records != expected_chain or missing != expected_missing:
+            raise WindowsDeleteFailure("directory_chain_changed")
+        return handles
+
+    @staticmethod
+    def _delete_held_chain_matches(ops, handles, expected_chain):
+        if len(handles) != len(expected_chain):
+            return False
+        return all(
+            ops.identity(handle) == expected_identity
+            for handle, (_path, expected_identity) in zip(
+                handles,
+                expected_chain,
+            )
+        )
+
+    def _delete_artifact_is_intact(
+        self,
+        ops,
+        artifact_handle,
+        snapshot,
+    ):
+        try:
+            return (
+                ops.identity(artifact_handle)
+                == snapshot.destination_identity
+                and self._delete_target_manifest(
+                    ops,
+                    artifact_handle,
+                    directory=snapshot.destination_directory,
+                )
+                == snapshot.destination_manifest
+            )
+        except WindowsDeleteFailure:
+            return False
+
+    def _delete_verify_named_identity(
+        self,
+        ops,
+        owner,
+        parent_handle,
+        name,
+        snapshot,
+    ):
+        if ops.name_is_absent(parent_handle, name):
+            return False
+        verification_handle = owner.acquire(
+            ops.open_relative_attributes(
+                parent_handle,
+                name,
+            )
+        )
+        try:
+            return (
+                ops.identity(verification_handle)
+                == snapshot.destination_identity
+            )
+        finally:
+            ops.close(verification_handle)
+            owner.release(verification_handle)
+
+    def _delete_try_local_restore(
+        self,
+        ops,
+        owner,
+        snapshot,
+        artifact_handle,
+        artifact_name,
+        source_handles,
+        destination_handles,
+        recovery_handles,
+    ):
+        destination_parent_handle = destination_handles[-1]
+        recovery_handle = recovery_handles[-1]
+        try:
+            if not self._delete_held_chain_matches(
+                ops,
+                source_handles,
+                snapshot.source_chain,
+            ):
+                return False
+            if not self._delete_held_chain_matches(
+                ops,
+                destination_handles,
+                snapshot.destination_chain,
+            ):
+                return False
+            if not self._delete_held_chain_matches(
+                ops,
+                recovery_handles,
+                snapshot.recovery_chain,
+            ):
+                return False
+            if not self._delete_artifact_is_intact(
+                ops,
+                artifact_handle,
+                snapshot,
+            ):
+                return False
+            if not ops.name_is_absent(
+                destination_parent_handle,
+                snapshot.destination_name,
+            ):
+                return False
+            if not self._delete_verify_named_identity(
+                ops,
+                owner,
+                recovery_handle,
+                artifact_name,
+                snapshot,
+            ):
+                return False
+
+            ops.rename_relative_no_replace(
+                artifact_handle,
+                destination_parent_handle,
+                snapshot.destination_name,
+            )
+            if not ops.name_is_absent(recovery_handle, artifact_name):
+                return False
+            return self._delete_verify_named_identity(
+                ops,
+                owner,
+                destination_parent_handle,
+                snapshot.destination_name,
+                snapshot,
+            )
+        except WindowsDeleteFailure:
+            return False
+
+    def _delete_retain_artifact(self, artifact_path):
+        normalized_path = os.path.normpath(artifact_path)
+        self._ordinary_config_delete_retained_artifacts.add(
+            normalized_path
+        )
+        self._report_best_effort(
+            "error",
+            "delete_compatibility retained recovery artifact: "
+            f"{normalized_path}",
+        )
+
+    def _delete_ordinary_config_compatibility(
+        self,
+        snapshot,
+        *,
+        handle_ops=None,
+    ):
+        ops = handle_ops or WindowsHandleOps()
+        if (
+            not isinstance(snapshot, _OrdinaryConfigDeleteSnapshot)
+            or snapshot.capability != "supported"
+        ):
+            self._report_best_effort(
+                "error",
+                "delete_compatibility error: invalid_snapshot",
+            )
+            return False
+        if not ops.is_supported():
+            self._report_best_effort(
+                "error",
+                "delete_compatibility error: "
+                f"{ops.unsupported_category or 'unsupported_api'}",
+            )
+            return False
+
+        artifact_name = None
+        artifact_path = None
+        artifact_handle = None
+        detached = False
+        root_disposition_accepted = False
+        failure_category = "transaction_failed"
+
+        owner = WindowsHandleOwner(ops.close)
+        try:
+            if owner:
+                source_handles = self._delete_reacquire_chain(
+                    ops,
+                    owner,
+                    snapshot.source_chain,
+                )
+                destination_handles = self._delete_reacquire_chain(
+                    ops,
+                    owner,
+                    snapshot.destination_chain,
+                    snapshot.destination_missing,
+                )
+                recovery_handles = self._delete_reacquire_chain(
+                    ops,
+                    owner,
+                    snapshot.recovery_chain,
+                )
+                recovery_handle = recovery_handles[-1]
+                if (
+                    ops.identity(recovery_handle)
+                    != snapshot.recovery_identity
+                ):
+                    raise WindowsDeleteFailure(
+                        "recovery_directory_changed"
+                    )
+
+                config_handle = source_handles[-1]
+                destination_parent_handle = destination_handles[-1]
+                if snapshot.destination_missing:
+                    if snapshot.destination_exists:
+                        raise WindowsDeleteFailure(
+                            "destination_state_changed"
+                        )
+                else:
+                    destination_is_absent = ops.name_is_absent(
+                        destination_parent_handle,
+                        snapshot.destination_name,
+                    )
+                    if (
+                        destination_is_absent
+                        is snapshot.destination_exists
+                    ):
+                        raise WindowsDeleteFailure(
+                            "destination_state_changed"
+                        )
+
+                if not snapshot.destination_exists:
+                    if not ops.name_is_absent(
+                        config_handle,
+                        snapshot.source_name,
+                    ):
+                        raise WindowsDeleteFailure("source_appeared")
+                    owner.close_all()
+                    self._report_best_effort(
+                        "info",
+                        "delete_compatibility no-op: "
+                        f"{snapshot.destination_path}",
+                    )
+                    return True
+
+                artifact_handle = owner.acquire(
+                    ops.open_relative(
+                        destination_parent_handle,
+                        snapshot.destination_name,
+                        directory=snapshot.destination_directory,
+                        delete=True,
+                    )
+                )
+                if (
+                    ops.identity(artifact_handle)
+                    != snapshot.destination_identity
+                    or self._delete_target_manifest(
+                        ops,
+                        artifact_handle,
+                        directory=snapshot.destination_directory,
+                    )
+                    != snapshot.destination_manifest
+                ):
+                    raise WindowsDeleteFailure(
+                        "destination_changed"
+                    )
+
+                if not self._delete_held_chain_matches(
+                    ops,
+                    source_handles,
+                    snapshot.source_chain,
+                ):
+                    raise WindowsDeleteFailure("source_chain_changed")
+                if not self._delete_held_chain_matches(
+                    ops,
+                    destination_handles,
+                    snapshot.destination_chain,
+                ):
+                    raise WindowsDeleteFailure(
+                        "destination_chain_changed"
+                    )
+                if not self._delete_held_chain_matches(
+                    ops,
+                    recovery_handles,
+                    snapshot.recovery_chain,
+                ):
+                    raise WindowsDeleteFailure(
+                        "recovery_chain_changed"
+                    )
+                if not ops.name_is_absent(
+                    config_handle,
+                    snapshot.source_name,
+                ):
+                    raise WindowsDeleteFailure("source_appeared")
+
+                for _attempt in range(128):
+                    candidate = (
+                        f".{snapshot.destination_name}.delete-"
+                        f"{uuid.uuid4().hex}"
+                    )
+                    try:
+                        ops.rename_relative_no_replace(
+                            artifact_handle,
+                            recovery_handle,
+                            candidate,
+                        )
+                    except WindowsDeleteFailure as error:
+                        if error.category == "rename_collision":
+                            continue
+                        raise
+                    artifact_name = candidate
+                    artifact_path = os.path.join(
+                        snapshot.recovery_path,
+                        artifact_name,
+                    )
+                    detached = True
+                    break
+                else:
+                    raise WindowsDeleteFailure(
+                        "artifact_name_exhausted"
+                    )
+
+                if not ops.name_is_absent(
+                    destination_parent_handle,
+                    snapshot.destination_name,
+                ):
+                    raise WindowsDeleteFailure(
+                        "destination_not_absent"
+                    )
+                if not self._delete_verify_named_identity(
+                    ops,
+                    owner,
+                    recovery_handle,
+                    artifact_name,
+                    snapshot,
+                ):
+                    raise WindowsDeleteFailure(
+                        "artifact_binding_changed"
+                    )
+                if (
+                    ops.identity(artifact_handle)
+                    != snapshot.destination_identity
+                    or self._delete_target_manifest(
+                        ops,
+                        artifact_handle,
+                        directory=snapshot.destination_directory,
+                    )
+                    != snapshot.destination_manifest
+                ):
+                    raise WindowsDeleteFailure(
+                        "post_rename_manifest_changed"
+                    )
+
+                if snapshot.destination_directory:
+                    ops.delete_descendants(
+                        artifact_handle,
+                        snapshot.destination_manifest[1],
+                    )
+                    if ops.enumerate(artifact_handle):
+                        raise WindowsDeleteFailure(
+                            "directory_not_empty"
+                        )
+                    if (
+                        ops.identity(artifact_handle)
+                        != snapshot.destination_identity
+                    ):
+                        raise WindowsDeleteFailure(
+                            "artifact_identity_changed"
+                        )
+                elif (
+                    ops.manifest_entry(artifact_handle)
+                    != snapshot.destination_manifest[0]
+                ):
+                    raise WindowsDeleteFailure(
+                        "artifact_manifest_changed"
+                    )
+
+                ops.set_delete_disposition(artifact_handle)
+                root_disposition_accepted = True
+                ops.close(artifact_handle)
+                owner.release(artifact_handle)
+                artifact_handle = None
+
+                if not ops.name_is_absent(
+                    destination_parent_handle,
+                    snapshot.destination_name,
+                ):
+                    raise WindowsDeleteFailure(
+                        "destination_not_absent"
+                    )
+                if not ops.name_is_absent(
+                    recovery_handle,
+                    artifact_name,
+                ):
+                    raise WindowsDeleteFailure(
+                        "artifact_not_absent"
+                    )
+                self._ordinary_config_delete_retained_artifacts.discard(
+                    os.path.normpath(artifact_path)
+                )
+                owner.close_all()
+                self._report_best_effort(
+                    "info",
+                    "delete_compatibility success: "
+                    f"{snapshot.destination_path}",
+                )
+                return True
+        except WindowsDeleteFailure as error:
+            failure_category = error.category
+            if (
+                detached
+                and not root_disposition_accepted
+                and artifact_handle is not None
+                and self._delete_try_local_restore(
+                    ops,
+                    owner,
+                    snapshot,
+                    artifact_handle,
+                    artifact_name,
+                    source_handles,
+                    destination_handles,
+                    recovery_handles,
+                )
+            ):
+                detached = False
+                artifact_path = None
+            elif detached and artifact_path is not None:
+                self._delete_retain_artifact(artifact_path)
+        except (OSError, TypeError, ValueError):
+            failure_category = "transaction_failed"
+            if detached and artifact_path is not None:
+                self._delete_retain_artifact(artifact_path)
+        finally:
+            try:
+                owner.close_all()
+            except WindowsDeleteFailure as error:
+                failure_category = error.category
+
+        self._report_best_effort(
+            "error",
+            f"delete_compatibility error: {failure_category}",
+        )
+        return False
+
     def backup_config_file(self, config_file_source_path):
         managed_roots = (
             (
@@ -3897,10 +4823,42 @@ class ConfigManager(object):
                 "error",
                 "配置文件恢复失败，保留备份文件",
             )
+            self._report_ordinary_config_manual_recovery_paths(
+                restore_targets
+            )
             return False
 
         self._report_best_effort("info", "配置文件已恢复")
-        return self.delete_backup_file()
+        cleanup_succeeded = self.delete_backup_file()
+        if not cleanup_succeeded:
+            self._report_ordinary_config_manual_recovery_paths(
+                restore_targets
+            )
+        return cleanup_succeeded
+
+    def _report_ordinary_config_manual_recovery_paths(
+        self,
+        restore_targets,
+    ):
+        retained_paths = set(
+            self._ordinary_config_delete_retained_artifacts
+        )
+        for flag_name, backup_path, _target_path, _display_name in (
+            restore_targets
+        ):
+            if getattr(self, flag_name) is False:
+                try:
+                    if os.path.lexists(backup_path):
+                        retained_paths.add(os.path.normpath(backup_path))
+                except (OSError, TypeError, ValueError):
+                    retained_paths.add(os.path.normpath(backup_path))
+
+        for retained_path in sorted(retained_paths):
+            self._report_best_effort(
+                "error",
+                "delete_compatibility manual recovery retained: "
+                f"{retained_path}",
+            )
 
     def delete_backup_file(self):
         self._report_best_effort("info", "正在删除备份文件...")

@@ -3,6 +3,7 @@ import ctypes
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -625,6 +626,491 @@ def test_windows_handle_cleanup_rejects_same_object_leaf_content_change(
         owner.close_all()
 
     assert leaf.read_bytes() == changed_contents
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
+def test_delete_snapshot_captures_immutable_bound_state_before_backup(
+    configured_tree,
+):
+    manager = make_manager()
+    target = configured_tree.roots["ui_config"] / "obsolete.bin"
+    target.write_bytes(b"captured-before-backup")
+    source = configured_tree.config_dir / target.name
+
+    snapshot, error = manager._preflight_ordinary_config_delete(
+        str(target),
+        str(source),
+    )
+
+    assert error is None
+    assert isinstance(snapshot, tuple)
+    with pytest.raises(AttributeError):
+        snapshot.destination_exists = False
+    assert snapshot.source_path == os.path.normpath(str(source))
+    assert [Path(path).name for path, _identity in snapshot.source_chain] == [
+        configured_tree.package_dir.name,
+        "resources",
+        "config",
+    ]
+    assert snapshot.destination_exists is True
+    assert snapshot.managed_root_exists is True
+    assert snapshot.destination_directory is False
+    assert snapshot.destination_identity[0] == snapshot.recovery_identity[0]
+    assert snapshot.destination_manifest[0][6] == hashlib.sha256(
+        b"captured-before-backup"
+    ).hexdigest()
+    assert Path(snapshot.recovery_path).parent == configured_tree.backup_dir
+    assert not any(path.exists() for path in configured_tree.backups.values())
+    assert all(getattr(manager, flag) is True for flag in (
+        "ui_pic_flag",
+        "ui_config_flag",
+        "ai_model_config_flag",
+        "scannre_barcode_config_flag",
+    ))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
+def test_delete_snapshot_rejects_untrusted_recovery_and_destination_reparse(
+    configured_tree,
+    tmp_path,
+    monkeypatch,
+):
+    manager = make_manager()
+    target = configured_tree.roots["ui_config"] / "obsolete"
+    target.mkdir()
+    source = configured_tree.config_dir / target.name
+    external_recovery = tmp_path / "external-backup"
+    monkeypatch.setattr(
+        upgrade_config,
+        "BACKUP_DIR",
+        directory_path(external_recovery),
+    )
+
+    snapshot, error = manager._preflight_ordinary_config_delete(
+        str(target),
+        str(source),
+    )
+
+    assert snapshot is None
+    assert error == "untrusted_recovery_directory"
+    assert target.is_dir()
+    assert not external_recovery.exists()
+
+    monkeypatch.setattr(
+        upgrade_config,
+        "BACKUP_DIR",
+        directory_path(configured_tree.backup_dir),
+    )
+    external = tmp_path / "external"
+    external.mkdir()
+    junction = configured_tree.roots["ui_pic"] / "reparse-target"
+    result = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(external)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+
+    snapshot, error = manager._preflight_ordinary_config_delete(
+        str(junction),
+        str(configured_tree.config_dir / junction.name),
+    )
+
+    assert snapshot is None
+    assert error == "unsupported_destination_reparse"
+    assert junction.exists()
+    assert external.exists()
+
+
+def test_delete_snapshot_rejects_unsupported_adapter_before_filesystem_change(
+    configured_tree,
+):
+    class UnsupportedOps:
+        unsupported_category = "unsupported_filesystem"
+
+        @staticmethod
+        def is_supported():
+            return False
+
+    manager = make_manager()
+    target = configured_tree.roots["ui_config"] / "obsolete.bin"
+    target.write_bytes(b"preserve")
+
+    snapshot, error = manager._preflight_ordinary_config_delete(
+        str(target),
+        str(configured_tree.config_dir / target.name),
+        handle_ops=UnsupportedOps(),
+    )
+
+    assert snapshot is None
+    assert error == "unsupported_filesystem"
+    assert target.read_bytes() == b"preserve"
+    assert not (configured_tree.backup_dir / "recovery").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
+@pytest.mark.parametrize("directory", [False, True])
+def test_windows_delete_transaction_removes_exact_file_or_tree(
+    configured_tree,
+    directory,
+):
+    manager = make_manager()
+    target = configured_tree.roots["ui_config"] / (
+        "obsolete-tree" if directory else "obsolete.bin"
+    )
+    if directory:
+        (target / "nested").mkdir(parents=True)
+        (target / "root.txt").write_bytes(b"root")
+        (target / "nested" / "leaf.txt").write_bytes(b"leaf")
+    else:
+        target.write_bytes(b"file")
+    source = configured_tree.config_dir / target.name
+    events = []
+    ops = upgrade_config.WindowsHandleOps(event_sink=events.append)
+    snapshot, error = manager._preflight_ordinary_config_delete(
+        str(target),
+        str(source),
+        handle_ops=ops,
+    )
+    assert error is None
+
+    assert manager._delete_ordinary_config_compatibility(
+        snapshot,
+        handle_ops=ops,
+    ) is True
+
+    assert not target.exists()
+    assert not list((configured_tree.backup_dir / "recovery").iterdir())
+    dispositions = [
+        index for index, event in enumerate(events)
+        if event[0] == "disposition"
+    ]
+    closes = [
+        index for index, event in enumerate(events)
+        if event[0] == "close"
+    ]
+    assert dispositions
+    assert max(dispositions) < max(closes)
+    assert any("delete_compatibility success" in message for message in logged_messages(manager))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
+def test_windows_delete_transaction_absent_target_is_bound_noop(
+    configured_tree,
+):
+    manager = make_manager()
+    target = configured_tree.roots["ui_config"] / "already-absent"
+    source = configured_tree.config_dir / target.name
+    snapshot, error = manager._preflight_ordinary_config_delete(
+        str(target),
+        str(source),
+    )
+    assert error is None
+    assert snapshot.destination_exists is False
+
+    assert manager._delete_ordinary_config_compatibility(snapshot) is True
+
+    assert not target.exists()
+    assert any("delete_compatibility no-op" in message for message in logged_messages(manager))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
+def test_windows_delete_transaction_source_appearance_and_target_change_fail_closed(
+    configured_tree,
+):
+    manager = make_manager()
+    target = configured_tree.roots["ui_config"] / "race.bin"
+    target.write_bytes(b"original")
+    source = configured_tree.config_dir / target.name
+    snapshot, error = manager._preflight_ordinary_config_delete(
+        str(target),
+        str(source),
+    )
+    assert error is None
+    source.write_bytes(b"appeared")
+
+    assert manager._delete_ordinary_config_compatibility(snapshot) is False
+    assert target.read_bytes() == b"original"
+    source.unlink()
+
+    snapshot, error = manager._preflight_ordinary_config_delete(
+        str(target),
+        str(source),
+    )
+    assert error is None
+    target.write_bytes(b"changed!")
+    assert manager._delete_ordinary_config_compatibility(snapshot) is False
+    assert target.read_bytes() == b"changed!"
+    assert not any("delete_compatibility success" in message for message in logged_messages(manager))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
+def test_windows_delete_transaction_collision_retries_relative_bound_rename(
+    configured_tree,
+    monkeypatch,
+):
+    manager = make_manager()
+    target = configured_tree.roots["ui_config"] / "collision.bin"
+    target.write_bytes(b"payload")
+    source = configured_tree.config_dir / target.name
+    ops = upgrade_config.WindowsHandleOps()
+    snapshot, error = manager._preflight_ordinary_config_delete(
+        str(target),
+        str(source),
+        handle_ops=ops,
+    )
+    assert error is None
+    real_rename = ops.rename_relative_no_replace
+    attempts = []
+
+    def collide_once(object_handle, parent_handle, target_name):
+        attempts.append((parent_handle, target_name))
+        if len(attempts) == 1:
+            raise upgrade_config.WindowsDeleteFailure("rename_collision")
+        return real_rename(object_handle, parent_handle, target_name)
+
+    monkeypatch.setattr(ops, "rename_relative_no_replace", collide_once)
+
+    assert manager._delete_ordinary_config_compatibility(
+        snapshot,
+        handle_ops=ops,
+    ) is True
+    assert len(attempts) == 2
+    assert attempts[0][1] != attempts[1][1]
+    assert all(Path(name).name == name for _handle, name in attempts)
+    assert ops.last_rename["root_directory"] == attempts[-1][0]
+    assert ops.last_rename["replace"] is False
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
+def test_windows_delete_transaction_exact_target_handle_blocks_final_swap(
+    configured_tree,
+    monkeypatch,
+):
+    manager = make_manager()
+    target = configured_tree.roots["ui_config"] / "rename-race.bin"
+    target.write_bytes(b"captured")
+    source = configured_tree.config_dir / target.name
+    ops = upgrade_config.WindowsHandleOps()
+    snapshot, error = manager._preflight_ordinary_config_delete(
+        str(target),
+        str(source),
+        handle_ops=ops,
+    )
+    assert error is None
+    real_rename = ops.rename_relative_no_replace
+    swap_was_blocked = []
+
+    def attempt_swap_then_rename(object_handle, parent_handle, target_name):
+        try:
+            os.rename(target, target.with_name("attacker-moved.bin"))
+        except OSError:
+            swap_was_blocked.append(True)
+        else:
+            pytest.fail("no-delete-share target handle permitted final-boundary swap")
+        return real_rename(object_handle, parent_handle, target_name)
+
+    monkeypatch.setattr(
+        ops,
+        "rename_relative_no_replace",
+        attempt_swap_then_rename,
+    )
+
+    assert manager._delete_ordinary_config_compatibility(
+        snapshot,
+        handle_ops=ops,
+    ) is True
+    assert swap_was_blocked == [True]
+    assert not target.exists()
+    assert not target.with_name("attacker-moved.bin").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
+def test_windows_delete_transaction_post_rename_failure_restores_locally(
+    configured_tree,
+    monkeypatch,
+):
+    manager = make_manager()
+    target = configured_tree.roots["ui_config"] / "restore.bin"
+    target.write_bytes(b"restore-me")
+    source = configured_tree.config_dir / target.name
+    ops = upgrade_config.WindowsHandleOps()
+    snapshot, error = manager._preflight_ordinary_config_delete(
+        str(target),
+        str(source),
+        handle_ops=ops,
+    )
+    assert error is None
+    real_manifest_entry = ops.manifest_entry
+    injected = {"done": False}
+
+    def fail_first_post_rename(handle):
+        entry = real_manifest_entry(handle)
+        if ops.last_rename is not None and not injected["done"]:
+            injected["done"] = True
+            raise upgrade_config.WindowsDeleteFailure("injected_post_rename")
+        return entry
+
+    monkeypatch.setattr(ops, "manifest_entry", fail_first_post_rename)
+
+    assert manager._delete_ordinary_config_compatibility(
+        snapshot,
+        handle_ops=ops,
+    ) is False
+    assert injected["done"] is True
+    assert target.read_bytes() == b"restore-me"
+    assert not list((configured_tree.backup_dir / "recovery").iterdir())
+    assert not any("delete_compatibility success" in message for message in logged_messages(manager))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
+def test_windows_delete_transaction_partial_cleanup_retains_and_reports_artifact(
+    configured_tree,
+    monkeypatch,
+):
+    manager = make_manager()
+    target = configured_tree.roots["ui_config"] / "partial"
+    target.mkdir()
+    (target / "a.txt").write_bytes(b"a")
+    (target / "b.txt").write_bytes(b"b")
+    source = configured_tree.config_dir / target.name
+    ops = upgrade_config.WindowsHandleOps()
+    snapshot, error = manager._preflight_ordinary_config_delete(
+        str(target),
+        str(source),
+        handle_ops=ops,
+    )
+    assert error is None
+    real_disposition = ops.set_delete_disposition
+    calls = []
+
+    def fail_second_disposition(handle):
+        calls.append(handle)
+        if len(calls) == 2:
+            raise upgrade_config.WindowsDeleteFailure("injected_cleanup_failure")
+        return real_disposition(handle)
+
+    monkeypatch.setattr(
+        ops,
+        "set_delete_disposition",
+        fail_second_disposition,
+    )
+
+    assert manager._delete_ordinary_config_compatibility(
+        snapshot,
+        handle_ops=ops,
+    ) is False
+
+    artifacts = list((configured_tree.backup_dir / "recovery").iterdir())
+    assert len(artifacts) == 1
+    assert not target.exists()
+    assert str(artifacts[0]) in manager._ordinary_config_delete_retained_artifacts
+    assert any(
+        str(artifacts[0]) in message and "retained" in message
+        for message in logged_messages(manager, "error")
+    )
+    assert not any("delete_compatibility success" in message for message in logged_messages(manager))
+
+
+def test_delete_recovery_global_rollback_failure_reports_every_retained_path(
+    configured_tree,
+    monkeypatch,
+):
+    manager = make_manager()
+    create_backup_roots(
+        configured_tree,
+        ["ui_config", "ui_pic"],
+    )
+    manager.ui_config_flag = False
+    manager.ui_pic_flag = False
+    recovery_dir = configured_tree.backup_dir / "recovery"
+    recovery_dir.mkdir(parents=True)
+    artifact = recovery_dir / ".obsolete.delete-retained"
+    artifact.write_bytes(b"manual recovery")
+    manager._ordinary_config_delete_retained_artifacts.add(str(artifact))
+    monkeypatch.setattr(
+        manager,
+        "_replace_with_staged_snapshot",
+        lambda *_args: False,
+    )
+
+    assert manager.restore_config() is False
+
+    errors = logged_messages(manager, "error")
+    for retained_path in (
+        configured_tree.backups["ui_config"],
+        configured_tree.backups["ui_pic"],
+        artifact,
+    ):
+        assert retained_path.exists()
+        assert any(str(retained_path) in message for message in errors)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
+@pytest.mark.parametrize("changed_chain", ["source", "destination", "recovery"])
+def test_windows_delete_transaction_rejects_prebackup_chain_substitution(
+    configured_tree,
+    changed_chain,
+):
+    manager = make_manager()
+    target = configured_tree.roots["ui_config"] / "chain-race.bin"
+    target.write_bytes(b"captured")
+    source = configured_tree.config_dir / target.name
+    snapshot, error = manager._preflight_ordinary_config_delete(
+        str(target),
+        str(source),
+    )
+    assert error is None
+
+    if changed_chain == "source":
+        original = configured_tree.config_dir
+        displaced = original.with_name("config-displaced")
+        os.rename(original, displaced)
+        original.mkdir()
+    elif changed_chain == "destination":
+        original = configured_tree.roots["ui_config"]
+        displaced = original.with_name("ui_config-displaced")
+        os.rename(original, displaced)
+        original.mkdir()
+        (original / target.name).write_bytes(b"attacker")
+    else:
+        original = configured_tree.backup_dir / "recovery"
+        displaced = original.with_name("recovery-displaced")
+        os.rename(original, displaced)
+        original.mkdir()
+
+    assert manager._delete_ordinary_config_compatibility(snapshot) is False
+
+    if changed_chain == "destination":
+        assert (displaced / target.name).read_bytes() == b"captured"
+        assert target.read_bytes() == b"attacker"
+    else:
+        assert target.read_bytes() == b"captured"
+    assert not any("delete_compatibility success" in message for message in logged_messages(manager))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
+def test_windows_delete_transaction_absent_managed_root_is_noop_without_backup_state(
+    configured_tree,
+):
+    manager = make_manager()
+    target = configured_tree.roots["ui_pic"]
+    shutil.rmtree(target)
+    source = configured_tree.config_dir / target.name
+
+    snapshot, error = manager._preflight_ordinary_config_delete(
+        str(target),
+        str(source),
+    )
+
+    assert error is None
+    assert snapshot.destination_exists is False
+    assert snapshot.managed_root_exists is False
+    assert manager.ui_pic_flag is True
+    assert manager._delete_ordinary_config_compatibility(snapshot) is True
+    assert manager.ui_pic_flag is True
+    assert not configured_tree.backups["ui_pic"].exists()
 
 
 class DummyLogger:
