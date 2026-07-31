@@ -1238,9 +1238,14 @@ def test_windows_delete_transaction_post_rename_failure_restores_locally(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
+@pytest.mark.parametrize(
+    "redetach_verification_failure",
+    [None, "named_identity", "manifest"],
+)
 def test_windows_delete_restore_verification_failure_redetaches_before_global_rollback(
     configured_tree,
     monkeypatch,
+    redetach_verification_failure,
 ):
     target = configured_tree.roots["ui_config"] / "restore-location.bin"
     target.write_bytes(b"recoverable")
@@ -1262,6 +1267,7 @@ def test_windows_delete_restore_verification_failure_redetaches_before_global_ro
     ops = upgrade_config.WindowsHandleOps()
     real_target_manifest = manager._delete_target_manifest
     manifest_failure_injected = {"done": False}
+    redetach_manifest_failure_injected = {"done": False}
 
     def fail_post_detach_manifest(*args, **kwargs):
         if (
@@ -1273,6 +1279,19 @@ def test_windows_delete_restore_verification_failure_redetaches_before_global_ro
             manifest_failure_injected["done"] = True
             raise upgrade_config.WindowsDeleteFailure(
                 "injected_post_detach_verification"
+            )
+        if (
+            redetach_verification_failure == "manifest"
+            and manifest_failure_injected["done"]
+            and not redetach_manifest_failure_injected["done"]
+            and ops.last_rename is not None
+            and ops.last_rename["target_name"].startswith(
+                f".{target.name}.recovery-"
+            )
+        ):
+            redetach_manifest_failure_injected["done"] = True
+            raise upgrade_config.WindowsDeleteFailure(
+                "injected_redetach_manifest_verification"
             )
         return real_target_manifest(*args, **kwargs)
 
@@ -1290,6 +1309,11 @@ def test_windows_delete_restore_verification_failure_redetaches_before_global_ro
         if (
             name == target.name
             and named_identity_calls.count(name) == 2
+        ):
+            return False
+        if (
+            redetach_verification_failure == "named_identity"
+            and name.startswith(f".{target.name}.recovery-")
         ):
             return False
         return real_named_identity(*args, **kwargs)
@@ -1327,6 +1351,9 @@ def test_windows_delete_restore_verification_failure_redetaches_before_global_ro
 
     assert not target.exists()
     assert manifest_failure_injected["done"] is True
+    assert redetach_manifest_failure_injected["done"] is (
+        redetach_verification_failure == "manifest"
+    )
     assert target.name in named_identity_calls
     assert len(target_artifact_names) == 2
     retained_paths = manager._ordinary_config_delete_retained_artifacts
@@ -1339,6 +1366,12 @@ def test_windows_delete_restore_verification_failure_redetaches_before_global_ro
     )
     errors = logged_messages(manager, "error")
     assert any(str(retained_path) in message for message in errors)
+    if redetach_verification_failure is not None:
+        assert any(
+            "indeterminate recovery artifact retained" in message
+            and str(retained_path) in message
+            for message in errors
+        )
     assert not any(
         str(target) in message and "retained" in message
         for message in errors

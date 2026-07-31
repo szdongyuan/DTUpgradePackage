@@ -4216,6 +4216,11 @@ class ConfigManager(object):
                 f".{snapshot.destination_name}.recovery-"
                 f"{uuid.uuid4().hex}"
             )
+            candidate_path = os.path.join(
+                snapshot.recovery_path,
+                candidate,
+            )
+            rename_accepted = False
             try:
                 self._delete_validate_before_rename_attempt(
                     ops,
@@ -4231,6 +4236,7 @@ class ConfigManager(object):
                     recovery_handle,
                     candidate,
                 )
+                rename_accepted = True
             except WindowsDeleteFailure as error:
                 if error.category == "rename_collision":
                     continue
@@ -4245,10 +4251,6 @@ class ConfigManager(object):
                     False,
                 )
 
-            candidate_path = os.path.join(
-                snapshot.recovery_path,
-                candidate,
-            )
             try:
                 destination_is_absent = ops.name_is_absent(
                     destination_parent_handle,
@@ -4273,11 +4275,12 @@ class ConfigManager(object):
                     "error",
                     "delete_compatibility recovery re-detach "
                     f"verification failed: {error.category}; "
-                    "retained location indeterminate",
+                    "indeterminate recovery artifact retained: "
+                    f"{candidate_path}",
                 )
                 return _OrdinaryConfigDeleteRestoreResult(
                     False,
-                    None,
+                    candidate_path if rename_accepted else None,
                     False,
                 )
 
@@ -4290,11 +4293,12 @@ class ConfigManager(object):
                     "error",
                     "delete_compatibility recovery re-detach "
                     "verification failed: recovery_binding_indeterminate; "
-                    "retained location indeterminate",
+                    "indeterminate recovery artifact retained: "
+                    f"{candidate_path}",
                 )
                 return _OrdinaryConfigDeleteRestoreResult(
                     False,
-                    None,
+                    candidate_path if rename_accepted else None,
                     False,
                 )
             return _OrdinaryConfigDeleteRestoreResult(
