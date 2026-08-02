@@ -3388,6 +3388,38 @@ def test_successful_managed_root_backup_changes_only_matching_flag(configured_tr
     )
 
 
+def test_managed_root_backup_accepts_parent_segment_in_configured_path(
+    configured_tree,
+    monkeypatch,
+):
+    deployed_target_dir = configured_tree.package_dir.parent
+    deployed_ui_pic_root = deployed_target_dir / "ui" / "ui_pic"
+    deployed_ui_pic_root.mkdir(parents=True)
+    (deployed_ui_pic_root / "marker.txt").write_text(
+        "original deployed ui_pic",
+        encoding="utf-8",
+    )
+    deployed_ui_pic_path = configured_tree.package_dir / ".." / "ui" / "ui_pic"
+    monkeypatch.setattr(
+        upgrade_config,
+        "DEFAULT_TARGET_DIR",
+        directory_path(deployed_target_dir),
+    )
+    monkeypatch.setattr(
+        upgrade_config,
+        "UI_PIC_PATH",
+        directory_path(deployed_ui_pic_path),
+    )
+    manager = make_manager()
+
+    assert manager.backup_config_file(["ui/ui_pic/theme/icon.png"]) is True
+
+    assert manager.ui_pic_flag is False
+    assert (
+        configured_tree.backups["ui_pic"] / "marker.txt"
+    ).read_text(encoding="utf-8") == "original deployed ui_pic"
+
+
 @pytest.mark.parametrize("reporter", ["print", "logger"])
 @pytest.mark.parametrize(
     "exception_type",

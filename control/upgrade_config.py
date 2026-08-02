@@ -1360,9 +1360,17 @@ class ConfigManager(object):
         使用os.path判断parent_path是否为child_path的父路径
         """
         try:
-            common = os.path.commonpath([parent_path, child_path])
-            return os.path.normpath(common) == os.path.normpath(parent_path)
-        except (ValueError, OSError):
+            normalized_parent = os.path.normcase(
+                os.path.normpath(os.path.abspath(parent_path))
+            )
+            normalized_child = os.path.normcase(
+                os.path.normpath(os.path.abspath(child_path))
+            )
+            common = os.path.commonpath(
+                [normalized_parent, normalized_child]
+            )
+            return common == normalized_parent
+        except (TypeError, ValueError, OSError):
             return False
 
     def smart_copy(self, src_path, dst_path):
