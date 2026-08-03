@@ -2,6 +2,8 @@ import datetime
 import os
 import shutil
 import sqlite3
+from pathlib import Path
+
 import yaml
 
 from consts.program_config import DATABASE_PATH, SYSTEM_DATABASE_PATH, BACKUP_DIR, DEFAULT_DIR, TARGET_VERSION, ALL_VERSIONS
@@ -174,20 +176,38 @@ class DataBaseManager:
 
     def check_table_data(self):
         backup_database_path = os.path.join(BACKUP_DIR, "audio_data_backup.db")
-        sql_connect = sqlite3.connect(backup_database_path)
-        for item in self.modify_table_set:
-            original_data = sql_connect.execute(item).fetchall()
-            current_data = self.conn.execute(item).fetchall()
-            original_data_set = set({item[0] for item in original_data})
-            current_data_set = set({item[0] for item in current_data})
-            if original_data_set != current_data_set:
-                self.logger.error(f"{item} 表数据不一致！")
-                print(f"{item} 表数据不一致！")
-                return False
-            else:
+        backup_connection = None
+        result = False
+        try:
+            backup_uri = Path(backup_database_path).resolve().as_uri()
+            backup_connection = sqlite3.connect(
+                f"{backup_uri}?mode=ro",
+                uri=True,
+            )
+            backup_connection.execute("PRAGMA schema_version;").fetchone()
+            result = True
+            for item in self.modify_table_set:
+                original_data = backup_connection.execute(item).fetchall()
+                current_data = self.conn.execute(item).fetchall()
+                original_data_set = set({item[0] for item in original_data})
+                current_data_set = set({item[0] for item in current_data})
+                if original_data_set != current_data_set:
+                    self.logger.error(f"{item} 表数据不一致！")
+                    print(f"{item} 表数据不一致！")
+                    result = False
+                    break
                 print(f"{item} 表数据一致，无需处理！")
-        sql_connect.close()
-        return True
+        except Exception as exc:
+            self._report_safely(f"检查备份数据库失败: {exc}", "error")
+            result = False
+        finally:
+            if backup_connection is not None:
+                try:
+                    backup_connection.close()
+                except Exception as exc:
+                    self._report_safely(f"关闭备份数据库失败: {exc}", "error")
+                    result = False
+        return result
 
     def upgrade(self, current_version=_CURRENT_VERSION_UNSET):
         try:

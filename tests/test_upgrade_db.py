@@ -155,6 +155,210 @@ def read_table_names(path):
         conn.close()
 
 
+def create_comparison_db(path, row_ids):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("CREATE TABLE records (id INTEGER PRIMARY KEY, value TEXT)")
+        conn.executemany(
+            "INSERT INTO records (id, value) VALUES (?, ?)",
+            [(row_id, f"value-{row_id}") for row_id in row_ids],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_check_table_data_accepts_matching_read_only_backup(
+    monkeypatch,
+    local_tmp_path,
+):
+    database_path = local_tmp_path / "audio_data.db"
+    backup_dir = local_tmp_path / "backup"
+    backup_path = backup_dir / "audio_data_backup.db"
+    create_comparison_db(database_path, [1, 2])
+    create_comparison_db(backup_path, [2, 1])
+    monkeypatch.setattr(upgrade_db, "BACKUP_DIR", str(backup_dir))
+    monkeypatch.setattr(
+        upgrade_db.LogManager,
+        "set_log_handler",
+        staticmethod(lambda _name: DummyLogger()),
+    )
+    manager = DataBaseManager(str(database_path))
+    manager.modify_table_set.add("SELECT id FROM records")
+
+    assert manager.check_table_data() is True
+
+    manager.conn.close()
+
+
+def test_check_table_data_missing_backup_fails_without_creating_file(
+    monkeypatch,
+    local_tmp_path,
+):
+    database_path = local_tmp_path / "audio_data.db"
+    backup_dir = local_tmp_path / "backup"
+    backup_dir.mkdir()
+    backup_path = backup_dir / "audio_data_backup.db"
+    create_comparison_db(database_path, [1])
+    monkeypatch.setattr(upgrade_db, "BACKUP_DIR", str(backup_dir))
+    monkeypatch.setattr(
+        upgrade_db.LogManager,
+        "set_log_handler",
+        staticmethod(lambda _name: DummyLogger()),
+    )
+    manager = DataBaseManager(str(database_path))
+    manager.modify_table_set.add("SELECT id FROM records")
+
+    assert manager.check_table_data() is False
+    assert not backup_path.exists()
+
+    manager.conn.close()
+
+
+@pytest.mark.parametrize("failure", ["corrupt", "query"])
+def test_check_table_data_rejects_corrupt_backup_or_query_failure(
+    monkeypatch,
+    local_tmp_path,
+    failure,
+):
+    database_path = local_tmp_path / "audio_data.db"
+    backup_dir = local_tmp_path / "backup"
+    backup_path = backup_dir / "audio_data_backup.db"
+    create_comparison_db(database_path, [1])
+    if failure == "corrupt":
+        backup_dir.mkdir()
+        backup_path.write_bytes(b"not a sqlite database")
+        comparison_sql = "SELECT id FROM records"
+    else:
+        create_comparison_db(backup_path, [1])
+        comparison_sql = "SELECT id FROM missing_table"
+    monkeypatch.setattr(upgrade_db, "BACKUP_DIR", str(backup_dir))
+    monkeypatch.setattr(
+        upgrade_db.LogManager,
+        "set_log_handler",
+        staticmethod(lambda _name: DummyLogger()),
+    )
+    manager = DataBaseManager(str(database_path))
+    manager.modify_table_set.add(comparison_sql)
+
+    assert manager.check_table_data() is False
+
+    manager.conn.close()
+
+
+def test_check_table_data_rejects_mismatched_rows(
+    monkeypatch,
+    local_tmp_path,
+):
+    database_path = local_tmp_path / "audio_data.db"
+    backup_dir = local_tmp_path / "backup"
+    backup_path = backup_dir / "audio_data_backup.db"
+    create_comparison_db(database_path, [1, 2])
+    create_comparison_db(backup_path, [1, 3])
+    monkeypatch.setattr(upgrade_db, "BACKUP_DIR", str(backup_dir))
+    monkeypatch.setattr(
+        upgrade_db.LogManager,
+        "set_log_handler",
+        staticmethod(lambda _name: DummyLogger()),
+    )
+    manager = DataBaseManager(str(database_path))
+    manager.modify_table_set.add("SELECT id FROM records")
+
+    assert manager.check_table_data() is False
+
+    manager.conn.close()
+
+
+@pytest.mark.parametrize("backup_failure", ["missing", "corrupt", "query"])
+def test_upgrade_fails_when_real_backup_checker_cannot_validate(
+    monkeypatch,
+    local_tmp_path,
+    backup_failure,
+):
+    database_path = local_tmp_path / "audio_data.db"
+    backup_dir = local_tmp_path / "backup"
+    backup_path = backup_dir / "audio_data_backup.db"
+    create_comparison_db(database_path, [1])
+    if backup_failure == "missing":
+        backup_dir.mkdir()
+    elif backup_failure == "corrupt":
+        backup_dir.mkdir()
+        backup_path.write_bytes(b"not a sqlite database")
+    else:
+        create_comparison_db(backup_path, [1])
+
+    monkeypatch.setattr(upgrade_db, "BACKUP_DIR", str(backup_dir))
+    monkeypatch.setattr(upgrade_db, "ALL_VERSIONS", ["2.0"])
+    monkeypatch.setattr(upgrade_db, "TARGET_VERSION", "2.0")
+    monkeypatch.setattr(
+        upgrade_db.LogManager,
+        "set_log_handler",
+        staticmethod(lambda _name: DummyLogger()),
+    )
+    manager = DataBaseManager(str(database_path))
+    if backup_failure == "query":
+        manager.modify_table_set.add("SELECT id FROM missing_table")
+
+    assert manager.upgrade("2.0") is False
+    if backup_failure == "missing":
+        assert not backup_path.exists()
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        manager.conn.execute("SELECT 1")
+
+
+@pytest.mark.parametrize(
+    ("outcome", "backup_ids", "comparison_sql", "expected_result"),
+    [
+        ("success", [1, 2], "SELECT id FROM records", True),
+        ("mismatch", [1, 3], "SELECT id FROM records", False),
+        ("exception", [1, 2], "SELECT id FROM missing_table", False),
+    ],
+)
+def test_check_table_data_always_closes_backup_connection(
+    monkeypatch,
+    local_tmp_path,
+    outcome,
+    backup_ids,
+    comparison_sql,
+    expected_result,
+):
+    database_path = local_tmp_path / "audio_data.db"
+    backup_dir = local_tmp_path / "backup"
+    backup_path = backup_dir / "audio_data_backup.db"
+    create_comparison_db(database_path, [1, 2])
+    create_comparison_db(backup_path, backup_ids)
+    monkeypatch.setattr(upgrade_db, "BACKUP_DIR", str(backup_dir))
+    monkeypatch.setattr(
+        upgrade_db.LogManager,
+        "set_log_handler",
+        staticmethod(lambda _name: DummyLogger()),
+    )
+    manager = DataBaseManager(str(database_path))
+    manager.modify_table_set.add(comparison_sql)
+    real_connect = sqlite3.connect
+    backup_connections = []
+    connect_calls = []
+
+    def tracking_connect(database, *args, **kwargs):
+        connect_calls.append((database, kwargs))
+        connection_proxy = ConnectionProxy(
+            real_connect(database, *args, **kwargs)
+        )
+        backup_connections.append(connection_proxy)
+        return connection_proxy
+
+    monkeypatch.setattr(upgrade_db.sqlite3, "connect", tracking_connect)
+
+    assert manager.check_table_data() is expected_result, outcome
+    assert len(backup_connections) == 1
+    assert backup_connections[0].closed is True
+    assert connect_calls[0][1]["uri"] is True
+    assert "mode=ro" in str(connect_calls[0][0])
+
+    manager.conn.close()
+
+
 def test_explicit_target_version_makes_split_audio_database_rerun_a_noop(
     monkeypatch,
     local_tmp_path,
@@ -202,7 +406,10 @@ def test_explicit_target_version_makes_split_audio_database_rerun_a_noop(
         staticmethod(lambda _name: DummyLogger()),
     )
     manager = DataBaseManager(str(database_path))
-    manager.check_table_data = lambda: True
+    backup_dir = local_tmp_path / "backup"
+    backup_dir.mkdir()
+    shutil.copy2(database_path, backup_dir / "audio_data_backup.db")
+    monkeypatch.setattr(upgrade_db, "BACKUP_DIR", str(backup_dir))
 
     assert manager.upgrade(authoritative_version) is True
 
@@ -252,7 +459,10 @@ def test_explicit_older_version_applies_updates_to_connected_audio_database(
         staticmethod(lambda _name: DummyLogger()),
     )
     manager = DataBaseManager(str(database_path))
-    manager.check_table_data = lambda: True
+    backup_dir = local_tmp_path / "backup"
+    backup_dir.mkdir()
+    shutil.copy2(database_path, backup_dir / "audio_data_backup.db")
+    monkeypatch.setattr(upgrade_db, "BACKUP_DIR", str(backup_dir))
 
     assert manager.upgrade("1.0") is True
 
