@@ -91,8 +91,15 @@ class ExeUpgradeManager(object):
             if not isinstance(raw_output_encoding, str) or not raw_output_encoding.strip():
                 return None, "exe 配置 output_encoding 必须是非空字符串", required
             try:
-                output_encoding = codecs.lookup(raw_output_encoding.strip()).name
-            except LookupError:
+                codec_info = codecs.lookup(raw_output_encoding.strip())
+                output_encoding = codec_info.name
+                decoded_probe = b"\xff".decode(
+                    output_encoding,
+                    errors="replace",
+                )
+            except Exception:
+                return None, f"exe 配置 output_encoding 无效或不受支持: {raw_output_encoding}", required
+            if not isinstance(decoded_probe, str):
                 return None, f"exe 配置 output_encoding 无效或不受支持: {raw_output_encoding}", required
 
         copy_to_parent = raw_config.get("copy_to_parent", False)
@@ -257,7 +264,10 @@ class ExeUpgradeManager(object):
             return ""
         if isinstance(output, bytes):
             if output_encoding is not None:
-                return output.decode(output_encoding, errors="replace")
+                try:
+                    return output.decode(output_encoding, errors="replace")
+                except Exception:
+                    return self._normalize_output(output)
 
             try:
                 return output.decode("utf-8")

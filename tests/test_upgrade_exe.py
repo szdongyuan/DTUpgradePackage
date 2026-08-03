@@ -1,4 +1,5 @@
 import builtins
+import codecs
 import locale
 import os
 import shutil
@@ -402,6 +403,130 @@ def test_unknown_output_encoding_is_a_normal_config_error(
         base_dir=str(local_tmp_path),
     ).run() is expected_result
     assert "output_encoding" in logged_text(logger)
+
+
+@pytest.mark.parametrize(
+    "output_encoding",
+    ["hex", "base64_codec", "undefined", "idna"],
+)
+@pytest.mark.parametrize(
+    ("required", "expected_result"),
+    [
+        (True, False),
+        (False, True),
+    ],
+)
+def test_recognized_non_text_or_unsafe_output_encoding_is_rejected(
+    local_tmp_path,
+    monkeypatch,
+    output_encoding,
+    required,
+    expected_result,
+):
+    logger = DummyLogger()
+    calls = []
+    write_version_file(
+        local_tmp_path,
+        {
+            "version": "1.0",
+            "exe": [
+                {
+                    "path": sys.executable,
+                    "output_encoding": output_encoding,
+                    "required": required,
+                }
+            ],
+        },
+    )
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=b"unused stdout",
+            stderr=b"unused stderr",
+        )
+
+    monkeypatch.setattr("control.upgrade_exe.subprocess.run", fake_run)
+
+    assert ExeUpgradeManager(
+        logger,
+        ["1.0"],
+        base_dir=str(local_tmp_path),
+    ).run() is expected_result
+    assert calls == []
+    assert "output_encoding" in logged_text(logger)
+
+
+def test_configured_decoder_failure_has_a_safe_direct_fallback(local_tmp_path):
+    manager = ExeUpgradeManager(DummyLogger(), [], base_dir=str(local_tmp_path))
+
+    assert manager._normalize_output(b"readable utf8", "undefined") == "readable utf8"
+
+
+def test_configured_decoder_runtime_failure_cannot_break_a_successful_run(
+    local_tmp_path,
+    monkeypatch,
+):
+    codec_name = "runtime_surprise_text_codec"
+
+    def encode(value, errors="strict"):
+        return value.encode("utf-8", errors), len(value)
+
+    def decode(value, errors="strict"):
+        value = bytes(value)
+        if value == b"\xff" and errors == "replace":
+            return "\ufffd", len(value)
+        raise RuntimeError("injected runtime decoder failure")
+
+    codec_info = codecs.CodecInfo(
+        name=codec_name,
+        encode=encode,
+        decode=decode,
+        _is_text_encoding=True,
+    )
+
+    def search_codec(encoding):
+        if encoding == codec_name:
+            return codec_info
+        return None
+
+    codecs.register(search_codec)
+    try:
+        logger = DummyLogger()
+        write_version_file(
+            local_tmp_path,
+            {
+                "version": "1.0",
+                "exe": [
+                    {
+                        "path": sys.executable,
+                        "output_encoding": codec_name,
+                    }
+                ],
+            },
+        )
+
+        def fake_run(command, **kwargs):
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=b"runtime stdout",
+                stderr=b"runtime stderr",
+            )
+
+        monkeypatch.setattr("control.upgrade_exe.subprocess.run", fake_run)
+
+        assert ExeUpgradeManager(
+            logger,
+            ["1.0"],
+            base_dir=str(local_tmp_path),
+        ).run() is True
+        assert "runtime stdout" in logged_text(logger)
+        assert "runtime stderr" in logged_text(logger)
+    finally:
+        codecs.unregister(search_codec)
 
 
 def test_configured_output_encoding_is_propagated_to_stdout_and_stderr(
