@@ -4,7 +4,7 @@
 
 **Goal:** Restore replacement-only ordinary configuration behavior so a missing package source is skipped without touching its target, while retaining valid replacements and JSON merge.
 
-**Architecture:** Keep the current upgrade, backup, rollback, staged replacement, and JSON merge infrastructure. Change only the ordinary-operation construction in `ConfigManager.update_config_file`: classify manifest syntax and package source before destination resolution, omit missing-leaf entries, and construct replacement-only operations for present sources. Leave the Windows deletion machinery dormant to avoid a risky broad refactor.
+**Architecture:** Keep the current upgrade, backup, rollback, staged replacement, and JSON merge infrastructure. Change ordinary-operation construction in `ConfigManager.update_config_file`: classify manifest syntax and package source before destination resolution, omit missing-leaf entries, and construct replacement-only operations for present sources. In `_replace_with_staged_ordinary_config`, bind the original source through staging copy and staged-content validation; after that boundary, commit the validated snapshot without consulting the live source or triggering source-driven rollback. Leave the Windows deletion machinery dormant to avoid a risky broad refactor.
 
 **Tech Stack:** Python 3.12, pytest, PyInstaller, Windows filesystem APIs
 
@@ -12,14 +12,14 @@
 
 ## File Structure
 
-- `control/upgrade_config.py`: ordinary configuration source-first operation construction and skip reporting.
+- `control/upgrade_config.py`: ordinary configuration source-first operation construction, skip reporting, and the validated-snapshot boundary in `_replace_with_staged_ordinary_config`.
 - `tests/test_upgrade_config.py`: focused behavior, race, backup-isolation, and JSON merge regression coverage.
 - `tests/test_main.py`: top-level upgrade success/rollback expectation for missing ordinary sources.
 
 ### Task 1: Restore source-first replacement-only behavior
 
 **Files:**
-- Modify: `control/upgrade_config.py` in `ConfigManager.update_config_file`
+- Modify: `control/upgrade_config.py` in `ConfigManager.update_config_file` and `_replace_with_staged_ordinary_config`
 - Modify: `tests/test_upgrade_config.py`
 - Modify: `tests/test_main.py`
 
@@ -44,8 +44,8 @@ Add cases for:
 - `.` and internal `sub/..` aliases with missing derived sources skip, while aliases with present sources continue through destination containment validation;
 - missing `resources/config` parent remains fatal;
 - a source appearing after missing classification remains skipped;
-- a source disappearing after valid classification fails without changing the target;
-- a valid source changing identity after preflight fails without changing the target.
+- a source disappearing or changing identity before staged-snapshot validation completes fails without changing the target;
+- a source changing after staged-snapshot validation does not trigger rollback, and the committed target equals the validated original staged snapshot rather than the later source object.
 
 Update top-level orchestration coverage so missing ordinary sources do not trigger database/config rollback.
 
@@ -81,7 +81,9 @@ destination_path, path_error = self._resolve_ordinary_config_destination(
 )
 ```
 
-Construct only `kind == "replace"` operations. Do not call delete conflict preflight, delete preflight, or delete execution from the active flow. Pass replacement operations to JSON conflict preflight, back up only their relative paths, and preserve execution-time source revalidation before staged replacement.
+Construct only `kind == "replace"` operations. Do not call delete conflict preflight, delete preflight, or delete execution from the active flow. Pass replacement operations to JSON conflict preflight, back up only their relative paths, and preserve source identity/content revalidation through staged-snapshot validation. After the staged snapshot is validated, treat it as the immutable transaction input and do not trigger rollback solely because the live package source changes.
+
+In `_replace_with_staged_ordinary_config`, keep the original expected-state checks at helper entry, before copy, after copy, and through `_ordinary_config_staging_is_safe` plus the stable staged manifest. Remove the later live-source checks from destination commit and recovery transitions. Add tests that change the live source after staged validation and assert a successful commit of the original validated staged bytes for both existing and absent targets.
 
 - [ ] **Step 4: Run focused tests and verify GREEN**
 

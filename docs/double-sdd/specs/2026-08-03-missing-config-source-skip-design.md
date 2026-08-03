@@ -84,10 +84,14 @@ For each version manifest:
 
 Source classification is fixed for the current version-manifest pass. If a
 source appears after it was classified as missing, the entry remains skipped.
-If a valid source disappears or changes identity after preflight, the existing
-execution-time revalidation/staged replacement must fail safely without
-deleting or changing the installed target; ordinary backup state may exist and
-is handled by the existing rollback path.
+For a present source, identity and content must remain consistent from
+preflight through the staging copy and staged-content validation. A change in
+that interval fails without modifying the installed target. Once the staged
+snapshot has been validated against the original source manifest, it becomes
+the immutable transaction input; later changes to the live package source do
+not invalidate committing that already-validated snapshot. This avoids
+triggering target rollback for an object that is no longer read by the
+transaction.
 
 ## Testing
 
@@ -104,8 +108,12 @@ Automated tests must prove:
   normal destination containment validation.
 - A missing `resources/config` source parent remains an error.
 - A source that appears after missing classification remains skipped.
-- A source that disappears or changes identity after valid classification
-  fails without changing or deleting the installed target.
+- A source that disappears or changes identity before staged-snapshot
+  validation completes fails without changing or deleting the installed
+  target.
+- A source that changes after staged-snapshot validation may coexist with a
+  successful commit, but the installed target must equal the validated staged
+  snapshot derived from the original source, never the later source object.
 - A manifest mixing a missing source and a present source skips the former and
   replaces the latter.
 - JSON merge still runs when an ordinary source is skipped.
