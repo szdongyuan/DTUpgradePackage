@@ -1,3 +1,4 @@
+import codecs
 import locale
 import os
 import shutil
@@ -83,6 +84,17 @@ class ExeUpgradeManager(object):
             if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
                 return None, "exe 配置 timeout 必须是大于 0 的数字", required
 
+        if "output_encoding" not in raw_config:
+            output_encoding = None
+        else:
+            raw_output_encoding = raw_config["output_encoding"]
+            if not isinstance(raw_output_encoding, str) or not raw_output_encoding.strip():
+                return None, "exe 配置 output_encoding 必须是非空字符串", required
+            try:
+                output_encoding = codecs.lookup(raw_output_encoding.strip()).name
+            except LookupError:
+                return None, f"exe 配置 output_encoding 无效或不受支持: {raw_output_encoding}", required
+
         copy_to_parent = raw_config.get("copy_to_parent", False)
         if not isinstance(copy_to_parent, bool):
             copy_to_parent = False
@@ -115,6 +127,7 @@ class ExeUpgradeManager(object):
             "args": args,
             "cwd": cwd,
             "timeout": timeout,
+            "output_encoding": output_encoding,
             "required": required,
             "copy_to_parent": copy_to_parent,
             "cleanup_after_run": cleanup_after_run,
@@ -202,13 +215,23 @@ class ExeUpgradeManager(object):
         except subprocess.TimeoutExpired as e:
             message = f"可执行程序执行超时: {config['name']}, 超时时间: {config['timeout']} 秒"
             result_success = self._handle_failure(message, config["required"])
-            self._log_captured_output(config["name"], e.stdout, e.stderr)
+            self._log_captured_output(
+                config["name"],
+                e.stdout,
+                e.stderr,
+                config["output_encoding"],
+            )
         except Exception as e:
             message = f"可执行程序启动失败: {config['name']}, 路径: {run_path}, 错误: {e}"
             result_success = self._handle_failure(message, config["required"])
         else:
             self._log_info(f"可执行程序执行结束: {config['name']}, 退出码: {result.returncode}")
-            self._log_captured_output(config["name"], result.stdout, result.stderr)
+            self._log_captured_output(
+                config["name"],
+                result.stdout,
+                result.stderr,
+                config["output_encoding"],
+            )
             if result.returncode != 0:
                 message = f"可执行程序返回非零退出码: {config['name']}, 退出码: {result.returncode}"
                 result_success = self._handle_failure(message, config["required"])
@@ -221,18 +244,26 @@ class ExeUpgradeManager(object):
                     return False
         return result_success
 
-    def _log_captured_output(self, name, stdout, stderr):
-        stdout_text = self._normalize_output(stdout).rstrip()
-        stderr_text = self._normalize_output(stderr).rstrip()
+    def _log_captured_output(self, name, stdout, stderr, output_encoding=None):
+        stdout_text = self._normalize_output(stdout, output_encoding).rstrip()
+        stderr_text = self._normalize_output(stderr, output_encoding).rstrip()
         if stdout_text:
             self._log_info(f"可执行程序标准输出: {name}\n{stdout_text}")
         if stderr_text:
             self._log_warning(f"可执行程序错误输出: {name}\n{stderr_text}")
 
-    def _normalize_output(self, output):
+    def _normalize_output(self, output, output_encoding=None):
         if output is None:
             return ""
         if isinstance(output, bytes):
+            if output_encoding is not None:
+                return output.decode(output_encoding, errors="replace")
+
+            try:
+                return output.decode("utf-8")
+            except UnicodeDecodeError:
+                pass
+
             local_encodings = []
             seen_encodings = set()
 
@@ -267,36 +298,11 @@ class ExeUpgradeManager(object):
                 add_encoding(getattr(sys.stdout, "encoding", None))
                 add_encoding(getattr(sys.stderr, "encoding", None))
 
-            try:
-                utf8_text = output.decode("utf-8")
-            except UnicodeDecodeError:
-                utf8_text = None
-
-            local_text = None
             for encoding in local_encodings:
                 try:
-                    local_text = output.decode(encoding)
-                    break
+                    return output.decode(encoding)
                 except (LookupError, UnicodeDecodeError):
                     continue
-
-            if utf8_text is not None and local_text is not None:
-                utf8_has_cyrillic = any(
-                    "\u0400" <= character <= "\u052f"
-                    for character in utf8_text
-                )
-                local_has_cjk = any(
-                    "\u3400" <= character <= "\u9fff"
-                    or "\uf900" <= character <= "\ufaff"
-                    for character in local_text
-                )
-                if os.name == "nt" and utf8_has_cyrillic and local_has_cjk:
-                    return local_text
-                return utf8_text
-            if utf8_text is not None:
-                return utf8_text
-            if local_text is not None:
-                return local_text
 
             for encoding in local_encodings:
                 try:

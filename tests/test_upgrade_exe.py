@@ -294,13 +294,19 @@ def test_gbk_process_output_is_decoded_without_mojibake(
         local_tmp_path,
         {
             "version": "1.0",
-            "exe": [{"name": "GBKTool", "path": sys.executable}],
+            "exe": [
+                {
+                    "name": "GBKTool",
+                    "path": sys.executable,
+                    "output_encoding": "gbk",
+                }
+            ],
         },
     )
     logger = DummyLogger()
-    # GBK "硬" is d3 b2, which is also valid UTF-8 for U+04F2.
-    stdout_text = "硬盘数据库升级成功"
-    stderr_text = "本地控制台警告"
+    # These GBK byte pairs are also individually valid UTF-8 sequences.
+    stdout_text = "硬隆垄伪"
+    stderr_text = "垄伪"
 
     def fake_run(command, **kwargs):
         return subprocess.CompletedProcess(
@@ -310,7 +316,6 @@ def test_gbk_process_output_is_decoded_without_mojibake(
             stderr=stderr_text.encode("gbk"),
         )
 
-    monkeypatch.setattr(locale, "getpreferredencoding", lambda _set=False: "gbk")
     monkeypatch.setattr("control.upgrade_exe.subprocess.run", fake_run)
 
     assert ExeUpgradeManager(
@@ -328,6 +333,146 @@ def test_gbk_process_output_is_decoded_without_mojibake(
     assert "\ufffd" not in logs
     assert "\u04f2" not in printed
     assert "\u04f2" not in logs
+
+
+def test_output_encoding_is_validated_and_canonicalized(local_tmp_path):
+    manager = ExeUpgradeManager(DummyLogger(), [], base_dir=str(local_tmp_path))
+
+    config, error, required = manager._normalize_entry(
+        {
+            "path": sys.executable,
+            "output_encoding": " CP936 ",
+        }
+    )
+
+    assert error is None
+    assert required is True
+    assert config["output_encoding"] == "gbk"
+
+
+@pytest.mark.parametrize("output_encoding", [None, "", "   ", 123])
+def test_output_encoding_must_be_a_non_empty_string(
+    local_tmp_path,
+    output_encoding,
+):
+    manager = ExeUpgradeManager(DummyLogger(), [], base_dir=str(local_tmp_path))
+
+    config, error, required = manager._normalize_entry(
+        {
+            "path": sys.executable,
+            "output_encoding": output_encoding,
+        }
+    )
+
+    assert config is None
+    assert "output_encoding" in error
+    assert required is True
+
+
+@pytest.mark.parametrize(
+    ("required", "expected_result"),
+    [
+        (True, False),
+        (False, True),
+    ],
+)
+def test_unknown_output_encoding_is_a_normal_config_error(
+    local_tmp_path,
+    required,
+    expected_result,
+):
+    logger = DummyLogger()
+    write_version_file(
+        local_tmp_path,
+        {
+            "version": "1.0",
+            "exe": [
+                {
+                    "path": sys.executable,
+                    "output_encoding": "not-a-real-codec",
+                    "required": required,
+                }
+            ],
+        },
+    )
+
+    assert ExeUpgradeManager(
+        logger,
+        ["1.0"],
+        base_dir=str(local_tmp_path),
+    ).run() is expected_result
+    assert "output_encoding" in logged_text(logger)
+
+
+def test_configured_output_encoding_is_propagated_to_stdout_and_stderr(
+    local_tmp_path,
+    monkeypatch,
+):
+    write_version_file(
+        local_tmp_path,
+        {
+            "version": "1.0",
+            "exe": [
+                {
+                    "path": sys.executable,
+                    "output_encoding": "cp936",
+                }
+            ],
+        },
+    )
+    manager = ExeUpgradeManager(
+        DummyLogger(),
+        ["1.0"],
+        base_dir=str(local_tmp_path),
+    )
+    observed = []
+    original_normalize_output = manager._normalize_output
+
+    def record_normalize_output(output, output_encoding=None):
+        observed.append((output, output_encoding))
+        return original_normalize_output(output, output_encoding)
+
+    def fake_run(command, **kwargs):
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=b"stdout bytes",
+            stderr=b"stderr bytes",
+        )
+
+    monkeypatch.setattr(manager, "_normalize_output", record_normalize_output)
+    monkeypatch.setattr("control.upgrade_exe.subprocess.run", fake_run)
+
+    assert manager.run() is True
+    assert observed == [
+        (b"stdout bytes", "gbk"),
+        (b"stderr bytes", "gbk"),
+    ]
+
+
+def test_explicit_encoding_deterministically_overrides_valid_utf8_bytes(
+    local_tmp_path,
+):
+    manager = ExeUpgradeManager(DummyLogger(), [], base_dir=str(local_tmp_path))
+
+    assert manager._normalize_output(b"\xc3\xa9", "cp1252") == "\u00c3\u00a9"
+
+
+def test_shipped_hardware_table_exe_declares_gbk_output():
+    version_file = (
+        Path(__file__).parents[1]
+        / "resources"
+        / "version_0.26.07.01.yml"
+    )
+
+    data = yaml.safe_load(version_file.read_text(encoding="utf-8"))
+
+    hardware_entry = next(
+        entry
+        for entry in data["exe"]
+        if entry["name"] == "create_hardware_tables"
+    )
+    assert hardware_entry["output_encoding"] == "gbk"
 
 
 def test_valid_utf8_chinese_wins_when_gbk_is_also_strictly_decodable(

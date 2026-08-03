@@ -1,0 +1,18 @@
+version: "0.26.07.01"
+db:
+    sqls_operate: []
+    data_check:
+        add: []
+        del: []
+ai: []
+ui: []
+config: []
+json_merge:
+    - target: "ui/ui_config/analysis_default_config.json"
+      source: "resources/config/analysis_default_config.json"
+exe:
+    - name: "create_hardware_tables"
+      path: "resources/config/create_hardware_tables.exe"
+      copy_to_parent: true
+      cleanup_after_run: true
+      output_encoding: gbk
