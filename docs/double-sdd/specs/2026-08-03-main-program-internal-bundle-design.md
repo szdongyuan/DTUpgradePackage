@@ -19,7 +19,7 @@ The source dependency path is classified with no destination mutation:
 - Existing real directory: include it in the bundle replacement.
 - Symbolic links, Windows junctions/reparse-point directory aliases, broken links, non-directories, and otherwise invalid directory objects: fail the main-program stage without modifying either destination object.
 
-Directory copying does not follow source symbolic links or junctions. Encountering a link or junction anywhere inside the source tree is a validation failure before commit; only files and real directories rooted within the source `_internal` tree are copied.
+Directory copying does not intentionally follow source symbolic links or junctions. Encountering a link or junction anywhere inside the stable source tree is a validation failure before commit; only files and real directories rooted within the source `_internal` tree are copied. The source package is required to remain unchanged during one serialized invocation. Protection against another process replacing a source entry in the final check-to-enumeration instant requires platform-specific handle traversal and is outside this change.
 
 ## Transactional Replacement
 
@@ -43,9 +43,9 @@ The destination `_internal` is a full replacement. Files that existed only in th
 - Partial executable or directory staging created before a copy failure is removed before returning. If removal fails, the failure message and log identify the retained staging artifact.
 - The existing `run_upgrade()` orchestration treats the returned failure as a main-program-stage failure and performs its existing database/configuration rollback.
 - Logging and console-reporting failures remain best effort and do not change a successful or failed filesystem transaction result.
-- `BaseException` control-flow signals trigger best-effort transaction rollback/cleanup and are then re-raised unchanged; they are never converted into a normal success/failure return.
+- The first `BaseException` control-flow signal encountered triggers best-effort transaction rollback/cleanup and is then re-raised unchanged; it is never converted into a normal success/failure return. Secondary rollback/cleanup failures are reported best effort and do not replace that first control-flow signal. If an ordinary failure is already being handled and rollback/cleanup raises the first `BaseException`, that control-flow signal propagates after remaining best-effort recovery attempts.
 
-The transaction guarantee covers one serialized invocation and failures represented by caught Python exceptions. Cross-process locking, recovery after abrupt process termination or power loss, and reconciliation of artifacts from older invocations are outside this change. The existing upgrade launcher is responsible for preventing concurrent upgrade invocations.
+The transaction guarantee covers one serialized invocation with a stable source package and failures represented by caught Python exceptions. Cross-process locking, concurrent source mutation, recovery after abrupt process termination or power loss, and reconciliation of artifacts from older invocations are outside this change. The existing upgrade launcher is responsible for preventing concurrent upgrade invocations.
 
 ## Safety Boundaries
 
@@ -53,6 +53,7 @@ The transaction guarantee covers one serialized invocation and failures represen
 - Operations use resolved, fixed source/destination roots; no manifest-provided path is introduced.
 - Existing destination directory-like objects are displaced as objects rather than traversed before replacement.
 - Cleanup targets only artifacts created by the current invocation.
+- Staging/recovery links, broken links, and junctions are removed as leaf objects; cleanup never traverses their referents. Real staging/recovery directories owned or displaced by the invocation may be recursively removed.
 - When source `_internal` is absent, any destination `_internal` object—including a directory, file, link, or broken link—is left untouched.
 
 ## Testing
@@ -69,7 +70,8 @@ The transaction guarantee covers one serialized invocation and failures represen
 - Rollback failure reports retained recovery paths without deleting the only recoverable prior object.
 - Cleanup-reporting failures do not mask a successful committed bundle.
 - Logger/console failures remain isolated; control-flow exceptions propagate.
-- `BaseException` during a transaction attempts rollback/cleanup before propagation.
+- `BaseException` at staging, displacement, installation, rollback, or cleanup boundaries attempts all remaining recovery/cleanup before the first control-flow signal propagates unchanged.
+- Recovery cleanup of displaced link/junction objects leaves every external referent untouched.
 - Absent source `_internal` leaves destination `_internal` unchanged for directory and non-directory destination objects.
 - Existing top-level upgrade tests continue to prove that main-program-stage failure triggers orchestration rollback.
 
