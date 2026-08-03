@@ -6052,6 +6052,69 @@ def test_source_swap_during_final_destination_check_aborts_before_commit(
     assert swap_artifacts(target) == []
 
 
+@pytest.mark.parametrize("destination_existed", [True, False])
+def test_source_swap_inside_atomic_commit_move_rolls_back_target(
+    configured_tree,
+    monkeypatch,
+    destination_existed,
+):
+    target = (
+        configured_tree.roots["ui_config"]
+        / f"atomic-source-check-{destination_existed}.bin"
+    )
+    source = configured_tree.config_dir / target.name
+    displaced_source = (
+        configured_tree.config_dir / f".{target.name}.original"
+    )
+    original_target = b"installed target"
+    if destination_existed:
+        target.write_bytes(original_target)
+    source.write_bytes(b"validated replacement")
+    manager = make_manager()
+    expected_source_state, source_error = (
+        manager._ordinary_config_source_state(str(source))
+    )
+    assert source_error is None
+    real_atomic_move = manager._atomic_move_no_replace
+    atomic_move_calls = []
+
+    def swap_before_first_atomic_move_returns(source_path, destination_path):
+        result = real_atomic_move(source_path, destination_path)
+        atomic_move_calls.append((source_path, destination_path))
+        if len(atomic_move_calls) == 1:
+            os.replace(source, displaced_source)
+            source.write_bytes(b"substituted replacement")
+        return result
+
+    monkeypatch.setattr(
+        manager,
+        "_atomic_move_no_replace",
+        swap_before_first_atomic_move_returns,
+    )
+
+    assert manager._replace_with_staged_ordinary_config(
+        str(source),
+        str(target),
+        expected_source_state=expected_source_state,
+    ) is False
+
+    assert len(atomic_move_calls) >= 1
+    if destination_existed:
+        assert target.read_bytes() == original_target
+    else:
+        assert not target.exists()
+    assert swap_artifacts(target) == []
+    errors = logged_messages(manager, "error")
+    assert any(
+        "ordinary_config error: source_path:identity_changed" in message
+        for message in errors
+    )
+    assert any(
+        "配置文件暂存替换失败" in message
+        for message in errors
+    )
+
+
 def test_ordinary_config_concurrent_destination_creation_is_preserved(
     configured_tree,
     monkeypatch,

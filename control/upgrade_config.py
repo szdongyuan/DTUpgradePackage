@@ -3005,6 +3005,10 @@ class ConfigManager(object):
                     destination_path,
                     old_path,
                 )
+                if not source_state_is_current():
+                    raise OSError(
+                        "source changed after recovery transition"
+                    )
                 if not self._ordinary_config_binding_matches(
                     destination_path,
                     initial_destination_binding,
@@ -3054,6 +3058,10 @@ class ConfigManager(object):
                 destination_path,
             )
             staging_path = None
+            if not source_state_is_current():
+                raise OSError(
+                    "source changed after staging transition"
+                )
             if not self._ordinary_config_binding_matches(
                 destination_path,
                 initial_destination_binding,
