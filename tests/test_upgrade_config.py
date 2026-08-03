@@ -4874,6 +4874,57 @@ def test_present_source_preflight_race_fails_without_changing_target(
     ).read_bytes() == b"installed"
 
 
+def test_source_identity_change_at_replacement_helper_boundary_is_rejected(
+    configured_tree,
+    monkeypatch,
+):
+    relative_path = "ui/ui_config/helper-boundary.ini"
+    target = configured_tree.target_dir / relative_path
+    target.write_bytes(b"installed")
+    source = configured_tree.config_dir / target.name
+    source.write_bytes(b"validated package source")
+    displaced_source = (
+        configured_tree.config_dir / "helper-boundary-original.ini"
+    )
+    manager = configure_manifest_manager(
+        configured_tree,
+        [("1.0", {"config": [relative_path], "json_merge": []})],
+    )
+    real_replace = manager._replace_with_staged_ordinary_config
+    race_triggered = {"value": False}
+
+    def swap_before_helper_baseline(
+        source_path,
+        destination_path,
+        *args,
+        **kwargs,
+    ):
+        assert race_triggered["value"] is False
+        race_triggered["value"] = True
+        os.replace(source, displaced_source)
+        source.write_bytes(b"substituted package source")
+        return real_replace(
+            source_path,
+            destination_path,
+            *args,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(
+        manager,
+        "_replace_with_staged_ordinary_config",
+        swap_before_helper_baseline,
+    )
+
+    assert manager.update_config_file() is False
+
+    assert race_triggered["value"] is True
+    assert target.read_bytes() == b"installed"
+    assert (
+        configured_tree.backups["ui_config"] / target.name
+    ).read_bytes() == b"installed"
+
+
 def test_missing_ordinary_source_parent_stays_fatal_before_backup(
     configured_tree,
     monkeypatch,
@@ -5204,7 +5255,8 @@ def test_existing_config_actions_run_before_json_merge_actions(
         events.append(("backup", tuple(paths)))
         return True
 
-    def track_replace(source, target):
+    def track_replace(source, target, *, expected_source_state=None):
+        assert expected_source_state is not None
         events.append(("replace", source, target))
         return True
 
@@ -5677,11 +5729,20 @@ def test_ordinary_update_reporting_is_best_effort_at_transaction_boundaries(
     replacement_calls = []
     real_replacement = manager._replace_with_staged_ordinary_config
 
-    def replacement(source_path, destination_path):
+    def replacement(
+        source_path,
+        destination_path,
+        *,
+        expected_source_state=None,
+    ):
         replacement_calls.append((source_path, destination_path))
         if report_phase == "replacement_failure":
             return False
-        return real_replacement(source_path, destination_path)
+        return real_replacement(
+            source_path,
+            destination_path,
+            expected_source_state=expected_source_state,
+        )
 
     monkeypatch.setattr(
         manager,

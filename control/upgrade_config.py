@@ -2798,6 +2798,8 @@ class ConfigManager(object):
         self,
         source_path,
         destination_path,
+        *,
+        expected_source_state=None,
     ):
         destination_path = os.path.normpath(destination_path)
         parent_path = os.path.dirname(destination_path) or os.curdir
@@ -2817,6 +2819,16 @@ class ConfigManager(object):
         if source_error is not None:
             self._report_ordinary_config_source_error(source_error)
             return False
+        if (
+            expected_source_state is not None
+            and source_state != expected_source_state
+        ):
+            self._report_ordinary_config_source_error(
+                "identity_check_failed"
+            )
+            return False
+        if expected_source_state is not None:
+            source_state = expected_source_state
         expected_source_content = (
             self._ordinary_config_content_manifest(source_state[2])
         )
@@ -6067,6 +6079,9 @@ class ConfigManager(object):
                     if not self._replace_with_staged_ordinary_config(
                         new_config_file_path,
                         target_file_path,
+                        expected_source_state=operation[
+                            "source_state"
+                        ],
                     ):
                         self._report_best_effort(
                             "error",
