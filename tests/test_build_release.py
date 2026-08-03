@@ -210,6 +210,94 @@ def test_missing_executable_fails_before_staging(release_test_root):
     assert not stage.exists()
 
 
+def test_nonzero_pyinstaller_exit_fails_without_staging(release_test_root):
+    resources = write_resources(release_test_root)
+    stage = release_test_root / "failed-build-stage"
+    fake_pyinstaller = release_test_root / "pyinstaller-fails.cmd"
+    fake_pyinstaller.write_text("@echo off\r\nexit /b 23\r\n", encoding="utf-8")
+
+    result = run_build_script(
+        "-PyInstallerExecutable",
+        fake_pyinstaller,
+        "-ExecutableSource",
+        release_test_root / "never-created.exe",
+        "-ResourcesSource",
+        resources,
+        "-StageDirectory",
+        stage,
+        "-PythonExecutable",
+        sys.executable,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "PyInstaller failed with exit code 23" in output
+    assert not stage.exists()
+
+
+def test_successful_pyinstaller_without_executable_fails_without_staging(release_test_root):
+    resources = write_resources(release_test_root)
+    stage = release_test_root / "missing-build-output-stage"
+    fake_pyinstaller = release_test_root / "pyinstaller-no-output.cmd"
+    fake_pyinstaller.write_text("@echo off\r\nexit /b 0\r\n", encoding="utf-8")
+    executable = release_test_root / "not-generated.exe"
+
+    result = run_build_script(
+        "-PyInstallerExecutable",
+        fake_pyinstaller,
+        "-ExecutableSource",
+        executable,
+        "-ResourcesSource",
+        resources,
+        "-StageDirectory",
+        stage,
+        "-PythonExecutable",
+        sys.executable,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "PyInstaller completed but executable source is missing:" in output
+    assert executable.name in output
+    assert not stage.exists()
+
+
+@pytest.mark.parametrize(
+    ("version_yaml", "reason"),
+    [
+        ("versions: [\n", "invalid YAML"),
+        ('versions: ["1"]\ntarget_version: "1"\n', "versions must contain 0.12"),
+    ],
+)
+def test_invalid_staged_version_config_fails_without_release_artifact(
+    release_test_root, version_yaml, reason
+):
+    executable = release_test_root / "fake-main.exe"
+    executable.write_bytes(b"fake")
+    resources = write_resources(release_test_root)
+    (resources / "version.yml").write_text(version_yaml, encoding="utf-8")
+    stage = release_test_root / "invalid-config-stage"
+
+    result = run_build_script(
+        "-SkipBuild",
+        "-ExecutableSource",
+        executable,
+        "-ResourcesSource",
+        resources,
+        "-StageDirectory",
+        stage,
+        "-PythonExecutable",
+        sys.executable,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert reason in output
+    assert "Staged version configuration validation failed" in output
+    assert "Staged release:" not in output
+    assert not stage.exists()
+
+
 @pytest.mark.parametrize("unsafe_stage", [DIST_ROOT, REPO_ROOT])
 def test_stage_must_be_strict_descendant_of_repository_dist(release_test_root, unsafe_stage):
     executable = release_test_root / "fake-main.exe"

@@ -131,6 +131,7 @@ finally {
     Pop-Location
 }
 if (-not $validationSucceeded -or ($null -ne $validationExitCode -and $validationExitCode -ne 0)) {
+    Remove-Item -LiteralPath $stagePath -Recurse -Force
     throw "Staged version configuration validation failed with exit code $validationExitCode"
 }
 
