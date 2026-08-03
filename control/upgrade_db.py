@@ -184,7 +184,13 @@ class DataBaseManager:
                 f"{backup_uri}?mode=ro",
                 uri=True,
             )
-            backup_connection.execute("PRAGMA schema_version;").fetchone()
+            quick_check_rows = backup_connection.execute(
+                "PRAGMA quick_check;"
+            ).fetchall()
+            if quick_check_rows != [("ok",)]:
+                raise sqlite3.DatabaseError(
+                    f"备份数据库 quick_check 失败: {quick_check_rows}"
+                )
             result = True
             for item in self.modify_table_set:
                 original_data = backup_connection.execute(item).fetchall()

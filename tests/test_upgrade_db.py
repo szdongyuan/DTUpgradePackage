@@ -247,6 +247,100 @@ def test_check_table_data_rejects_corrupt_backup_or_query_failure(
     manager.conn.close()
 
 
+def test_quick_check_rejects_parseable_database_with_corrupt_data_page(
+    monkeypatch,
+    local_tmp_path,
+):
+    database_path = local_tmp_path / "audio_data.db"
+    backup_dir = local_tmp_path / "backup"
+    backup_path = backup_dir / "audio_data_backup.db"
+    create_comparison_db(database_path, [1])
+    backup_dir.mkdir()
+    backup_connection = sqlite3.connect(backup_path)
+    try:
+        backup_connection.execute("PRAGMA page_size = 512")
+        backup_connection.execute(
+            "CREATE TABLE damaged (id INTEGER PRIMARY KEY, payload BLOB)"
+        )
+        backup_connection.executemany(
+            "INSERT INTO damaged (payload) VALUES (?)",
+            [(bytes([index % 251]) * 400,) for index in range(100)],
+        )
+        backup_connection.commit()
+        page_size = backup_connection.execute(
+            "PRAGMA page_size"
+        ).fetchone()[0]
+        page_count = backup_connection.execute(
+            "PRAGMA page_count"
+        ).fetchone()[0]
+        root_page = backup_connection.execute(
+            "SELECT rootpage FROM sqlite_master WHERE name = 'damaged'"
+        ).fetchone()[0]
+    finally:
+        backup_connection.close()
+    assert page_count > root_page
+    with backup_path.open("r+b") as backup_file:
+        backup_file.seek((page_count - 1) * page_size)
+        backup_file.write(b"\x00" * page_size)
+
+    readonly_uri = f"{backup_path.resolve().as_uri()}?mode=ro"
+    probe_connection = sqlite3.connect(readonly_uri, uri=True)
+    try:
+        assert probe_connection.execute(
+            "PRAGMA schema_version"
+        ).fetchone() == (1,)
+        try:
+            quick_check_rows = probe_connection.execute(
+                "PRAGMA quick_check"
+            ).fetchall()
+        except sqlite3.DatabaseError:
+            quick_check_rows = []
+        assert quick_check_rows != [("ok",)]
+    finally:
+        probe_connection.close()
+
+    monkeypatch.setattr(upgrade_db, "BACKUP_DIR", str(backup_dir))
+    monkeypatch.setattr(upgrade_db, "ALL_VERSIONS", ["2.0"])
+    monkeypatch.setattr(upgrade_db, "TARGET_VERSION", "2.0")
+    monkeypatch.setattr(
+        upgrade_db.LogManager,
+        "set_log_handler",
+        staticmethod(lambda _name: DummyLogger()),
+    )
+    manager = DataBaseManager(str(database_path))
+    real_connect = sqlite3.connect
+    checker_connections = []
+
+    def tracking_connect(database, *args, **kwargs):
+        connection_proxy = ConnectionProxy(
+            real_connect(database, *args, **kwargs)
+        )
+        checker_connections.append(connection_proxy)
+        return connection_proxy
+
+    with monkeypatch.context() as checker_context:
+        checker_context.setattr(
+            upgrade_db.sqlite3,
+            "connect",
+            tracking_connect,
+        )
+
+        assert manager.check_table_data() is False
+        assert manager.upgrade("2.0") is False
+
+    assert len(checker_connections) == 2
+    assert all(connection.closed for connection in checker_connections)
+    conn = sqlite3.connect(database_path)
+    try:
+        assert conn.execute("SELECT id, value FROM records").fetchall() == [
+            (1, "value-1")
+        ]
+    finally:
+        conn.close()
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        manager.conn.execute("SELECT 1")
+
+
 def test_check_table_data_rejects_mismatched_rows(
     monkeypatch,
     local_tmp_path,
