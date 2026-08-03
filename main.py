@@ -1,7 +1,11 @@
 import os
 import sys
-import shutil
 
+from control.program_bundle import (
+    ProgramBundleError,
+    ProgramBundleResult,
+    replace_program_bundle,
+)
 from control.upgrade_db import DataBaseManager, get_version_database_path, read_current_version_from_db
 from control.upgrade_config import ConfigManager
 from control.upgrade_exe import ExeUpgradeManager
@@ -14,14 +18,34 @@ def update_version_program(
 ):  # local_program_path: 异音软件可执行程序位置     targer_program_path：目标版本可执行程序位置
     _print_safely("正在更新主程序...")
     _log_safely(logger, "info", "正在更新主程序...")
+
+    source_executable = DEFAULT_DIR + "resources/DiTing.exe"
+    destination_executable = DEFAULT_TARGET_DIR + "DiTing.exe"
+    source_internal = DEFAULT_DIR + "resources/_internal"
+    destination_internal = DEFAULT_TARGET_DIR + "_internal"
+
+    def report_warning(message):
+        _print_safely(message)
+        _log_safely(logger, "warning", message)
+
     try:
-        targer_program_path = DEFAULT_DIR + "resources/DiTing.exe"
-        local_program_path = DEFAULT_TARGET_DIR + "DiTing.exe"
-        shutil.copy2(targer_program_path, local_program_path)
-    except Exception as e:
+        result: ProgramBundleResult = replace_program_bundle(
+            source_executable,
+            destination_executable,
+            source_internal,
+            destination_internal,
+            warning_reporter=report_warning,
+        )
+    except ProgramBundleError as e:
         failure_message = f"更新主程序失败: {e}"
         _log_safely(logger, "error", failure_message)
         return False, failure_message
+
+    if result.internal_replaced:
+        internal_message = "主程序 _internal 目录替换成功"
+    else:
+        internal_message = "主程序 _internal 源不存在，跳过目录替换"
+    _log_safely(logger, "info", internal_message)
 
     _print_safely("更新主程序成功")
     _log_safely(logger, "info", "更新主程序成功")

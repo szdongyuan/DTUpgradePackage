@@ -6,6 +6,7 @@ import pytest
 import yaml
 
 import main as upgrade_main
+from control.program_bundle import ProgramBundleError, ProgramBundleResult
 from control import upgrade_config, upgrade_db
 
 
@@ -621,14 +622,178 @@ def test_post_commit_reporting_failures_do_not_block_either_cleanup(
     assert "config_restore" not in scenario.events
 
 
+@pytest.mark.parametrize(
+    ("internal_replaced", "expected_message"),
+    [
+        (False, "主程序 _internal 源不存在，跳过目录替换"),
+        (True, "主程序 _internal 目录替换成功"),
+    ],
+)
+def test_program_bundle_uses_fixed_paths_and_result_driven_logging(
+    monkeypatch,
+    internal_replaced,
+    expected_message,
+):
+    logger = RecordingLogger()
+    calls = []
+
+    def fake_replace_program_bundle(*args, **kwargs):
+        calls.append((args, kwargs))
+        return ProgramBundleResult(internal_replaced=internal_replaced)
+
+    monkeypatch.setattr(upgrade_main, "DEFAULT_DIR", "package-root/")
+    monkeypatch.setattr(upgrade_main, "DEFAULT_TARGET_DIR", "deployed-root/")
+    monkeypatch.setattr(
+        upgrade_main,
+        "replace_program_bundle",
+        fake_replace_program_bundle,
+    )
+
+    assert upgrade_main.update_version_program(logger) == (
+        True,
+        "更新主程序成功",
+    )
+
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args == (
+        "package-root/resources/DiTing.exe",
+        "deployed-root/DiTing.exe",
+        "package-root/resources/_internal",
+        "deployed-root/_internal",
+    )
+    assert set(kwargs) == {"warning_reporter"}
+    assert callable(kwargs["warning_reporter"])
+    assert ("info", expected_message) in logger.messages
+
+
+def test_program_bundle_warning_reports_retained_artifact_without_failing(
+    monkeypatch,
+):
+    logger = RecordingLogger()
+    printed = []
+    retained_path = "deployed-root/.DiTing.exe.program-bundle-recovery-retained"
+
+    def fake_replace_program_bundle(*_args, warning_reporter, **_kwargs):
+        warning_reporter(f"retained recovery artifact: {retained_path}")
+        return ProgramBundleResult(internal_replaced=True)
+
+    monkeypatch.setattr(
+        upgrade_main,
+        "replace_program_bundle",
+        fake_replace_program_bundle,
+    )
+    monkeypatch.setattr(upgrade_main, "print", printed.append, raising=False)
+
+    assert upgrade_main.update_version_program(logger) == (
+        True,
+        "更新主程序成功",
+    )
+
+    warning = f"retained recovery artifact: {retained_path}"
+    assert warning in printed
+    assert ("warning", warning) in logger.messages
+
+
+@pytest.mark.parametrize("control_flow", [KeyboardInterrupt(), SystemExit(7)])
+def test_program_bundle_control_flow_signals_propagate(monkeypatch, control_flow):
+    def fail_bundle(*_args, **_kwargs):
+        raise control_flow
+
+    monkeypatch.setattr(upgrade_main, "replace_program_bundle", fail_bundle)
+
+    with pytest.raises(type(control_flow)) as raised:
+        upgrade_main.update_version_program(RecordingLogger())
+
+    assert raised.value is control_flow
+
+
+def test_program_bundle_error_preserves_retained_artifact_and_required_stage_failure(
+    monkeypatch,
+):
+    real_update_version_program = upgrade_main.update_version_program
+    scenario = install_fake_upgrade(monkeypatch)
+    retained_path = "deployed-root/.DiTing.exe.program-bundle-stage-retained"
+
+    def fail_bundle(*_args, **_kwargs):
+        raise ProgramBundleError(f"retained staging artifact: {retained_path}")
+
+    monkeypatch.setattr(upgrade_main, "replace_program_bundle", fail_bundle)
+    monkeypatch.setattr(
+        upgrade_main,
+        "update_version_program",
+        real_update_version_program,
+    )
+
+    expected_failure = (
+        False,
+        f"更新主程序失败: retained staging artifact: {retained_path}",
+    )
+    assert real_update_version_program(scenario.logger) == expected_failure
+    assert ("error", expected_failure[1]) in scenario.logger.messages
+
+    scenario.events.clear()
+    scenario.logger.messages.clear()
+
+    assert upgrade_main.run_upgrade(scenario.logger) is False
+    assert scenario.events == [
+        "backup_db",
+        "db_upgrade",
+        "config_update",
+        "exe_run",
+        "database_restore",
+        "config_restore",
+    ]
+    assert any(
+        level == "error" and retained_path in message
+        for level, message in scenario.logger.messages
+    )
+
+
+@pytest.mark.parametrize("failing_reporter", ["warning_print", "warning_logger"])
+def test_program_bundle_warning_reporting_failures_are_isolated(
+    monkeypatch,
+    failing_reporter,
+):
+    logger = RecordingLogger()
+
+    def fake_replace_program_bundle(*_args, warning_reporter, **_kwargs):
+        warning_reporter("retained recovery artifact: retained-path")
+        return ProgramBundleResult(internal_replaced=False)
+
+    monkeypatch.setattr(
+        upgrade_main,
+        "replace_program_bundle",
+        fake_replace_program_bundle,
+    )
+    if failing_reporter == "warning_print":
+        monkeypatch.setattr(
+            upgrade_main,
+            "print",
+            lambda _message: (_ for _ in ()).throw(RuntimeError("print failed")),
+            raising=False,
+        )
+    else:
+        monkeypatch.setattr(
+            logger,
+            "warning",
+            lambda _message: (_ for _ in ()).throw(RuntimeError("log failed")),
+        )
+
+    assert upgrade_main.update_version_program(logger) == (
+        True,
+        "更新主程序成功",
+    )
+
+
 @pytest.mark.parametrize("failing_reporter", ["success_print", "success_logger"])
-def test_successful_program_copy_reporting_failure_still_commits_and_cleans_up(
+def test_successful_program_bundle_reporting_failure_still_commits_and_cleans_up(
     tmp_path,
     monkeypatch,
     failing_reporter,
 ):
     real_update_version_program = upgrade_main.update_version_program
-    real_copy2 = upgrade_main.shutil.copy2
+    real_replace_program_bundle = upgrade_main.replace_program_bundle
     scenario = install_fake_upgrade(monkeypatch)
     package_dir = tmp_path / "package"
     target_dir = tmp_path / "target"
@@ -653,11 +818,15 @@ def test_successful_program_copy_reporting_failure_still_commits_and_cleans_up(
         real_update_version_program,
     )
 
-    def recording_copy2(source, destination):
-        scenario.events.append("program_copy")
-        return real_copy2(source, destination)
+    def recording_replace_program_bundle(*args, **kwargs):
+        scenario.events.append("program_bundle")
+        return real_replace_program_bundle(*args, **kwargs)
 
-    monkeypatch.setattr(upgrade_main.shutil, "copy2", recording_copy2)
+    monkeypatch.setattr(
+        upgrade_main,
+        "replace_program_bundle",
+        recording_replace_program_bundle,
+    )
 
     if failing_reporter == "success_print":
         def failing_print(message):
@@ -692,7 +861,7 @@ def test_successful_program_copy_reporting_failure_still_commits_and_cleans_up(
         "db_upgrade",
         "config_update",
         "exe_run",
-        "program_copy",
+        "program_bundle",
         "version_update",
         "database_backup_cleanup",
         "config_backup_cleanup",
