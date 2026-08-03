@@ -464,3 +464,523 @@ def test_rejects_unexpected_destination_leaf_names(tmp_path, index, leaf):
 
     with pytest.raises(ProgramBundleError, match="destination leaf"):
         _replace(paths)
+
+
+def _transaction_artifacts(destination_parent, kind=None):
+    paths = [path for path in destination_parent.iterdir() if ".program-bundle-" in path.name]
+    if kind is not None:
+        paths = [path for path in paths if f"program-bundle-{kind}-" in path.name]
+    return sorted(paths, key=lambda path: path.name)
+
+
+@pytest.mark.parametrize("failure_boundary", ["internal_displacement", "executable_displacement", "internal_install", "executable_install"])
+def test_commit_failure_restores_both_original_destinations(tmp_path, monkeypatch, failure_boundary):
+    paths = _bundle_paths(tmp_path)
+    _write(paths[2] / "new.txt", "new internal")
+    _write(paths[1], "old executable")
+    _write(paths[3] / "old.txt", "old internal")
+    real_replace = program_bundle.os.replace
+    commit_call = 0
+    boundaries = {
+        1: "internal_displacement",
+        2: "executable_displacement",
+        3: "internal_install",
+        4: "executable_install",
+    }
+
+    def fail_at_boundary(source, destination):
+        nonlocal commit_call
+        commit_call += 1
+        if boundaries.get(commit_call) == failure_boundary:
+            raise OSError(f"failed {failure_boundary}")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(program_bundle.os, "replace", fail_at_boundary)
+
+    with pytest.raises(ProgramBundleError, match=failure_boundary):
+        _replace(paths)
+
+    assert paths[1].read_text(encoding="utf-8") == "old executable"
+    assert (paths[3] / "old.txt").read_text(encoding="utf-8") == "old internal"
+    assert not (paths[3] / "new.txt").exists()
+    _assert_no_transaction_artifacts(paths[1].parent)
+
+
+@pytest.mark.parametrize("staging_boundary", ["executable", "internal"])
+def test_staging_failure_removes_partial_artifacts_and_preserves_destinations(tmp_path, monkeypatch, staging_boundary):
+    paths = _bundle_paths(tmp_path)
+    _write(paths[2] / "new.txt", "new internal")
+    _write(paths[1], "old executable")
+    _write(paths[3] / "old.txt", "old internal")
+    if staging_boundary == "executable":
+        real_copy = program_bundle._copy_regular_file
+
+        def fail_executable_copy(source, destination, expected_stat=None):
+            Path(destination).write_text("partial", encoding="utf-8")
+            if Path(source) == paths[0]:
+                raise OSError("failed executable staging")
+            return real_copy(source, destination, expected_stat=expected_stat)
+
+        monkeypatch.setattr(program_bundle, "_copy_regular_file", fail_executable_copy)
+    else:
+        def fail_internal_copy(_source, destination, expected_stat=None):
+            _write(Path(destination) / "partial.txt", "partial")
+            raise OSError("failed internal staging")
+
+        monkeypatch.setattr(program_bundle, "_stage_internal_directory", fail_internal_copy)
+
+    with pytest.raises(ProgramBundleError, match=f"failed {staging_boundary} staging"):
+        _replace(paths)
+
+    assert paths[1].read_text(encoding="utf-8") == "old executable"
+    assert (paths[3] / "old.txt").read_text(encoding="utf-8") == "old internal"
+    _assert_no_transaction_artifacts(paths[1].parent)
+
+
+def test_failed_staging_cleanup_reports_and_retains_exact_artifact(tmp_path, monkeypatch):
+    paths = _bundle_paths(tmp_path)
+    real_remove = program_bundle._remove_leaf
+
+    def fail_copy(_source, destination, expected_stat=None):
+        Path(destination).write_text("partial", encoding="utf-8")
+        raise OSError("copy failed")
+
+    def fail_stage_cleanup(path):
+        if "program-bundle-stage" in Path(path).name:
+            raise OSError("cleanup denied")
+        return real_remove(path)
+
+    monkeypatch.setattr(program_bundle, "_copy_regular_file", fail_copy)
+    monkeypatch.setattr(program_bundle, "_remove_leaf", fail_stage_cleanup)
+
+    with pytest.raises(ProgramBundleError) as raised:
+        _replace(paths)
+
+    retained = _transaction_artifacts(paths[1].parent, "stage")
+    assert len(retained) == 1
+    assert str(retained[0]) in str(raised.value)
+    assert "retained staging artifact" in str(raised.value)
+
+
+@pytest.mark.parametrize("alias_kind", ["symlink", "junction"])
+def test_staging_alias_cleanup_is_leaf_only_and_preserves_external_referent(
+    tmp_path, monkeypatch, alias_kind
+):
+    paths = _bundle_paths(tmp_path)
+    _write(paths[2] / "new.txt", "new internal")
+    external = tmp_path / "external-stage"
+    _write(external / "keep.txt", "keep")
+
+    def substitute_staging_with_alias(_source, destination, expected_stat=None):
+        shutil.rmtree(destination)
+        if alias_kind == "junction":
+            _make_junction(Path(destination), external)
+        else:
+            _make_symlink(Path(destination), external, directory=True)
+        raise OSError("staging failed after substitution")
+
+    monkeypatch.setattr(program_bundle, "_stage_internal_directory", substitute_staging_with_alias)
+
+    with pytest.raises(ProgramBundleError, match="staging failed after substitution"):
+        _replace(paths)
+
+    assert (external / "keep.txt").read_text(encoding="utf-8") == "keep"
+    _assert_no_transaction_artifacts(paths[1].parent)
+
+
+def test_rollback_failure_reports_recovery_and_never_deletes_only_prior_object(tmp_path, monkeypatch):
+    paths = _bundle_paths(tmp_path)
+    _write(paths[2] / "new.txt", "new internal")
+    _write(paths[1], "old executable")
+    _write(paths[3] / "old.txt", "old internal")
+    real_replace = program_bundle.os.replace
+    call = 0
+
+    def fail_install_and_internal_restore(source, destination):
+        nonlocal call
+        call += 1
+        if call == 4:
+            raise OSError("install failed")
+        if "program-bundle-recovery" in Path(source).name and Path(destination) == paths[3]:
+            raise OSError("restore failed")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(program_bundle.os, "replace", fail_install_and_internal_restore)
+
+    with pytest.raises(ProgramBundleError) as raised:
+        _replace(paths)
+
+    retained = _transaction_artifacts(paths[1].parent, "recovery")
+    assert len(retained) == 1
+    assert str(retained[0]) in str(raised.value)
+    assert retained[0].is_dir()
+    assert (retained[0] / "old.txt").read_text(encoding="utf-8") == "old internal"
+    assert paths[1].read_text(encoding="utf-8") == "old executable"
+
+
+def test_removal_failure_keeps_recovery_available_and_reports_it(tmp_path, monkeypatch):
+    paths = _bundle_paths(tmp_path)
+    _write(paths[2] / "new.txt", "new internal")
+    _write(paths[1], "old executable")
+    _write(paths[3] / "old.txt", "old internal")
+    real_replace = program_bundle.os.replace
+    real_remove = program_bundle._remove_leaf
+    replace_call = 0
+
+    def fail_executable_install(source, destination):
+        nonlocal replace_call
+        replace_call += 1
+        if replace_call == 4:
+            raise OSError("install failed")
+        return real_replace(source, destination)
+
+    def fail_installed_internal_removal(path):
+        if Path(path) == paths[3]:
+            raise OSError("cannot remove installed internal")
+        return real_remove(path)
+
+    monkeypatch.setattr(program_bundle.os, "replace", fail_executable_install)
+    monkeypatch.setattr(program_bundle, "_remove_leaf", fail_installed_internal_removal)
+
+    with pytest.raises(ProgramBundleError) as raised:
+        _replace(paths)
+
+    recoveries = _transaction_artifacts(paths[1].parent, "recovery")
+    assert len(recoveries) == 1
+    assert str(recoveries[0]) in str(raised.value)
+    assert (recoveries[0] / "old.txt").read_text(encoding="utf-8") == "old internal"
+
+
+@pytest.mark.parametrize("destination_kind", ["directory", "file", "symlink", "broken_symlink"])
+@pytest.mark.parametrize("failure_boundary", ["staging", "displacement", "installation"])
+def test_absent_source_internal_is_untouched_through_executable_failures(
+    tmp_path, monkeypatch, destination_kind, failure_boundary
+):
+    paths = _bundle_paths(tmp_path)
+    external = tmp_path / "external-internal"
+    if destination_kind == "directory":
+        _write(paths[3] / "old.txt", "old internal")
+    elif destination_kind == "file":
+        _write(paths[3], "old internal")
+    elif destination_kind == "symlink":
+        _write(external / "old.txt", "external old")
+        _make_symlink(paths[3], external, directory=True)
+    else:
+        _make_symlink(paths[3], tmp_path / "missing-external", directory=True)
+    original = paths[3].lstat()
+    _write(paths[1], "old executable")
+    if failure_boundary == "staging":
+        monkeypatch.setattr(
+            program_bundle,
+            "_copy_regular_file",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("staging failure")),
+        )
+    else:
+        real_replace = program_bundle.os.replace
+        call = 0
+
+        def fail_replace(source, destination):
+            nonlocal call
+            call += 1
+            if call == (1 if failure_boundary == "displacement" else 2):
+                raise OSError(f"{failure_boundary} failure")
+            return real_replace(source, destination)
+
+        monkeypatch.setattr(program_bundle.os, "replace", fail_replace)
+
+    with pytest.raises(ProgramBundleError):
+        _replace(paths)
+
+    assert paths[3].lstat().st_ino == original.st_ino
+    if destination_kind == "symlink":
+        assert (external / "old.txt").read_text(encoding="utf-8") == "external old"
+    elif destination_kind == "broken_symlink":
+        assert os.path.lexists(paths[3]) and not paths[3].exists()
+
+
+@pytest.mark.parametrize("alias_kind", ["symlink", "broken_symlink"])
+@pytest.mark.parametrize("cleanup_context", ["success", "rollback"])
+def test_recovery_alias_cleanup_is_leaf_only_and_preserves_external_referent(
+    tmp_path, monkeypatch, alias_kind, cleanup_context
+):
+    paths = _bundle_paths(tmp_path)
+    _write(paths[2] / "new.txt", "new internal")
+    external = tmp_path / "external-old"
+    if alias_kind == "symlink":
+        _write(external / "keep.txt", "keep")
+        _make_symlink(paths[3], external, directory=True)
+    else:
+        _make_symlink(paths[3], tmp_path / "missing-external", directory=True)
+    if cleanup_context == "rollback":
+        real_replace = program_bundle.os.replace
+        call = 0
+
+        def fail_executable_install(source, destination):
+            nonlocal call
+            call += 1
+            if call == 4:
+                raise OSError("install failed")
+            return real_replace(source, destination)
+
+        monkeypatch.setattr(program_bundle.os, "replace", fail_executable_install)
+        with pytest.raises(ProgramBundleError):
+            _replace(paths)
+        assert os.path.lexists(paths[3])
+    else:
+        _replace(paths)
+        assert paths[3].is_dir() and not paths[3].is_symlink()
+    if alias_kind == "symlink":
+        assert (external / "keep.txt").read_text(encoding="utf-8") == "keep"
+    _assert_no_transaction_artifacts(paths[1].parent)
+
+
+def test_recovery_junction_cleanup_is_leaf_only_and_preserves_external_referent(tmp_path):
+    paths = _bundle_paths(tmp_path)
+    _write(paths[2] / "new.txt", "new internal")
+    external = tmp_path / "external-old"
+    _write(external / "keep.txt", "keep")
+    _make_junction(paths[3], external)
+
+    _replace(paths)
+
+    assert (external / "keep.txt").read_text(encoding="utf-8") == "keep"
+    _assert_no_transaction_artifacts(paths[1].parent)
+
+
+def test_absent_source_internal_junction_is_untouched_during_executable_rollback(tmp_path, monkeypatch):
+    paths = _bundle_paths(tmp_path)
+    external = tmp_path / "external-internal"
+    _write(external / "keep.txt", "keep")
+    _make_junction(paths[3], external)
+    _write(paths[1], "old executable")
+    real_replace = program_bundle.os.replace
+    call = 0
+
+    def fail_executable_install(source, destination):
+        nonlocal call
+        call += 1
+        if call == 2:
+            raise OSError("installation failed")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(program_bundle.os, "replace", fail_executable_install)
+
+    with pytest.raises(ProgramBundleError, match="installation failed"):
+        _replace(paths)
+
+    assert paths[3].is_junction()
+    assert (external / "keep.txt").read_text(encoding="utf-8") == "keep"
+    assert paths[1].read_text(encoding="utf-8") == "old executable"
+
+
+@pytest.mark.parametrize("signal", [KeyboardInterrupt("stop"), SystemExit(17)], ids=["interrupt", "system_exit"])
+@pytest.mark.parametrize("boundary", ["staging", "displacement", "installation"])
+def test_control_flow_signal_rolls_back_and_cleans_before_propagating(tmp_path, monkeypatch, signal, boundary):
+    paths = _bundle_paths(tmp_path)
+    _write(paths[2] / "new.txt", "new internal")
+    _write(paths[1], "old executable")
+    _write(paths[3] / "old.txt", "old internal")
+    if boundary == "staging":
+        def signal_during_stage(source, destination, expected_stat):
+            _write(Path(destination) / "partial.txt", "partial")
+            raise signal
+
+        monkeypatch.setattr(program_bundle, "_stage_internal_directory", signal_during_stage)
+    else:
+        real_replace = program_bundle.os.replace
+        call = 0
+
+        def signal_during_replace(source, destination):
+            nonlocal call
+            call += 1
+            target_call = 2 if boundary == "displacement" else 4
+            if call == target_call:
+                raise signal
+            return real_replace(source, destination)
+
+        monkeypatch.setattr(program_bundle.os, "replace", signal_during_replace)
+
+    with pytest.raises(type(signal)) as raised:
+        _replace(paths)
+
+    assert raised.value is signal
+    assert paths[1].read_text(encoding="utf-8") == "old executable"
+    assert (paths[3] / "old.txt").read_text(encoding="utf-8") == "old internal"
+    _assert_no_transaction_artifacts(paths[1].parent)
+
+
+def test_first_control_flow_signal_wins_and_remaining_recovery_is_attempted(tmp_path, monkeypatch):
+    paths = _bundle_paths(tmp_path)
+    _write(paths[2] / "new.txt", "new internal")
+    _write(paths[1], "old executable")
+    _write(paths[3] / "old.txt", "old internal")
+    first = KeyboardInterrupt("first")
+    real_replace = program_bundle.os.replace
+    real_remove = program_bundle._remove_leaf
+    replace_call = 0
+    removed = []
+
+    def signal_during_install(source, destination):
+        nonlocal replace_call
+        replace_call += 1
+        if replace_call == 4:
+            raise first
+        return real_replace(source, destination)
+
+    def secondary_signal_during_cleanup(path):
+        removed.append(Path(path).name)
+        if Path(path) == paths[3]:
+            raise SystemExit(99)
+        return real_remove(path)
+
+    monkeypatch.setattr(program_bundle.os, "replace", signal_during_install)
+    monkeypatch.setattr(program_bundle, "_remove_leaf", secondary_signal_during_cleanup)
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        _replace(paths)
+
+    assert raised.value is first
+    assert any("program-bundle-stage" in name for name in removed)
+    assert paths[1].read_text(encoding="utf-8") == "old executable"
+
+
+def test_control_flow_during_rollback_after_ordinary_failure_propagates_and_recovery_continues(tmp_path, monkeypatch):
+    paths = _bundle_paths(tmp_path)
+    _write(paths[2] / "new.txt", "new internal")
+    _write(paths[1], "old executable")
+    _write(paths[3] / "old.txt", "old internal")
+    first = KeyboardInterrupt("rollback stop")
+    real_replace = program_bundle.os.replace
+    call = 0
+
+    def fail_install_then_signal_restore(source, destination):
+        nonlocal call
+        call += 1
+        if call == 4:
+            raise OSError("ordinary install failure")
+        if "program-bundle-recovery" in Path(source).name and Path(destination) == paths[1]:
+            raise first
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(program_bundle.os, "replace", fail_install_then_signal_restore)
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        _replace(paths)
+
+    assert raised.value is first
+    assert (paths[3] / "old.txt").read_text(encoding="utf-8") == "old internal"
+    assert _transaction_artifacts(paths[1].parent, "recovery")
+
+
+def test_control_flow_during_staging_cleanup_after_ordinary_failure_attempts_all_artifacts(
+    tmp_path, monkeypatch
+):
+    paths = _bundle_paths(tmp_path)
+    _write(paths[2] / "new.txt", "new internal")
+    first = KeyboardInterrupt("cleanup stop")
+    real_remove = program_bundle._remove_leaf
+    attempts = []
+
+    def fail_internal_stage(_source, destination, expected_stat=None):
+        _write(Path(destination) / "partial.txt", "partial")
+        raise OSError("ordinary staging failure")
+
+    def signal_on_first_cleanup(path):
+        attempts.append(Path(path).name)
+        if len(attempts) == 1:
+            raise first
+        return real_remove(path)
+
+    monkeypatch.setattr(program_bundle, "_stage_internal_directory", fail_internal_stage)
+    monkeypatch.setattr(program_bundle, "_remove_leaf", signal_on_first_cleanup)
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        _replace(paths)
+
+    assert raised.value is first
+    assert len(attempts) == 2
+    retained = _transaction_artifacts(paths[1].parent, "stage")
+    assert len(retained) == 1
+
+
+def test_post_commit_cleanup_control_flow_keeps_first_signal_and_attempts_all_artifacts(tmp_path, monkeypatch):
+    paths = _bundle_paths(tmp_path)
+    _write(paths[2] / "new.txt", "new internal")
+    _write(paths[1], "old executable")
+    _write(paths[3] / "old.txt", "old internal")
+    first = KeyboardInterrupt("cleanup stop")
+    real_remove = program_bundle._remove_leaf
+    attempts = []
+
+    def signal_on_first_recovery(path):
+        attempts.append(Path(path).name)
+        if len(attempts) == 1:
+            raise first
+        return real_remove(path)
+
+    monkeypatch.setattr(program_bundle, "_remove_leaf", signal_on_first_recovery)
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        _replace(paths)
+
+    assert raised.value is first
+    assert len(attempts) == 2
+    assert paths[1].read_text(encoding="utf-8") == "new executable"
+    assert (paths[3] / "new.txt").read_text(encoding="utf-8") == "new internal"
+
+
+def test_warning_reporter_control_flow_is_not_swallowed_and_other_cleanup_continues(tmp_path, monkeypatch):
+    paths = _bundle_paths(tmp_path)
+    _write(paths[2] / "new.txt", "new internal")
+    _write(paths[1], "old executable")
+    _write(paths[3] / "old.txt", "old internal")
+    reporter_signal = SystemExit(23)
+    real_remove = program_bundle._remove_leaf
+    cleanup_attempts = 0
+
+    def fail_first_cleanup(path):
+        nonlocal cleanup_attempts
+        cleanup_attempts += 1
+        if cleanup_attempts == 1:
+            raise OSError("cleanup failed")
+        return real_remove(path)
+
+    def reporter(_message):
+        raise reporter_signal
+
+    monkeypatch.setattr(program_bundle, "_remove_leaf", fail_first_cleanup)
+
+    with pytest.raises(SystemExit) as raised:
+        _replace(paths, warning_reporter=reporter)
+
+    assert raised.value is reporter_signal
+    assert cleanup_attempts == 2
+
+
+def test_post_commit_cleanup_failure_warns_with_exact_retained_recovery_path(tmp_path, monkeypatch):
+    paths = _bundle_paths(tmp_path)
+    _write(paths[2] / "new.txt", "new internal")
+    _write(paths[1], "old executable")
+    _write(paths[3] / "old.txt", "old internal")
+    real_remove = program_bundle._remove_leaf
+    cleanup_attempts = 0
+    warnings = []
+
+    def fail_first_cleanup(path):
+        nonlocal cleanup_attempts
+        cleanup_attempts += 1
+        if cleanup_attempts == 1:
+            raise OSError("cleanup failed")
+        return real_remove(path)
+
+    monkeypatch.setattr(program_bundle, "_remove_leaf", fail_first_cleanup)
+
+    result = _replace(paths, warning_reporter=warnings.append)
+
+    retained = _transaction_artifacts(paths[1].parent, "recovery")
+    assert result.internal_replaced is True
+    assert cleanup_attempts == 2
+    assert len(retained) == 1
+    assert warnings == [
+        f"failed to clean retained recovery artifact {retained[0]}: cleanup failed"
+    ]

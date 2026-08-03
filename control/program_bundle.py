@@ -241,29 +241,169 @@ def _report_warning_best_effort(warning_reporter, message):
         return
     try:
         warning_reporter(message)
-    except BaseException:
-        pass
-
-
-def _cleanup_committed_recovery(path, warning_reporter):
-    if path is None:
-        return
-    try:
-        _remove_leaf(path)
-    except Exception as error:
-        _report_warning_best_effort(
-            warning_reporter,
-            f"failed to clean retained recovery artifact {path}: {error}",
-        )
-
-
-def _cleanup_staging_best_effort(path):
-    if path is None:
-        return
-    try:
-        _remove_leaf(path)
     except Exception:
         pass
+
+
+def _remember_control_flow(first_control_flow, error):
+    if first_control_flow is None and not isinstance(error, Exception):
+        return error
+    return first_control_flow
+
+
+def _artifact_exists(path):
+    return path is not None and os.path.lexists(path)
+
+
+def _format_artifacts(kind, paths):
+    if not paths:
+        return None
+    noun = "artifact" if len(paths) == 1 else "artifacts"
+    return f"retained {kind} {noun}: {', '.join(paths)}"
+
+
+def _report_messages(warning_reporter, messages, first_control_flow):
+    for message in messages:
+        try:
+            _report_warning_best_effort(warning_reporter, message)
+        except BaseException as error:
+            first_control_flow = _remember_control_flow(first_control_flow, error)
+    return first_control_flow
+
+
+def _remove_artifact(path, description, problems, first_control_flow):
+    if not _artifact_exists(path):
+        return first_control_flow
+    try:
+        _remove_leaf(path)
+    except BaseException as error:
+        first_control_flow = _remember_control_flow(first_control_flow, error)
+        if _artifact_exists(path):
+            problems.append(f"failed to remove {description} {path}: {error}")
+    return first_control_flow
+
+
+def _restore_recovery(recovery, destination, description, problems, first_control_flow):
+    if not _artifact_exists(recovery):
+        return first_control_flow
+    if _artifact_exists(destination):
+        problems.append(
+            f"cannot restore {description}; destination remains occupied and recovery is retained: "
+            f"{recovery}"
+        )
+        return first_control_flow
+    try:
+        os.replace(recovery, destination)
+    except BaseException as error:
+        first_control_flow = _remember_control_flow(first_control_flow, error)
+        if _artifact_exists(recovery):
+            problems.append(f"failed to restore {description} from {recovery}: {error}")
+    return first_control_flow
+
+
+def _rollback_transaction(state, primary, warning_reporter):
+    first_control_flow = _remember_control_flow(None, primary)
+    problems = []
+
+    if state["executable_installed"]:
+        first_control_flow = _remove_artifact(
+            state["destination_executable"],
+            "newly installed executable",
+            problems,
+            first_control_flow,
+        )
+    if state["internal_installed"]:
+        first_control_flow = _remove_artifact(
+            state["destination_internal"],
+            "newly installed internal directory",
+            problems,
+            first_control_flow,
+        )
+
+    first_control_flow = _restore_recovery(
+        state["executable_recovery"],
+        state["destination_executable"],
+        "prior executable",
+        problems,
+        first_control_flow,
+    )
+    first_control_flow = _restore_recovery(
+        state["internal_recovery"],
+        state["destination_internal"],
+        "prior internal object",
+        problems,
+        first_control_flow,
+    )
+
+    first_control_flow = _remove_artifact(
+        state["staged_executable"],
+        "staging artifact",
+        problems,
+        first_control_flow,
+    )
+    first_control_flow = _remove_artifact(
+        state["staged_internal"],
+        "staging artifact",
+        problems,
+        first_control_flow,
+    )
+
+    retained_staging = [
+        path
+        for path in (state["staged_executable"], state["staged_internal"])
+        if _artifact_exists(path)
+    ]
+    retained_recovery = [
+        path
+        for path in (state["executable_recovery"], state["internal_recovery"])
+        if _artifact_exists(path)
+    ]
+    artifact_messages = [
+        message
+        for message in (
+            _format_artifacts("staging", retained_staging),
+            _format_artifacts("recovery", retained_recovery),
+        )
+        if message is not None
+    ]
+    first_control_flow = _report_messages(
+        warning_reporter,
+        problems + artifact_messages,
+        first_control_flow,
+    )
+
+    if first_control_flow is not None:
+        raise first_control_flow
+
+    detail = str(primary)
+    if not isinstance(primary, ProgramBundleError):
+        detail = f"program bundle replacement failed: {detail}"
+    additions = problems + artifact_messages
+    if additions:
+        detail = f"{detail}; {'; '.join(additions)}"
+    raise ProgramBundleError(detail) from primary
+
+
+def _cleanup_after_commit(recovery_paths, warning_reporter):
+    first_control_flow = None
+    messages = []
+    for recovery in recovery_paths:
+        if not _artifact_exists(recovery):
+            continue
+        try:
+            _remove_leaf(recovery)
+        except BaseException as error:
+            first_control_flow = _remember_control_flow(first_control_flow, error)
+            if _artifact_exists(recovery):
+                messages.append(f"failed to clean retained recovery artifact {recovery}: {error}")
+
+    first_control_flow = _report_messages(
+        warning_reporter,
+        messages,
+        first_control_flow,
+    )
+    if first_control_flow is not None:
+        raise first_control_flow
 
 
 def replace_program_bundle(
@@ -284,46 +424,56 @@ def replace_program_bundle(
     internal_participates = internal_stat is not None
     destination_parent = os.path.dirname(destination_executable)
 
-    staged_executable = None
-    staged_internal = None
-    executable_recovery = None
-    internal_recovery = None
-    committed = False
+    state = {
+        "destination_executable": destination_executable,
+        "destination_internal": destination_internal,
+        "staged_executable": None,
+        "staged_internal": None,
+        "executable_recovery": None,
+        "internal_recovery": None,
+        "executable_installed": False,
+        "internal_installed": False,
+    }
     try:
-        executable_descriptor, staged_executable = tempfile.mkstemp(
+        executable_descriptor, state["staged_executable"] = tempfile.mkstemp(
             prefix=f".{os.path.basename(destination_executable)}.program-bundle-stage-",
             dir=destination_parent,
         )
         os.close(executable_descriptor)
-        _copy_regular_file(source_executable, staged_executable, expected_stat=executable_stat)
+        _copy_regular_file(
+            source_executable,
+            state["staged_executable"],
+            expected_stat=executable_stat,
+        )
 
         if internal_participates:
-            staged_internal = tempfile.mkdtemp(
+            state["staged_internal"] = tempfile.mkdtemp(
                 prefix=f".{os.path.basename(destination_internal)}.program-bundle-stage-",
                 dir=destination_parent,
             )
-            _stage_internal_directory(source_internal, staged_internal, expected_stat=internal_stat)
+            _stage_internal_directory(
+                source_internal,
+                state["staged_internal"],
+                expected_stat=internal_stat,
+            )
 
         if internal_participates:
-            internal_recovery = _move_destination_to_recovery(destination_internal)
-        executable_recovery = _move_destination_to_recovery(destination_executable)
+            state["internal_recovery"] = _move_destination_to_recovery(destination_internal)
+        state["executable_recovery"] = _move_destination_to_recovery(destination_executable)
 
         if internal_participates:
-            os.replace(staged_internal, destination_internal)
-            staged_internal = None
-        os.replace(staged_executable, destination_executable)
-        staged_executable = None
-        committed = True
-    except ProgramBundleError:
-        raise
-    except Exception as error:
-        raise ProgramBundleError(f"program bundle replacement failed: {error}") from error
-    finally:
-        _cleanup_staging_best_effort(staged_executable)
-        _cleanup_staging_best_effort(staged_internal)
+            os.replace(state["staged_internal"], destination_internal)
+            state["staged_internal"] = None
+            state["internal_installed"] = True
+        os.replace(state["staged_executable"], destination_executable)
+        state["staged_executable"] = None
+        state["executable_installed"] = True
+    except BaseException as error:
+        _rollback_transaction(state, error, warning_reporter)
 
-    if committed:
-        _cleanup_committed_recovery(executable_recovery, warning_reporter)
-        _cleanup_committed_recovery(internal_recovery, warning_reporter)
+    _cleanup_after_commit(
+        (state["executable_recovery"], state["internal_recovery"]),
+        warning_reporter,
+    )
 
     return ProgramBundleResult(internal_replaced=internal_participates)
