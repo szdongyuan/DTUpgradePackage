@@ -191,20 +191,9 @@ def test_run_upgrade_uses_default_logger_and_orders_commit_before_cleanup(monkey
     ]
 
 
-@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
-@pytest.mark.parametrize(
-    "failure_stage",
-    [
-        "config_transaction",
-        "executable",
-        "program",
-        "version_persistence",
-    ],
-)
-def test_real_compatibility_delete_is_restored_after_later_stage_failure(
+def test_missing_ordinary_source_does_not_trigger_orchestration_rollback(
     monkeypatch,
     tmp_path,
-    failure_stage,
 ):
     target_dir = tmp_path / "target"
     package_dir = tmp_path / "package"
@@ -249,26 +238,14 @@ def test_real_compatibility_delete_is_restored_after_later_stage_failure(
     def directory_path(path):
         return str(path) + os.sep
 
-    monkeypatch.setattr(
-        upgrade_config,
-        "DEFAULT_DIR",
-        directory_path(package_dir),
-    )
+    monkeypatch.setattr(upgrade_config, "DEFAULT_DIR", directory_path(package_dir))
     monkeypatch.setattr(
         upgrade_config,
         "DEFAULT_TARGET_DIR",
         directory_path(target_dir),
     )
-    monkeypatch.setattr(
-        upgrade_config,
-        "CONFIG_DIR",
-        directory_path(config_dir),
-    )
-    monkeypatch.setattr(
-        upgrade_config,
-        "BACKUP_DIR",
-        directory_path(backup_dir),
-    )
+    monkeypatch.setattr(upgrade_config, "CONFIG_DIR", directory_path(config_dir))
+    monkeypatch.setattr(upgrade_config, "BACKUP_DIR", directory_path(backup_dir))
     monkeypatch.setattr(
         upgrade_config,
         "UI_PIC_PATH",
@@ -314,53 +291,23 @@ def test_real_compatibility_delete_is_restored_after_later_stage_failure(
 
     logger = RecordingLogger()
     managers = []
-    failure_observed = []
     database_events = []
+    config_rollback_calls = []
 
     def actual_config_manager(supplied_logger, current_version):
         manager = upgrade_config.ConfigManager(
             supplied_logger,
             current_version,
         )
-        if failure_stage == "config_transaction":
-            real_named_identity = manager._delete_verify_named_identity
-            injected = {"done": False}
-
-            def interrupt_post_detach_verification(
-                ops,
-                owner,
-                parent_handle,
-                name,
-                snapshot,
-            ):
-                if not injected["done"] and name != ui_pic.name:
-                    injected["done"] = True
-                    observe_failure("config_transaction")
-                    raise RuntimeError(
-                        "injected config transaction failure"
-                    )
-                return real_named_identity(
-                    ops,
-                    owner,
-                    parent_handle,
-                    name,
-                    snapshot,
-                )
-
-            manager._delete_verify_named_identity = (
-                interrupt_post_detach_verification
-            )
+        manager.restore_config = lambda: (
+            config_rollback_calls.append("restore") or True
+        )
         managers.append(manager)
         return manager
 
-    def observe_failure(stage):
-        assert stage == failure_stage
-        assert not ui_pic.exists()
-        failure_observed.append(stage)
-
-    class LaterFailureDataBaseManager:
-        def __init__(self, path):
-            self.path = path
+    class SuccessfulDataBaseManager:
+        def __init__(self, _path):
+            pass
 
         @staticmethod
         def backup_db():
@@ -373,55 +320,34 @@ def test_real_compatibility_delete_is_restored_after_later_stage_failure(
             return True
 
         def upgrade(self):
+            database_events.append("upgrade")
             return True
 
         def update_version(self):
-            if failure_stage == "version_persistence":
-                observe_failure("version_persistence")
-                return False
+            database_events.append("update_version")
             return True
 
-    class LaterFailureExeUpgradeManager:
+    class SuccessfulExeUpgradeManager:
         def __init__(self, _logger, _versions):
             pass
 
-        def run(self):
-            if failure_stage == "executable":
-                observe_failure("executable")
-                return False
+        @staticmethod
+        def run():
             return True
 
-    def later_failure_program(_logger):
-        if failure_stage == "program":
-            observe_failure("program")
-            return False, "injected program failure"
-        return True, "ok"
-
-    monkeypatch.setattr(
-        upgrade_main,
-        "DataBaseManager",
-        LaterFailureDataBaseManager,
-    )
-    monkeypatch.setattr(
-        upgrade_main,
-        "ConfigManager",
-        actual_config_manager,
-    )
+    monkeypatch.setattr(upgrade_main, "DataBaseManager", SuccessfulDataBaseManager)
+    monkeypatch.setattr(upgrade_main, "ConfigManager", actual_config_manager)
     monkeypatch.setattr(
         upgrade_main,
         "ExeUpgradeManager",
-        LaterFailureExeUpgradeManager,
+        SuccessfulExeUpgradeManager,
     )
     monkeypatch.setattr(
         upgrade_main,
         "update_version_program",
-        later_failure_program,
+        lambda _logger: (True, "ok"),
     )
-    monkeypatch.setattr(
-        upgrade_main,
-        "get_current_version",
-        lambda: "0.0",
-    )
+    monkeypatch.setattr(upgrade_main, "get_current_version", lambda: "0.0")
     monkeypatch.setattr(
         upgrade_main,
         "get_version_database_path",
@@ -430,11 +356,11 @@ def test_real_compatibility_delete_is_restored_after_later_stage_failure(
     monkeypatch.setattr(upgrade_main, "DATABASE_PATH", "database.db")
     monkeypatch.setattr(upgrade_main, "BACKUP_DIR", str(backup_dir))
 
-    assert upgrade_main.run_upgrade(logger) is False
+    assert upgrade_main.run_upgrade(logger) is True
 
-    assert failure_observed == [failure_stage]
     assert len(managers) == 1
-    assert managers[0]._ordinary_config_delete_retained_artifacts == set()
+    assert database_events == ["backup", "upgrade", "update_version"]
+    assert config_rollback_calls == []
     assert {
         path.relative_to(ui_pic).as_posix(): (
             "directory" if path.is_dir() else path.read_bytes()
@@ -442,14 +368,15 @@ def test_real_compatibility_delete_is_restored_after_later_stage_failure(
         for path in sorted(ui_pic.rglob("*"))
     } == original_tree
     assert not backups["ui_pic"].exists()
-    recovery_dir = backup_dir / "recovery"
-    assert recovery_dir.is_dir()
-    assert list(recovery_dir.iterdir()) == []
-    assert database_events == ["backup", "restore"]
-    assert not any(
-        "retained recovery object" in message
+    assert any(
+        "配置源不存在，跳过: ui/ui_pic" in message
         for _level, message in logger.messages
     )
+    assert not any(
+        "delete_compatibility selected" in message
+        for _level, message in logger.messages
+    )
+
 
 
 def create_orchestration_version_db(

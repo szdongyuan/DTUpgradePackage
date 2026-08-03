@@ -2939,18 +2939,20 @@ def test_windows_delete_restore_verification_failure_redetaches_before_global_ro
         "rename_relative_no_replace",
         record_rename,
     )
-    real_delete = manager._delete_ordinary_config_compatibility
-
-    def delete_with_injected_ops(snapshot):
-        return real_delete(snapshot, handle_ops=ops)
-
-    monkeypatch.setattr(
-        manager,
-        "_delete_ordinary_config_compatibility",
-        delete_with_injected_ops,
+    source = configured_tree.config_dir / target.name
+    snapshot, error = manager._preflight_ordinary_config_delete(
+        str(target),
+        str(source),
     )
+    assert error is None
+    assert manager.backup_config_file(
+        ["ui/ui_config/restore-location.bin"]
+    ) is True
 
-    assert manager.update_config_file() is False
+    assert manager._delete_ordinary_config_compatibility(
+        snapshot,
+        handle_ops=ops,
+    ) is False
 
     assert not target.exists()
     assert manifest_failure_injected["done"] is True
@@ -3025,7 +3027,9 @@ def test_windows_delete_transaction_partial_cleanup_retains_and_reports_artifact
     def fail_second_disposition(handle):
         calls.append(handle)
         if len(calls) == 2:
-            raise upgrade_config.WindowsDeleteFailure("injected_cleanup_failure")
+            raise upgrade_config.WindowsDeleteFailure(
+                "injected_cleanup_failure"
+            )
         return real_disposition(handle)
 
     monkeypatch.setattr(
@@ -3039,15 +3043,23 @@ def test_windows_delete_transaction_partial_cleanup_retains_and_reports_artifact
         handle_ops=ops,
     ) is False
 
-    artifacts = list((configured_tree.backup_dir / "recovery").iterdir())
+    artifacts = list(
+        (configured_tree.backup_dir / "recovery").iterdir()
+    )
     assert len(artifacts) == 1
     assert not target.exists()
-    assert str(artifacts[0]) in manager._ordinary_config_delete_retained_artifacts
+    assert (
+        str(artifacts[0])
+        in manager._ordinary_config_delete_retained_artifacts
+    )
     assert any(
         str(artifacts[0]) in message and "retained" in message
         for message in logged_messages(manager, "error")
     )
-    assert not any("delete_compatibility success" in message for message in logged_messages(manager))
+    assert not any(
+        "delete_compatibility success" in message
+        for message in logged_messages(manager)
+    )
 
 
 def test_delete_recovery_global_rollback_failure_reports_every_retained_path(
@@ -4597,18 +4609,81 @@ def test_ordinary_config_managed_root_entry_is_backed_up_and_replaced(
     )
 
 
-@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
-def test_missing_ordinary_source_compatibility_delete_backs_up_and_removes_root(
+def test_missing_ordinary_source_is_informational_skip_without_target_work(
     configured_tree,
+    monkeypatch,
 ):
     target_root = configured_tree.roots["ui_pic"]
+    original_tree = snapshot_tree(target_root)
+    manager = configure_manifest_manager(
+        configured_tree,
+        [("1.0", {"config": ["ui/ui_pic"], "json_merge": []})],
+    )
+    calls = []
+
+    monkeypatch.setattr(
+        manager,
+        "_resolve_ordinary_config_destination",
+        lambda _path: calls.append("destination") or (None, "unexpected"),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_preflight_ordinary_config_delete_conflicts",
+        lambda _operations: calls.append("delete_conflicts") or True,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_preflight_ordinary_config_delete",
+        lambda *_args: calls.append("delete_preflight") or (None, None),
+    )
+    monkeypatch.setattr(
+        manager,
+        "backup_config_file",
+        lambda _paths: calls.append("backup") or True,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_replace_with_staged_ordinary_config",
+        lambda *_args: calls.append("replace") or True,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_delete_ordinary_config_compatibility",
+        lambda *_args: calls.append("delete") or True,
+    )
+
+    assert manager.update_config_file() is True
+
+    assert calls == []
+    assert snapshot_tree(target_root) == original_tree
+    assert not configured_tree.backups["ui_pic"].exists()
+    assert any(
+        "配置源不存在，跳过: ui/ui_pic" in message
+        for message in logged_messages(manager, "info")
+    )
+    assert not any(
+        "delete_compatibility selected" in message
+        for message in logged_messages(manager)
+    )
+
+
+def test_missing_and_present_ordinary_sources_skip_then_replace(
+    configured_tree,
+):
+    missing_target = configured_tree.roots["ui_pic"]
+    original_missing_tree = snapshot_tree(missing_target)
+    relative_path = "ui/ui_config/mic_channel_calibration.json"
+    present_target = configured_tree.target_dir / relative_path
+    present_target.write_bytes(b"installed calibration")
+    present_source = configured_tree.config_dir / present_target.name
+    present_source.write_bytes(b"package calibration")
     manager = configure_manifest_manager(
         configured_tree,
         [
             (
                 "1.0",
                 {
-                    "config": ["ui/ui_pic"],
+                    "config": ["ui/ui_pic", relative_path],
                     "json_merge": [],
                 },
             )
@@ -4617,119 +4692,189 @@ def test_missing_ordinary_source_compatibility_delete_backs_up_and_removes_root(
 
     assert manager.update_config_file() is True
 
-    assert not target_root.exists()
+    assert snapshot_tree(missing_target) == original_missing_tree
+    assert present_target.read_bytes() == b"package calibration"
+    assert not configured_tree.backups["ui_pic"].exists()
     assert (
-        configured_tree.backups["ui_pic"] / "marker.txt"
-    ).read_text(encoding="utf-8") == "original ui_pic"
-    assert manager.ui_pic_flag is False
-    assert any(
-        "delete_compatibility success" in message
-        for message in logged_messages(manager, "info")
-    )
-    assert not any(
-        "source_path:missing_path" in message
-        for message in logged_messages(manager)
-    )
+        configured_tree.backups["ui_config"] / present_target.name
+    ).read_bytes() == b"installed calibration"
 
 
-@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
-@pytest.mark.parametrize(
-    ("relative_path", "target_kind"),
-    [
-        ("ui/ui_config/obsolete.ini", "file"),
-        ("ui/ui_config/already-absent", "absent-child"),
-        ("ui/ui_pic", "absent-root"),
-        ("ui/ui_pic/already-absent", "absent-descendant"),
-    ],
-)
-def test_missing_ordinary_source_compatibility_delete_file_and_noop_cases(
+def test_json_merge_runs_when_ordinary_source_is_skipped(
     configured_tree,
-    relative_path,
-    target_kind,
 ):
-    target = configured_tree.target_dir / Path(relative_path)
-    if target_kind == "file":
-        target.write_bytes(b"obsolete")
-    elif target_kind in {"absent-root", "absent-descendant"}:
-        shutil.rmtree(configured_tree.roots["ui_pic"])
+    missing_target = configured_tree.roots["ui_pic"]
+    original_missing_tree = snapshot_tree(missing_target)
+    merge_target = write_json(
+        configured_tree.roots["ui_config"] / "settings.json",
+        {"retained": True},
+    )
+    merge_source = write_json(
+        configured_tree.config_dir / "patch.json",
+        {"appended": "value"},
+    )
     manager = configure_manifest_manager(
         configured_tree,
-        [("1.0", {"config": [relative_path], "json_merge": []})],
+        [
+            (
+                "1.0",
+                {
+                    "config": ["ui/ui_pic"],
+                    "json_merge": [
+                        {
+                            "target": "ui/ui_config/settings.json",
+                            "source": "resources/config/patch.json",
+                        }
+                    ],
+                },
+            )
+        ],
     )
 
     assert manager.update_config_file() is True
 
-    assert not target.exists()
-    if target_kind in {"absent-root", "absent-descendant"}:
-        assert not configured_tree.backups["ui_pic"].exists()
-        assert manager.ui_pic_flag is True
-    else:
-        assert configured_tree.backups["ui_config"].exists()
-        assert manager.ui_config_flag is False
-    expected_outcome = (
-        "delete_compatibility success"
-        if target_kind == "file"
-        else "delete_compatibility no-op"
-    )
-    assert any(
-        expected_outcome in message
-        for message in logged_messages(manager, "info")
-    )
-    assert not any(
-        "source_path:missing_path" in message
-        for message in logged_messages(manager)
-    )
+    assert snapshot_tree(missing_target) == original_missing_tree
+    assert json.loads(merge_target.read_text(encoding="utf-8")) == {
+        "retained": True,
+        "appended": "value",
+    }
+    assert merge_source.exists()
+    assert not configured_tree.backups["ui_pic"].exists()
 
 
 @pytest.mark.parametrize(
-    ("platform_name", "expected_category"),
+    "config_entry",
     [
-        ("not-windows", "unsupported_platform"),
-        ("nt-without-bindings", "unsupported_api"),
+        "ui/ui_config/./optional.ini",
+        "ui/ui_config/optional/sub/..",
     ],
+    ids=["dot-component", "internal-parent-component"],
 )
-def test_compatibility_delete_platform_or_api_failure_precedes_backup(
+def test_missing_source_path_aliases_skip_before_destination_resolution(
     configured_tree,
     monkeypatch,
-    platform_name,
-    expected_category,
+    config_entry,
 ):
-    target = configured_tree.roots["ui_pic"]
-    original = snapshot_tree(target)
-    if platform_name == "not-windows":
-        ops = upgrade_config.WindowsHandleOps(
-            platform_name="not-windows"
-        )
-    else:
-        ops = upgrade_config.WindowsHandleOps(platform_name="nt")
-        monkeypatch.setattr(ops, "_load_bindings", lambda: False)
-    monkeypatch.setattr(upgrade_config, "WindowsHandleOps", lambda: ops)
-    backup_calls = []
     manager = configure_manifest_manager(
         configured_tree,
-        [("1.0", {"config": ["ui/ui_pic"], "json_merge": []})],
+        [("1.0", {"config": [config_entry], "json_merge": []})],
     )
+    destination_calls = []
     monkeypatch.setattr(
         manager,
-        "backup_config_file",
-        lambda paths: backup_calls.append(tuple(paths)) or True,
+        "_resolve_ordinary_config_destination",
+        lambda _path: destination_calls.append(_path) or (None, "unexpected"),
+    )
+
+    assert manager.update_config_file() is True
+
+    assert destination_calls == []
+
+
+def test_present_dot_alias_reaches_destination_containment_validation(
+    configured_tree,
+    monkeypatch,
+):
+    manager = configure_manifest_manager(
+        configured_tree,
+        [("1.0", {"config": ["."], "json_merge": []})],
+    )
+    destination_calls = []
+    real_resolve_destination = manager._resolve_ordinary_config_destination
+
+    def track_destination(path):
+        destination_calls.append(path)
+        return real_resolve_destination(path)
+
+    monkeypatch.setattr(
+        manager,
+        "_resolve_ordinary_config_destination",
+        track_destination,
     )
 
     assert manager.update_config_file() is False
 
-    assert backup_calls == []
-    assert snapshot_tree(target) == original
+    assert destination_calls == ["."]
     assert any(
-        f"delete_compatibility:{expected_category}" in message
+        "ordinary_config error: destination_path:outside_allowed_root" in message
         for message in logged_messages(manager, "error")
     )
-    assert not any(
-        "source_path:missing_path" in message
-        for message in logged_messages(manager)
+
+
+def test_source_appearing_after_missing_classification_remains_skipped(
+    configured_tree,
+    monkeypatch,
+):
+    source = configured_tree.config_dir / "ui_pic"
+    target = configured_tree.roots["ui_pic"]
+    original_tree = snapshot_tree(target)
+    manager = configure_manifest_manager(
+        configured_tree,
+        [("1.0", {"config": ["ui/ui_pic"], "json_merge": []})],
+    )
+    real_resolve_source = manager._resolve_ordinary_config_source
+    resolve_calls = []
+
+    def appear_after_classification(path):
+        result = real_resolve_source(path)
+        resolve_calls.append(result)
+        if len(resolve_calls) == 1:
+            source.mkdir()
+            source.joinpath("appeared.txt").write_bytes(b"appeared")
+        return result
+
+    monkeypatch.setattr(
+        manager,
+        "_resolve_ordinary_config_source",
+        appear_after_classification,
     )
 
+    assert manager.update_config_file() is True
 
-def test_compatibility_delete_missing_source_parent_stays_fatal_before_backup(
+    assert len(resolve_calls) == 1
+    assert resolve_calls[0][1] == "missing_path"
+    assert snapshot_tree(target) == original_tree
+    assert not configured_tree.backups["ui_pic"].exists()
+
+
+@pytest.mark.parametrize("race_kind", ["disappears", "identity_changes"])
+def test_present_source_preflight_race_fails_without_changing_target(
+    configured_tree,
+    monkeypatch,
+    race_kind,
+):
+    relative_path = "ui/ui_config/race.ini"
+    target = configured_tree.target_dir / relative_path
+    target.write_bytes(b"installed")
+    source = configured_tree.config_dir / target.name
+    source.write_bytes(b"validated package source")
+    displaced_source = configured_tree.config_dir / "race-original.ini"
+    manager = configure_manifest_manager(
+        configured_tree,
+        [("1.0", {"config": [relative_path], "json_merge": []})],
+    )
+    real_backup = manager.backup_config_file
+
+    def race_after_preflight(paths):
+        assert real_backup(paths) is True
+        if race_kind == "disappears":
+            source.unlink()
+        else:
+            os.replace(source, displaced_source)
+            source.write_bytes(b"substituted package source")
+        return True
+
+    monkeypatch.setattr(manager, "backup_config_file", race_after_preflight)
+
+    assert manager.update_config_file() is False
+
+    assert target.read_bytes() == b"installed"
+    assert (
+        configured_tree.backups["ui_config"] / target.name
+    ).read_bytes() == b"installed"
+
+
+def test_missing_ordinary_source_parent_stays_fatal_before_backup(
     configured_tree,
     monkeypatch,
 ):
@@ -4752,375 +4897,6 @@ def test_compatibility_delete_missing_source_parent_stays_fatal_before_backup(
         "source_path:missing_parent" in message
         for message in logged_messages(manager, "error")
     )
-
-
-@pytest.mark.skipif(os.name != "nt", reason="requires Windows junctions")
-def test_compatibility_delete_destination_root_reparse_fails_before_backup(
-    configured_tree,
-    monkeypatch,
-):
-    target = configured_tree.roots["ui_pic"]
-    shutil.rmtree(target)
-    external = configured_tree.target_dir.parent / "external-ui-pic"
-    external.mkdir()
-    witness = external / "must-survive.bin"
-    witness.write_bytes(b"external")
-    create_windows_junction(external, target)
-    backup_calls = []
-    manager = configure_manifest_manager(
-        configured_tree,
-        [("1.0", {"config": ["ui/ui_pic"], "json_merge": []})],
-    )
-    monkeypatch.setattr(
-        manager,
-        "backup_config_file",
-        lambda paths: backup_calls.append(tuple(paths)) or True,
-    )
-
-    try:
-        assert manager.update_config_file() is False
-        assert backup_calls == []
-        assert os.path.isjunction(target)
-        assert witness.read_bytes() == b"external"
-        assert any(
-            "delete_compatibility:unsupported_destination_reparse"
-            in message
-            for message in logged_messages(manager, "error")
-        )
-    finally:
-        if os.path.isjunction(target):
-            os.rmdir(target)
-
-
-@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
-@pytest.mark.parametrize(
-    "config_entries",
-    [
-        ["ui/ui_pic", r"ui\ui_pic"],
-        ["ui/ui_config/obsolete", "ui/ui_config/obsolete/child.txt"],
-        ["ui/ui_config/obsolete/child.txt", "ui/ui_config/obsolete"],
-        [
-            "ui/ui_config/replace-parent",
-            "ui/ui_config/replace-parent/child.txt",
-            "ui/ui_pic",
-        ],
-    ],
-)
-def test_delete_conflict_between_related_ordinary_targets_precedes_backup(
-    configured_tree,
-    monkeypatch,
-    config_entries,
-):
-    for entry in config_entries:
-        name = Path(entry.replace("\\", "/")).name
-        if name in {"child.txt", "replace-parent"}:
-            source = configured_tree.config_dir / name
-            if "." in name:
-                source.write_bytes(b"replacement")
-            else:
-                source.mkdir(exist_ok=True)
-    backup_calls = []
-    transaction_calls = []
-    preflight_calls = []
-    original_roots = {
-        name: snapshot_tree(root)
-        for name, root in configured_tree.roots.items()
-    }
-    manager = configure_manifest_manager(
-        configured_tree,
-        [("1.0", {"config": config_entries, "json_merge": []})],
-    )
-    real_preflight = manager._preflight_ordinary_config_delete
-
-    def track_preflight(*args, **kwargs):
-        preflight_calls.append((args, kwargs))
-        return real_preflight(*args, **kwargs)
-
-    monkeypatch.setattr(
-        manager,
-        "_preflight_ordinary_config_delete",
-        track_preflight,
-    )
-    monkeypatch.setattr(
-        manager,
-        "backup_config_file",
-        lambda paths: backup_calls.append(tuple(paths)) or True,
-    )
-    monkeypatch.setattr(
-        manager,
-        "_delete_ordinary_config_compatibility",
-        lambda snapshot: transaction_calls.append(snapshot) or True,
-    )
-
-    assert manager.update_config_file() is False
-
-    assert backup_calls == []
-    assert transaction_calls == []
-    assert preflight_calls == []
-    assert not (configured_tree.backup_dir / "recovery").exists()
-    assert {
-        name: snapshot_tree(root)
-        for name, root in configured_tree.roots.items()
-    } == original_roots
-    assert any(
-        "delete_compatibility:target_conflict" in message
-        for message in logged_messages(manager, "error")
-    )
-
-
-@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
-@pytest.mark.parametrize(
-    "json_target",
-    [
-        "ui/ui_config/obsolete",
-        "ui/ui_config/obsolete/target.json",
-        "ui/ui_config",
-    ],
-)
-def test_delete_conflict_with_equal_ancestor_or_descendant_json_merge_precedes_backup(
-    configured_tree,
-    monkeypatch,
-    json_target,
-):
-    delete_target = configured_tree.roots["ui_config"] / "obsolete"
-    delete_target.mkdir()
-    (delete_target / "target.json").write_text("{}", encoding="utf-8")
-    patch = configured_tree.config_dir / "patch.json"
-    patch.write_text("{}", encoding="utf-8")
-    backup_calls = []
-    transaction_calls = []
-    preflight_calls = []
-    original_target = snapshot_tree(delete_target)
-    manager = configure_manifest_manager(
-        configured_tree,
-        [
-            (
-                "1.0",
-                {
-                    "config": ["ui/ui_config/obsolete"],
-                    "json_merge": [
-                        {
-                            "target": json_target,
-                            "source": "resources/config/patch.json",
-                        }
-                    ],
-                },
-            )
-        ],
-    )
-    real_preflight = manager._preflight_ordinary_config_delete
-
-    def track_preflight(*args, **kwargs):
-        preflight_calls.append((args, kwargs))
-        return real_preflight(*args, **kwargs)
-
-    monkeypatch.setattr(
-        manager,
-        "_preflight_ordinary_config_delete",
-        track_preflight,
-    )
-    monkeypatch.setattr(
-        manager,
-        "backup_config_file",
-        lambda paths: backup_calls.append(tuple(paths)) or True,
-    )
-    monkeypatch.setattr(
-        manager,
-        "_delete_ordinary_config_compatibility",
-        lambda snapshot: transaction_calls.append(snapshot) or True,
-    )
-
-    assert manager.update_config_file() is False
-
-    assert backup_calls == []
-    assert transaction_calls == []
-    assert preflight_calls == []
-    assert not (configured_tree.backup_dir / "recovery").exists()
-    assert snapshot_tree(delete_target) == original_target
-    assert any(
-        "delete_compatibility:json_merge_conflict" in message
-        for message in logged_messages(manager, "error")
-    )
-
-
-@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
-def test_compatibility_delete_backup_failure_prevents_transaction(
-    configured_tree,
-    monkeypatch,
-):
-    transaction_calls = []
-    manager = configure_manifest_manager(
-        configured_tree,
-        [("1.0", {"config": ["ui/ui_pic"], "json_merge": []})],
-    )
-    monkeypatch.setattr(manager, "backup_config_file", lambda paths: False)
-    monkeypatch.setattr(
-        manager,
-        "_delete_ordinary_config_compatibility",
-        lambda snapshot: transaction_calls.append(snapshot) or True,
-    )
-
-    assert manager.update_config_file() is False
-
-    assert transaction_calls == []
-    assert configured_tree.roots["ui_pic"].exists()
-    assert not any(
-        "delete_compatibility success" in message
-        for message in logged_messages(manager)
-    )
-
-
-@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
-def test_compatibility_delete_snapshot_change_after_backup_fails_before_detach(
-    configured_tree,
-    monkeypatch,
-):
-    target = configured_tree.roots["ui_pic"]
-    marker = target / "marker.txt"
-    manager = configure_manifest_manager(
-        configured_tree,
-        [("1.0", {"config": ["ui/ui_pic"], "json_merge": []})],
-    )
-    real_backup = manager.backup_config_file
-
-    def mutate_after_backup(paths):
-        assert real_backup(paths) is True
-        marker.write_text("changed after preflight", encoding="utf-8")
-        return True
-
-    monkeypatch.setattr(
-        manager,
-        "backup_config_file",
-        mutate_after_backup,
-    )
-
-    assert manager.update_config_file() is False
-
-    assert marker.read_text(encoding="utf-8") == "changed after preflight"
-    assert (
-        configured_tree.backups["ui_pic"] / "marker.txt"
-    ).read_text(encoding="utf-8") == "original ui_pic"
-    assert not any(
-        "delete_compatibility success" in message
-        for message in logged_messages(manager)
-    )
-
-
-@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
-def test_compatibility_delete_failure_blocks_json_merge_and_success_log(
-    configured_tree,
-    monkeypatch,
-):
-    json_target = configured_tree.roots["ui_config"] / "settings.json"
-    write_json(json_target, {"value": "old"})
-    patch = configured_tree.config_dir / "patch.json"
-    write_json(patch, {"value": "new"})
-    merge_calls = []
-    manager = configure_manifest_manager(
-        configured_tree,
-        [
-            (
-                "1.0",
-                {
-                    "config": ["ui/ui_pic"],
-                    "json_merge": [
-                        {
-                            "target": "ui/ui_config/settings.json",
-                            "source": "resources/config/patch.json",
-                        }
-                    ],
-                },
-            )
-        ],
-    )
-    monkeypatch.setattr(
-        manager,
-        "_delete_ordinary_config_compatibility",
-        lambda snapshot: False,
-    )
-    monkeypatch.setattr(
-        upgrade_config,
-        "merge_json_files_with_reason",
-        lambda *args: merge_calls.append(args) or (True, "ok"),
-    )
-
-    assert manager.update_config_file() is False
-
-    assert merge_calls == []
-    assert json.loads(json_target.read_text(encoding="utf-8")) == {
-        "value": "old"
-    }
-    assert not any(
-        "配置文件升级成功" in message
-        or "delete_compatibility success" in message
-        for message in logged_messages(manager)
-    )
-
-
-@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
-def test_compatibility_delete_failure_blocks_later_ordinary_action(
-    configured_tree,
-    monkeypatch,
-):
-    later_target = (
-        configured_tree.roots["ui_config"] / "later-action.txt"
-    )
-    later_target.write_bytes(b"old")
-    (configured_tree.config_dir / later_target.name).write_bytes(b"new")
-    replace_calls = []
-    manager = configure_manifest_manager(
-        configured_tree,
-        [
-            (
-                "1.0",
-                {
-                    "config": [
-                        "ui/ui_pic",
-                        "ui/ui_config/later-action.txt",
-                    ],
-                    "json_merge": [],
-                },
-            )
-        ],
-    )
-    monkeypatch.setattr(
-        manager,
-        "_delete_ordinary_config_compatibility",
-        lambda snapshot: False,
-    )
-    monkeypatch.setattr(
-        manager,
-        "_replace_with_staged_ordinary_config",
-        lambda source, target: (
-            replace_calls.append((source, target)) or True
-        ),
-    )
-
-    assert manager.update_config_file() is False
-
-    assert replace_calls == []
-    assert later_target.read_bytes() == b"old"
-
-
-@pytest.mark.skipif(os.name != "nt", reason="requires Windows native handles")
-def test_compatibility_delete_global_restore_preserves_recovery_artifact(
-    configured_tree,
-):
-    target = configured_tree.roots["ui_pic"]
-    manager = configure_manifest_manager(
-        configured_tree,
-        [("1.0", {"config": ["ui/ui_pic"], "json_merge": []})],
-    )
-
-    assert manager.update_config_file() is True
-    retained = configured_tree.backup_dir / "recovery" / "retained.bin"
-    retained.write_bytes(b"manual recovery")
-    assert manager.restore_config() is True
-
-    assert (target / "marker.txt").read_text(
-        encoding="utf-8"
-    ) == "original ui_pic"
-    assert retained.read_bytes() == b"manual recovery"
 
 
 def test_missing_ordinary_source_returns_candidate_and_missing_path(
@@ -6804,7 +6580,7 @@ def test_config_path_alias_conflicts_with_json_merge_target_before_merge_write(
         {"state": "pre-upgrade"},
     )
     (target.parent / "sub").mkdir()
-    replacement_name = config_target.split("/")[-1]
+    replacement_name = Path(config_target.replace("\\", "/")).name
     write_json(
         configured_tree.config_dir / replacement_name,
         {"state": "replacement"},

@@ -5958,70 +5958,48 @@ class ConfigManager(object):
 
                 config_operations = []
                 for config_file_path in config_file_source_path:
-                    target_file_path, path_error = (
-                        self._resolve_ordinary_config_destination(
-                            config_file_path
-                        )
+                    path_error = self._ordinary_config_path_error(
+                        config_file_path
                     )
                     if path_error is not None:
-                        if path_error == "symlink_escape":
-                            lexical_target = os.path.abspath(
-                                os.path.join(
-                                    DEFAULT_TARGET_DIR,
-                                    config_file_path,
-                                )
-                            )
-                            (
-                                _delete_source_path,
-                                delete_source_error,
-                            ) = self._resolve_ordinary_config_source(
-                                lexical_target
-                            )
-                            if delete_source_error == "missing_path":
-                                try:
-                                    lexical_target_stat = os.lstat(
-                                        lexical_target
-                                    )
-                                except (
-                                    OSError,
-                                    TypeError,
-                                    ValueError,
-                                ):
-                                    lexical_target_stat = None
-                                if (
-                                    lexical_target_stat is not None
-                                    and self._snapshot_entry_is_link_or_reparse(
-                                        lexical_target_stat
-                                    )
-                                ):
-                                    self._report_best_effort(
-                                        "error",
-                                        "delete_compatibility:"
-                                        "unsupported_destination_reparse",
-                                    )
-                                    return False
                         self._report_ordinary_config_destination_error(
                             path_error
                         )
                         return False
                     new_config_file_path, source_error = (
                         self._resolve_ordinary_config_source(
-                            target_file_path
+                            config_file_path
                         )
                     )
                     if source_error == "missing_path":
-                        config_operations.append(
-                            {
-                                "kind": "delete",
-                                "relative_path": config_file_path,
-                                "destination_path": target_file_path,
-                                "source_path": new_config_file_path,
-                            }
+                        self._report_best_effort(
+                            "info",
+                            f"配置源不存在，跳过: {config_file_path}",
                         )
                         continue
                     if source_error is not None:
                         self._report_ordinary_config_source_error(
                             source_error
+                        )
+                        return False
+                    source_state, source_state_error = (
+                        self._ordinary_config_source_state(
+                            new_config_file_path
+                        )
+                    )
+                    if source_state_error is not None:
+                        self._report_ordinary_config_source_error(
+                            source_state_error
+                        )
+                        return False
+                    target_file_path, path_error = (
+                        self._resolve_ordinary_config_destination(
+                            config_file_path
+                        )
+                    )
+                    if path_error is not None:
+                        self._report_ordinary_config_destination_error(
+                            path_error
                         )
                         return False
                     config_operations.append(
@@ -6030,51 +6008,19 @@ class ConfigManager(object):
                             "relative_path": config_file_path,
                             "destination_path": target_file_path,
                             "source_path": new_config_file_path,
+                            "source_state": source_state,
                         }
                     )
 
-                if not self._preflight_ordinary_config_delete_conflicts(
-                    config_operations
-                ):
-                    return False
                 if not self._preflight_json_merge_conflicts(
                     json_merge_entries,
                     config_operations,
                 ):
                     return False
 
-                for operation in config_operations:
-                    if operation["kind"] != "delete":
-                        continue
-                    snapshot, delete_error = (
-                        self._preflight_ordinary_config_delete(
-                            operation["destination_path"],
-                            operation["source_path"],
-                        )
-                    )
-                    if delete_error is not None:
-                        self._report_best_effort(
-                            "error",
-                            "delete_compatibility:"
-                            f"{delete_error}",
-                        )
-                        return False
-                    operation["snapshot"] = snapshot
-
-                for operation in config_operations:
-                    if operation["kind"] == "delete":
-                        self._report_best_effort(
-                            "info",
-                            "delete_compatibility selected: "
-                            f"{operation['relative_path']}",
-                        )
-
                 backup_paths = [
                     operation["relative_path"]
                     for operation in config_operations
-                    if operation["kind"] == "replace"
-                    or operation["snapshot"].destination_exists
-                    or operation["snapshot"].managed_root_exists
                 ]
                 if backup_paths and not self.backup_config_file(
                     backup_paths
@@ -6088,13 +6034,6 @@ class ConfigManager(object):
                 for operation in config_operations:
                     config_file_path = operation["relative_path"]
                     target_file_path = operation["destination_path"]
-                    if operation["kind"] == "delete":
-                        if not self._delete_ordinary_config_compatibility(
-                            operation["snapshot"]
-                        ):
-                            return False
-                        continue
-
                     self._report_best_effort(
                         "info",
                         f"更新配置文件: {config_file_path}",
@@ -6103,11 +6042,26 @@ class ConfigManager(object):
                         new_config_file_path,
                         source_error,
                     ) = self._resolve_ordinary_config_source(
-                        target_file_path
+                        config_file_path
                     )
                     if source_error is not None:
                         self._report_ordinary_config_source_error(
                             source_error
+                        )
+                        return False
+                    current_source_state, source_state_error = (
+                        self._ordinary_config_source_state(
+                            new_config_file_path
+                        )
+                    )
+                    if source_state_error is not None:
+                        self._report_ordinary_config_source_error(
+                            source_state_error
+                        )
+                        return False
+                    if current_source_state != operation["source_state"]:
+                        self._report_ordinary_config_source_error(
+                            "identity_check_failed"
                         )
                         return False
                     if not self._replace_with_staged_ordinary_config(
