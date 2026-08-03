@@ -233,7 +233,7 @@ class ExeUpgradeManager(object):
         if output is None:
             return ""
         if isinstance(output, bytes):
-            encodings = []
+            local_encodings = []
             seen_encodings = set()
 
             def add_encoding(encoding):
@@ -243,8 +243,13 @@ class ExeUpgradeManager(object):
                 normalized_encoding = encoding.casefold()
                 if normalized_encoding in seen_encodings:
                     return
+                if normalized_encoding.replace("_", "-") in {
+                    "utf8",
+                    "utf-8",
+                }:
+                    return
                 seen_encodings.add(normalized_encoding)
-                encodings.append(encoding)
+                local_encodings.append(encoding)
 
             try:
                 preferred_encoding = locale.getpreferredencoding(False)
@@ -257,24 +262,48 @@ class ExeUpgradeManager(object):
                 add_encoding(getattr(sys.stderr, "encoding", None))
                 add_encoding("mbcs")
                 add_encoding("gbk")
-                add_encoding("utf-8")
             else:
-                add_encoding("utf-8")
                 add_encoding(preferred_encoding)
                 add_encoding(getattr(sys.stdout, "encoding", None))
                 add_encoding(getattr(sys.stderr, "encoding", None))
 
-            for encoding in encodings:
+            try:
+                utf8_text = output.decode("utf-8")
+            except UnicodeDecodeError:
+                utf8_text = None
+
+            local_text = None
+            for encoding in local_encodings:
                 try:
-                    return output.decode(encoding)
+                    local_text = output.decode(encoding)
+                    break
                 except (LookupError, UnicodeDecodeError):
                     continue
 
-            fallback_encoding = encodings[0] if encodings else "utf-8"
-            try:
-                return output.decode(fallback_encoding, errors="replace")
-            except LookupError:
-                return output.decode("utf-8", errors="replace")
+            if utf8_text is not None and local_text is not None:
+                utf8_has_cyrillic = any(
+                    "\u0400" <= character <= "\u052f"
+                    for character in utf8_text
+                )
+                local_has_cjk = any(
+                    "\u3400" <= character <= "\u9fff"
+                    or "\uf900" <= character <= "\ufaff"
+                    for character in local_text
+                )
+                if os.name == "nt" and utf8_has_cyrillic and local_has_cjk:
+                    return local_text
+                return utf8_text
+            if utf8_text is not None:
+                return utf8_text
+            if local_text is not None:
+                return local_text
+
+            for encoding in local_encodings:
+                try:
+                    return output.decode(encoding, errors="replace")
+                except LookupError:
+                    continue
+            return output.decode("utf-8", errors="replace")
         return str(output)
 
     def _handle_failure(self, message, required):
@@ -296,10 +325,10 @@ class ExeUpgradeManager(object):
     def _report_best_effort(self, level, message):
         try:
             print(message)
-        except BaseException:
+        except Exception:
             pass
         try:
             if self.logger:
                 getattr(self.logger, level)(message)
-        except BaseException:
+        except Exception:
             pass

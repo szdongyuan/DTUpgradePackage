@@ -330,6 +330,23 @@ def test_gbk_process_output_is_decoded_without_mojibake(
     assert "\u04f2" not in logs
 
 
+def test_valid_utf8_chinese_wins_when_gbk_is_also_strictly_decodable(
+    local_tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(locale, "getpreferredencoding", lambda _set=False: "gbk")
+    manager = ExeUpgradeManager(
+        DummyLogger(),
+        [],
+        base_dir=str(local_tmp_path),
+    )
+    utf8_text = "升级"
+    mojibake = utf8_text.encode("utf-8").decode("gbk")
+    assert mojibake != utf8_text
+
+    assert manager._normalize_output(utf8_text.encode("utf-8")) == utf8_text
+
+
 def test_console_encoding_failure_does_not_change_success_and_logger_runs(
     local_tmp_path,
     monkeypatch,
@@ -420,6 +437,40 @@ def test_logger_failures_do_not_change_business_result_or_console_reporting(
     printed = capsys.readouterr().out
     assert "logger standard output" in printed
     assert expected_message in printed
+
+
+@pytest.mark.parametrize("failure_source", ["console", "logger"])
+def test_best_effort_reporting_does_not_swallow_control_flow_exceptions(
+    local_tmp_path,
+    monkeypatch,
+    failure_source,
+):
+    class InterruptingLogger:
+        @staticmethod
+        def info(_message):
+            raise SystemExit("logger interrupted")
+
+    manager = ExeUpgradeManager(
+        InterruptingLogger(),
+        [],
+        base_dir=str(local_tmp_path),
+    )
+    if failure_source == "console":
+        def interrupt_print(*_args, **_kwargs):
+            raise KeyboardInterrupt()
+
+        monkeypatch.setattr(
+            builtins,
+            "print",
+            interrupt_print,
+        )
+        expected_exception = KeyboardInterrupt
+    else:
+        monkeypatch.setattr(builtins, "print", lambda *_args, **_kwargs: None)
+        expected_exception = SystemExit
+
+    with pytest.raises(expected_exception):
+        manager._log_info("control-flow interruption")
 
 
 def test_undecodable_process_output_is_decoded_with_replacement(local_tmp_path, monkeypatch, capsys):
