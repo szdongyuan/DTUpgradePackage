@@ -1,3 +1,5 @@
+import builtins
+import locale
 import os
 import shutil
 import subprocess
@@ -283,6 +285,143 @@ def test_success_prints_and_logs_start_end_stdout_and_stderr(local_tmp_path, cap
         assert text in logs
 
 
+def test_gbk_process_output_is_decoded_without_mojibake(
+    local_tmp_path,
+    monkeypatch,
+    capsys,
+):
+    write_version_file(
+        local_tmp_path,
+        {
+            "version": "1.0",
+            "exe": [{"name": "GBKTool", "path": sys.executable}],
+        },
+    )
+    logger = DummyLogger()
+    # GBK "硬" is d3 b2, which is also valid UTF-8 for U+04F2.
+    stdout_text = "硬盘数据库升级成功"
+    stderr_text = "本地控制台警告"
+
+    def fake_run(command, **kwargs):
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=stdout_text.encode("gbk"),
+            stderr=stderr_text.encode("gbk"),
+        )
+
+    monkeypatch.setattr(locale, "getpreferredencoding", lambda _set=False: "gbk")
+    monkeypatch.setattr("control.upgrade_exe.subprocess.run", fake_run)
+
+    assert ExeUpgradeManager(
+        logger,
+        ["1.0"],
+        base_dir=str(local_tmp_path),
+    ).run() is True
+
+    printed = capsys.readouterr().out
+    logs = logged_text(logger)
+    for text in (stdout_text, stderr_text):
+        assert text in printed
+        assert text in logs
+    assert "\ufffd" not in printed
+    assert "\ufffd" not in logs
+    assert "\u04f2" not in printed
+    assert "\u04f2" not in logs
+
+
+def test_console_encoding_failure_does_not_change_success_and_logger_runs(
+    local_tmp_path,
+    monkeypatch,
+):
+    write_version_file(
+        local_tmp_path,
+        {
+            "version": "1.0",
+            "exe": [{"name": "ConsoleTool", "path": sys.executable}],
+        },
+    )
+    logger = DummyLogger()
+
+    def fake_run(command, **kwargs):
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="数据库升级成功".encode("utf-8"),
+            stderr=b"",
+        )
+
+    def fail_console_print(*_args, **_kwargs):
+        raise UnicodeEncodeError("ascii", "数据库升级成功", 0, 1, "injected")
+
+    monkeypatch.setattr("control.upgrade_exe.subprocess.run", fake_run)
+    monkeypatch.setattr(builtins, "print", fail_console_print)
+
+    assert ExeUpgradeManager(
+        logger,
+        ["1.0"],
+        base_dir=str(local_tmp_path),
+    ).run() is True
+    assert "数据库升级成功" in logged_text(logger)
+    assert "可执行程序执行结束" in logged_text(logger)
+
+
+@pytest.mark.parametrize(
+    ("returncode", "expected_result", "expected_message"),
+    [
+        (0, True, "logger warning output"),
+        (7, False, "可执行程序返回非零退出码"),
+    ],
+)
+def test_logger_failures_do_not_change_business_result_or_console_reporting(
+    local_tmp_path,
+    monkeypatch,
+    capsys,
+    returncode,
+    expected_result,
+    expected_message,
+):
+    write_version_file(
+        local_tmp_path,
+        {
+            "version": "1.0",
+            "exe": [{"name": "LoggerTool", "path": sys.executable}],
+        },
+    )
+
+    class FailingLogger:
+        @staticmethod
+        def info(_message):
+            raise RuntimeError("info logger failed")
+
+        @staticmethod
+        def warning(_message):
+            raise RuntimeError("warning logger failed")
+
+        @staticmethod
+        def error(_message):
+            raise RuntimeError("error logger failed")
+
+    def fake_run(command, **kwargs):
+        return subprocess.CompletedProcess(
+            command,
+            returncode,
+            stdout=b"logger standard output",
+            stderr=b"logger warning output",
+        )
+
+    monkeypatch.setattr("control.upgrade_exe.subprocess.run", fake_run)
+
+    assert ExeUpgradeManager(
+        FailingLogger(),
+        ["1.0"],
+        base_dir=str(local_tmp_path),
+    ).run() is expected_result
+    printed = capsys.readouterr().out
+    assert "logger standard output" in printed
+    assert expected_message in printed
+
+
 def test_undecodable_process_output_is_decoded_with_replacement(local_tmp_path, monkeypatch, capsys):
     calls = []
     write_version_file(local_tmp_path, {"version": "1.0", "exe": [{"name": "ByteTool", "path": sys.executable}]})
@@ -290,7 +429,12 @@ def test_undecodable_process_output_is_decoded_with_replacement(local_tmp_path, 
 
     def fake_run(command, **kwargs):
         calls.append((command, kwargs))
-        return subprocess.CompletedProcess(command, 0, stdout=b"bad\xffout", stderr=b"bad\xfeerr")
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=b"bad\xffout",
+            stderr=b"bad\xfferr",
+        )
 
     monkeypatch.setattr("control.upgrade_exe.subprocess.run", fake_run)
 

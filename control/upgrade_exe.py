@@ -1,6 +1,8 @@
+import locale
 import os
 import shutil
 import subprocess
+import sys
 
 from consts.program_config import DEFAULT_DIR
 from load_yml.load_yml import Readyml
@@ -231,7 +233,48 @@ class ExeUpgradeManager(object):
         if output is None:
             return ""
         if isinstance(output, bytes):
-            return output.decode("utf-8", errors="replace")
+            encodings = []
+            seen_encodings = set()
+
+            def add_encoding(encoding):
+                if not isinstance(encoding, str) or not encoding.strip():
+                    return
+                encoding = encoding.strip()
+                normalized_encoding = encoding.casefold()
+                if normalized_encoding in seen_encodings:
+                    return
+                seen_encodings.add(normalized_encoding)
+                encodings.append(encoding)
+
+            try:
+                preferred_encoding = locale.getpreferredencoding(False)
+            except Exception:
+                preferred_encoding = None
+
+            if os.name == "nt":
+                add_encoding(preferred_encoding)
+                add_encoding(getattr(sys.stdout, "encoding", None))
+                add_encoding(getattr(sys.stderr, "encoding", None))
+                add_encoding("mbcs")
+                add_encoding("gbk")
+                add_encoding("utf-8")
+            else:
+                add_encoding("utf-8")
+                add_encoding(preferred_encoding)
+                add_encoding(getattr(sys.stdout, "encoding", None))
+                add_encoding(getattr(sys.stderr, "encoding", None))
+
+            for encoding in encodings:
+                try:
+                    return output.decode(encoding)
+                except (LookupError, UnicodeDecodeError):
+                    continue
+
+            fallback_encoding = encodings[0] if encodings else "utf-8"
+            try:
+                return output.decode(fallback_encoding, errors="replace")
+            except LookupError:
+                return output.decode("utf-8", errors="replace")
         return str(output)
 
     def _handle_failure(self, message, required):
@@ -242,16 +285,21 @@ class ExeUpgradeManager(object):
         return True
 
     def _log_info(self, message):
-        print(message)
-        if self.logger:
-            self.logger.info(message)
+        self._report_best_effort("info", message)
 
     def _log_warning(self, message):
-        print(message)
-        if self.logger:
-            self.logger.warning(message)
+        self._report_best_effort("warning", message)
 
     def _log_error(self, message):
-        print(message)
-        if self.logger:
-            self.logger.error(message)
+        self._report_best_effort("error", message)
+
+    def _report_best_effort(self, level, message):
+        try:
+            print(message)
+        except BaseException:
+            pass
+        try:
+            if self.logger:
+                getattr(self.logger, level)(message)
+        except BaseException:
+            pass
