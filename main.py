@@ -10,7 +10,15 @@ from control.upgrade_db import DataBaseManager, get_version_database_path, read_
 from control.upgrade_config import ConfigManager
 from control.upgrade_exe import ExeUpgradeManager
 from log_model.log_manager import LogManager
-from consts.program_config import DEFAULT_DIR, DEFAULT_TARGET_DIR, DATABASE_PATH, BACKUP_DIR
+from consts.program_config import (
+    ALL_VERSIONS,
+    BACKUP_DIR,
+    DATABASE_PATH,
+    DEFAULT_DIR,
+    DEFAULT_TARGET_DIR,
+    TARGET_VERSION,
+)
+from consts.version_config import UnknownVersionError, compare_version_positions
 
 
 def update_version_program(
@@ -154,6 +162,21 @@ def run_upgrade(logger=None):
             _print_safely(f"日志初始化失败: {e}")
             return False
 
+    current_version = get_current_version()
+    if current_version not in (None, ""):
+        try:
+            relation = compare_version_positions(
+                ALL_VERSIONS,
+                TARGET_VERSION,
+                current_version,
+            )
+        except UnknownVersionError as exc:
+            _log_safely(logger, "error", f"版本兼容性检查失败: {exc}")
+            return False
+        if relation > 0:
+            _log_safely(logger, "info", "当前版本高于升级包目标版本，无需升级")
+            return True
+
     try:
         result_backup = DataBaseManager.backup_db()
     except Exception as e:
@@ -165,7 +188,6 @@ def run_upgrade(logger=None):
 
     config_manager = None
     try:
-        current_version = get_current_version()
         config_manager = ConfigManager(logger, current_version)
         db = DataBaseManager(DATABASE_PATH)
 

@@ -632,6 +632,34 @@ def test_upgrade_without_explicit_version_preserves_legacy_initialization(
     assert read_version_value(database_path, "current_version") == "0.12"
 
 
+def test_database_upgrade_follows_configured_order_not_lexical_order(
+    monkeypatch,
+    local_tmp_path,
+):
+    database_path = local_tmp_path / "audio_data.db"
+    sqlite3.connect(database_path).close()
+    monkeypatch.setattr(
+        upgrade_db,
+        "ALL_VERSIONS",
+        ["0.12", "10", "2", "3"],
+    )
+    monkeypatch.setattr(upgrade_db, "TARGET_VERSION", "2")
+    monkeypatch.setattr(
+        upgrade_db.LogManager,
+        "set_log_handler",
+        staticmethod(lambda _name: DummyLogger()),
+    )
+    manager = DataBaseManager(str(database_path))
+    updated_versions = []
+    manager.update_db = updated_versions.append
+    manager.check_table_data = lambda: True
+
+    assert manager.upgrade("0.12") is True
+    assert updated_versions == ["10", "2"]
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        manager.conn.execute("SELECT 1")
+
+
 def test_version_database_path_uses_audio_database_for_legacy_single_db(monkeypatch, local_tmp_path):
     audio_path = local_tmp_path / "audio_data.db"
     system_path = local_tmp_path / "system_data.db"
@@ -728,6 +756,50 @@ def test_update_version_commits_metadata_and_returns_true(monkeypatch, local_tmp
     assert read_version_value(database_path, "last_running_version") == "0.26.02.01"
     assert read_version_value(database_path, "current_version") == "0.26.06.01"
     assert read_version_value(database_path, "update_time") != "2000-01-01 00:00:00"
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        manager.conn.execute("SELECT 1")
+
+
+def test_update_version_does_not_downgrade_newer_current_version(
+    monkeypatch,
+    local_tmp_path,
+):
+    database_path = local_tmp_path / "system_data.db"
+    create_version_db(database_path, "3")
+    metadata_before = read_version_metadata(database_path)
+    monkeypatch.setattr(upgrade_db, "ALL_VERSIONS", ["0.12", "1", "2", "3"])
+    monkeypatch.setattr(upgrade_db, "TARGET_VERSION", "2")
+    monkeypatch.setattr(
+        upgrade_db.LogManager,
+        "set_log_handler",
+        staticmethod(lambda _name: DummyLogger()),
+    )
+    manager = DataBaseManager(str(database_path))
+
+    assert manager.update_version() is True
+    assert read_version_metadata(database_path) == metadata_before
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        manager.conn.execute("SELECT 1")
+
+
+def test_update_version_rejects_unknown_current_version_without_mutation(
+    monkeypatch,
+    local_tmp_path,
+):
+    database_path = local_tmp_path / "system_data.db"
+    create_version_db(database_path, "unknown")
+    metadata_before = read_version_metadata(database_path)
+    monkeypatch.setattr(upgrade_db, "ALL_VERSIONS", ["0.12", "1", "2", "3"])
+    monkeypatch.setattr(upgrade_db, "TARGET_VERSION", "2")
+    monkeypatch.setattr(
+        upgrade_db.LogManager,
+        "set_log_handler",
+        staticmethod(lambda _name: DummyLogger()),
+    )
+    manager = DataBaseManager(str(database_path))
+
+    assert manager.update_version() is False
+    assert read_version_metadata(database_path) == metadata_before
     with pytest.raises(sqlite3.ProgrammingError, match="closed"):
         manager.conn.execute("SELECT 1")
 

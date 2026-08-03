@@ -15,6 +15,7 @@ from typing import NamedTuple
 from base.json_merge import merge_json_files_with_reason
 
 from consts.program_config import BACKUP_DIR, DEFAULT_DIR, TARGET_VERSION, ALL_VERSIONS, BACKUP_UI_PIC_PATH, CONFIG_DIR
+from consts.version_config import select_upgrade_versions
 from consts.program_config import AI_MODEL_CONFIG_PATH, SCANNER_BARCODE_CONFIG_PATH, UI_CONFIG_PATH, UI_PIC_PATH
 from consts.program_config import BACKUP_AI_MODEL_CONFIG_PATH, BACKUP_SCANNER_BARCODE_CONFIG_PATH, BACKUP_UI_CONFIG_PATH
 from consts.program_config import DEFAULT_TARGET_DIR
@@ -3339,12 +3340,13 @@ class ConfigManager(object):
     def init_upgrade_version_list(self):
         print("初始化升级版本列表")
         self.logger.info("初始化升级版本列表")
-        for version in ALL_VERSIONS:
-            if version > TARGET_VERSION:
-                break
-            if version <= self.current_version:
-                continue
-            self.upgrade_version_list.append(version)
+        self.upgrade_version_list.extend(
+            select_upgrade_versions(
+                ALL_VERSIONS,
+                TARGET_VERSION,
+                self.current_version,
+            )
+        )
 
         self.logger.info(f"升级版本列表：{self.upgrade_version_list}")
 

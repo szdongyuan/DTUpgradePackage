@@ -21,6 +21,42 @@ class WindowsHandleInstrumentationSignal(BaseException):
     pass
 
 
+def test_upgrade_versions_follow_configured_order_not_lexical_order(monkeypatch):
+    manager = upgrade_config.ConfigManager.__new__(upgrade_config.ConfigManager)
+    manager.logger = SimpleNamespace(info=lambda _message: None)
+    manager.current_version = "0.12"
+    manager.upgrade_version_list = []
+    monkeypatch.setattr(
+        upgrade_config,
+        "ALL_VERSIONS",
+        ["0.12", "10", "2", "3"],
+    )
+    monkeypatch.setattr(upgrade_config, "TARGET_VERSION", "2")
+
+    manager.init_upgrade_version_list()
+
+    assert manager.upgrade_version_list == ["10", "2"]
+
+
+def test_upgrade_versions_honor_declared_order_when_it_differs_from_lexical_order(
+    monkeypatch,
+):
+    manager = upgrade_config.ConfigManager.__new__(upgrade_config.ConfigManager)
+    manager.logger = SimpleNamespace(info=lambda _message: None)
+    manager.current_version = "0.12"
+    manager.upgrade_version_list = []
+    monkeypatch.setattr(
+        upgrade_config,
+        "ALL_VERSIONS",
+        ["0.12", "2", "10", "3"],
+    )
+    monkeypatch.setattr(upgrade_config, "TARGET_VERSION", "10")
+
+    manager.init_upgrade_version_list()
+
+    assert manager.upgrade_version_list == ["2", "10"]
+
+
 def test_delete_artifact_ledger_stages_candidates_without_overwriting_prior_location():
     state = upgrade_config._OrdinaryConfigDeleteArtifactState()
 
@@ -3244,7 +3280,10 @@ def configured_tree(tmp_path, monkeypatch):
 
 
 def make_manager():
-    return upgrade_config.ConfigManager(DummyLogger(), "99")
+    return upgrade_config.ConfigManager(
+        DummyLogger(),
+        upgrade_config.TARGET_VERSION,
+    )
 
 
 def logged_messages(manager, level=None):

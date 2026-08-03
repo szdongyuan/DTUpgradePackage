@@ -158,6 +158,13 @@ def install_fake_upgrade(
     monkeypatch.setattr(upgrade_main, "get_version_database_path", lambda: "version.db")
     monkeypatch.setattr(upgrade_main, "DATABASE_PATH", "database.db")
     monkeypatch.setattr(upgrade_main, "BACKUP_DIR", "backup")
+    monkeypatch.setattr(
+        upgrade_main,
+        "ALL_VERSIONS",
+        ["0.1", "1.0"],
+        raising=False,
+    )
+    monkeypatch.setattr(upgrade_main, "TARGET_VERSION", "1.0", raising=False)
     monkeypatch.setattr(upgrade_main.os.path, "exists", lambda _path: recovery_files["database"])
     monkeypatch.setattr(upgrade_main.os, "remove", fake_remove)
     monkeypatch.setattr(
@@ -174,6 +181,47 @@ def install_fake_upgrade(
         received_db_upgrade_versions=received_db_upgrade_versions,
         recovery_files=recovery_files,
     )
+
+
+def test_newer_installed_version_is_mutation_free_successful_noop(monkeypatch):
+    scenario = install_fake_upgrade(
+        monkeypatch,
+        construction_failure="initial_db_manager_construct",
+    )
+    monkeypatch.setattr(upgrade_main, "ALL_VERSIONS", ["0.1", "1.0", "2.0"])
+    monkeypatch.setattr(upgrade_main, "TARGET_VERSION", "1.0")
+    monkeypatch.setattr(upgrade_main, "get_current_version", lambda: "2.0")
+
+    assert upgrade_main.run_upgrade(scenario.logger) is True
+    assert scenario.events == []
+
+
+def test_unknown_installed_version_fails_before_backup_or_restore(monkeypatch):
+    scenario = install_fake_upgrade(
+        monkeypatch,
+        construction_failure="config_manager_construct",
+    )
+    monkeypatch.setattr(upgrade_main, "ALL_VERSIONS", ["0.1", "1.0", "2.0"])
+    monkeypatch.setattr(upgrade_main, "TARGET_VERSION", "1.0")
+    monkeypatch.setattr(upgrade_main, "get_current_version", lambda: "unknown")
+
+    assert upgrade_main.run_upgrade(scenario.logger) is False
+    assert scenario.events == []
+    assert any(
+        level == "error" and "版本兼容性检查失败" in message
+        for level, message in scenario.logger.messages
+    )
+
+
+def test_missing_current_version_continues_into_existing_backup_first_path(
+    monkeypatch,
+):
+    scenario = install_fake_upgrade(monkeypatch)
+    monkeypatch.setattr(upgrade_main, "get_current_version", lambda: None)
+
+    assert upgrade_main.run_upgrade(scenario.logger) is True
+    assert scenario.events[0] == "backup_db"
+    assert scenario.received_db_upgrade_versions == [None]
 
 
 def test_run_upgrade_uses_default_logger_and_orders_commit_before_cleanup(monkeypatch):
@@ -291,8 +339,10 @@ def test_missing_ordinary_source_does_not_trigger_orchestration_rollback(
         "BACKUP_SCANNER_BARCODE_CONFIG_PATH",
         directory_path(backups["scanner"]),
     )
-    monkeypatch.setattr(upgrade_config, "ALL_VERSIONS", ["1.0"])
+    monkeypatch.setattr(upgrade_config, "ALL_VERSIONS", ["0.12", "1.0"])
     monkeypatch.setattr(upgrade_config, "TARGET_VERSION", "1.0")
+    monkeypatch.setattr(upgrade_main, "ALL_VERSIONS", ["0.12", "1.0"])
+    monkeypatch.setattr(upgrade_main, "TARGET_VERSION", "1.0")
 
     logger = RecordingLogger()
     managers = []
@@ -352,7 +402,7 @@ def test_missing_ordinary_source_does_not_trigger_orchestration_rollback(
         "update_version_program",
         lambda _logger: (True, "ok"),
     )
-    monkeypatch.setattr(upgrade_main, "get_current_version", lambda: "0.0")
+    monkeypatch.setattr(upgrade_main, "get_current_version", lambda: "0.12")
     monkeypatch.setattr(
         upgrade_main,
         "get_version_database_path",
@@ -1223,7 +1273,11 @@ def test_later_failures_restore_exact_json_bytes_with_real_config_manager(
     monkeypatch.setattr(upgrade_main, "ConfigManager", build_real_config_manager)
     monkeypatch.setattr(upgrade_main, "ExeUpgradeManager", FakeExeUpgradeManager)
     monkeypatch.setattr(upgrade_main, "update_version_program", fake_program_update)
-    monkeypatch.setattr(upgrade_main, "get_current_version", lambda: "99")
+    monkeypatch.setattr(
+        upgrade_main,
+        "get_current_version",
+        lambda: upgrade_main.TARGET_VERSION,
+    )
     monkeypatch.setattr(upgrade_main, "get_version_database_path", lambda: "version.db")
     monkeypatch.setattr(upgrade_main, "DATABASE_PATH", "database.db")
 

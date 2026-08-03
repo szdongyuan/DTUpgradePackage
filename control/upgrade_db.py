@@ -7,6 +7,12 @@ from pathlib import Path
 import yaml
 
 from consts.program_config import DATABASE_PATH, SYSTEM_DATABASE_PATH, BACKUP_DIR, DEFAULT_DIR, TARGET_VERSION, ALL_VERSIONS
+from consts.version_config import (
+    LEGACY_INITIAL_VERSION,
+    UnknownVersionError,
+    compare_version_positions,
+    select_upgrade_versions,
+)
 from log_model.log_manager import LogManager
 
 
@@ -169,7 +175,7 @@ class DataBaseManager:
                 ('last_running_version',null),
                 ('update_time', ?);
             """
-        init_version = "0.12"
+        init_version = LEGACY_INITIAL_VERSION
         self.conn.execute(insert_sql, (init_version, now_time))
         self.conn.commit()
         return init_version
@@ -232,10 +238,11 @@ class DataBaseManager:
                     )
             print(f"当前数据库版本: {db_current_version}")
             self.logger.info(f"当前数据库版本: {db_current_version}")
-            # 需要更新的版本列表
-            start_idx = ALL_VERSIONS.index(db_current_version) + 1
-            end_idx = ALL_VERSIONS.index(TARGET_VERSION) + 1
-            update_versions = ALL_VERSIONS[start_idx:end_idx]
+            update_versions = select_upgrade_versions(
+                ALL_VERSIONS,
+                TARGET_VERSION,
+                db_current_version,
+            )
             print(f"需要执行的更新版本序列: {update_versions}")
             self.logger.info(f"需要执行的更新版本序列: {update_versions}")
             if update_versions:
@@ -262,6 +269,24 @@ class DataBaseManager:
             db_current_version = self.get_current_version()
             if db_current_version is None:
                 raise sqlite3.OperationalError("current version is unavailable")
+            try:
+                relation = compare_version_positions(
+                    ALL_VERSIONS,
+                    TARGET_VERSION,
+                    db_current_version,
+                )
+            except UnknownVersionError as exc:
+                self._report_safely(
+                    f"数据库版本兼容性检查失败: {exc}",
+                    "error",
+                )
+                return False
+            if relation > 0:
+                self._report_safely(
+                    "当前数据库版本高于升级包目标版本，保留现有版本信息",
+                    "info",
+                )
+                return True
             now_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             cursor = self.conn.execute(
                 "UPDATE system_info_table SET value = ? WHERE name = 'last_running_version';",
