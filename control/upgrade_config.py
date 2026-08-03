@@ -2833,20 +2833,6 @@ class ConfigManager(object):
             self._ordinary_config_content_manifest(source_state[2])
         )
 
-        def source_state_is_current():
-            current_source_state, current_source_error = (
-                self._ordinary_config_source_state(source_path)
-            )
-            if (
-                current_source_error is not None
-                or current_source_state != source_state
-            ):
-                self._report_ordinary_config_source_error(
-                    current_source_error or "identity_changed"
-                )
-                return False
-            return True
-
         destination_is_current, destination_error = (
             self._ordinary_config_destination_is_current(
                 destination_path
@@ -2999,16 +2985,10 @@ class ConfigManager(object):
                     raise OSError(
                         "destination changed before recovery transition"
                     )
-                if not source_state_is_current():
-                    return False
                 self._atomic_move_no_replace(
                     destination_path,
                     old_path,
                 )
-                if not source_state_is_current():
-                    raise OSError(
-                        "source changed after recovery transition"
-                    )
                 if not self._ordinary_config_binding_matches(
                     destination_path,
                     initial_destination_binding,
@@ -3048,20 +3028,11 @@ class ConfigManager(object):
                 raise OSError(
                     "destination changed before staging transition"
                 )
-            if (
-                not destination_existed
-                and not source_state_is_current()
-            ):
-                return False
             self._atomic_move_no_replace(
                 staging_path,
                 destination_path,
             )
             staging_path = None
-            if not source_state_is_current():
-                raise OSError(
-                    "source changed after staging transition"
-                )
             if not self._ordinary_config_binding_matches(
                 destination_path,
                 initial_destination_binding,

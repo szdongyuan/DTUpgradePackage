@@ -5997,7 +5997,7 @@ def test_ordinary_config_source_swap_during_copy_then_restore_is_rejected(
 
 
 @pytest.mark.parametrize("destination_existed", [True, False])
-def test_source_swap_during_final_destination_check_aborts_before_commit(
+def test_source_swap_after_staged_validation_commits_validated_snapshot(
     configured_tree,
     monkeypatch,
     destination_existed,
@@ -6042,18 +6042,17 @@ def test_source_swap_during_final_destination_check_aborts_before_commit(
         str(source),
         str(target),
         expected_source_state=expected_source_state,
-    ) is False
+    ) is True
 
     assert len(destination_check_calls) == 2
-    if destination_existed:
-        assert target.read_bytes() == original_target
-    else:
-        assert not target.exists()
+    assert target.read_bytes() == b"validated replacement"
+    assert source.read_bytes() == b"substituted replacement"
+    assert displaced_source.read_bytes() == b"validated replacement"
     assert swap_artifacts(target) == []
 
 
 @pytest.mark.parametrize("destination_existed", [True, False])
-def test_source_swap_inside_atomic_commit_move_rolls_back_target(
+def test_source_swap_inside_atomic_commit_move_uses_validated_snapshot(
     configured_tree,
     monkeypatch,
     destination_existed,
@@ -6096,23 +6095,13 @@ def test_source_swap_inside_atomic_commit_move_rolls_back_target(
         str(source),
         str(target),
         expected_source_state=expected_source_state,
-    ) is False
+    ) is True
 
     assert len(atomic_move_calls) >= 1
-    if destination_existed:
-        assert target.read_bytes() == original_target
-    else:
-        assert not target.exists()
+    assert target.read_bytes() == b"validated replacement"
+    assert source.read_bytes() == b"substituted replacement"
+    assert displaced_source.read_bytes() == b"validated replacement"
     assert swap_artifacts(target) == []
-    errors = logged_messages(manager, "error")
-    assert any(
-        "ordinary_config error: source_path:identity_changed" in message
-        for message in errors
-    )
-    assert any(
-        "配置文件暂存替换失败" in message
-        for message in errors
-    )
 
 
 def test_ordinary_config_concurrent_destination_creation_is_preserved(
