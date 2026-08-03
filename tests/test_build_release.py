@@ -397,17 +397,21 @@ def test_repository_dist_reparse_point_is_rejected_without_touching_target(relea
         remove_directory_reparse_point(dist_link)
 
 
-def test_stage_descendant_reparse_point_is_rejected_without_touching_target(
-    release_test_root, tmp_path
-):
+def test_stage_descendant_reparse_point_is_rejected_without_touching_target(release_test_root):
     executable = (release_test_root / "fake-main.exe").resolve()
     executable.write_bytes(b"fake")
     resources = write_resources(release_test_root).resolve()
 
-    resolved_tmp_path = tmp_path.resolve()
-    external_target = (resolved_tmp_path / "external-stage-target").resolve()
-    assert external_target.parent == resolved_tmp_path
-    assert not external_target.is_relative_to(DIST_ROOT.resolve())
+    fake_repository = release_test_root / "fake-component-repository"
+    copied_script = fake_repository / "scripts" / "build_release.ps1"
+    copied_script.parent.mkdir(parents=True)
+    shutil.copy2(BUILD_SCRIPT, copied_script)
+    fake_dist = (fake_repository / "dist").resolve()
+    fake_dist.mkdir()
+
+    external_target = (release_test_root / "external-stage-target").resolve()
+    assert external_target.parent == release_test_root
+    assert not external_target.is_relative_to(fake_dist)
     (external_target / "existing").mkdir(parents=True)
     (external_target / "sentinel.txt").write_bytes(b"preserve sentinel exactly\x00\xff")
     (external_target / "existing" / "content.bin").write_bytes(b"existing target content")
@@ -422,10 +426,10 @@ def test_stage_descendant_reparse_point_is_rejected_without_touching_target(
         if path.is_dir()
     }
 
-    stage_link = release_test_root / "linked-stage-component"
+    stage_link = fake_dist / "linked-stage-component"
     try:
         create_directory_reparse_point(stage_link, external_target)
-        # Keep the absolute lexical path under repository dist. Resolving it after
+        # Keep the absolute lexical path under the fake repository dist. Resolving it after
         # link creation would follow the link and bypass the component-specific guard.
         stage = stage_link / "nested-stage"
         result = run_build_script(
@@ -438,6 +442,7 @@ def test_stage_descendant_reparse_point_is_rejected_without_touching_target(
             stage,
             "-PythonExecutable",
             Path(sys.executable).resolve(),
+            script=copied_script,
         )
 
         output = result.stdout + result.stderr
@@ -459,9 +464,6 @@ def test_stage_descendant_reparse_point_is_rejected_without_touching_target(
         assert not (external_target / "nested-stage").exists()
     finally:
         remove_directory_reparse_point(stage_link)
-        if external_target.exists():
-            assert external_target.parent == resolved_tmp_path
-            shutil.rmtree(external_target)
 
 
 @pytest.mark.parametrize("unsafe_stage", [DIST_ROOT, REPO_ROOT])
