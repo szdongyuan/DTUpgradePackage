@@ -1,0 +1,11 @@
+version: "0.26.07.02"
+db:
+    sqls_operate: []
+    data_check:
+        add: []
+        del: []
+ai: []
+ui: []
+config: []
+json_merge: []
+exe: []
