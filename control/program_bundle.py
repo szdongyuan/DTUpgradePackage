@@ -255,6 +255,17 @@ def _artifact_exists(path):
     return path is not None and os.path.lexists(path)
 
 
+def _probe_artifact(path, description, problems, first_control_flow):
+    if path is None:
+        return False, first_control_flow
+    try:
+        return _artifact_exists(path), first_control_flow
+    except BaseException as error:
+        first_control_flow = _remember_control_flow(first_control_flow, error)
+        problems.append(f"failed to inspect {description} {path}: {error}")
+        return None, first_control_flow
+
+
 def _format_artifacts(kind, paths):
     if not paths:
         return None
@@ -272,21 +283,47 @@ def _report_messages(warning_reporter, messages, first_control_flow):
 
 
 def _remove_artifact(path, description, problems, first_control_flow):
-    if not _artifact_exists(path):
+    exists, first_control_flow = _probe_artifact(
+        path,
+        description,
+        problems,
+        first_control_flow,
+    )
+    if exists is not True:
         return first_control_flow
     try:
         _remove_leaf(path)
     except BaseException as error:
         first_control_flow = _remember_control_flow(first_control_flow, error)
-        if _artifact_exists(path):
+        retained, first_control_flow = _probe_artifact(
+            path,
+            description,
+            problems,
+            first_control_flow,
+        )
+        if retained is True:
             problems.append(f"failed to remove {description} {path}: {error}")
     return first_control_flow
 
 
 def _restore_recovery(recovery, destination, description, problems, first_control_flow):
-    if not _artifact_exists(recovery):
+    recovery_exists, first_control_flow = _probe_artifact(
+        recovery,
+        f"{description} recovery artifact",
+        problems,
+        first_control_flow,
+    )
+    if recovery_exists is not True:
         return first_control_flow
-    if _artifact_exists(destination):
+    destination_exists, first_control_flow = _probe_artifact(
+        destination,
+        f"{description} destination",
+        problems,
+        first_control_flow,
+    )
+    if destination_exists is None:
+        return first_control_flow
+    if destination_exists:
         problems.append(
             f"cannot restore {description}; destination remains occupied and recovery is retained: "
             f"{recovery}"
@@ -296,9 +333,29 @@ def _restore_recovery(recovery, destination, description, problems, first_contro
         os.replace(recovery, destination)
     except BaseException as error:
         first_control_flow = _remember_control_flow(first_control_flow, error)
-        if _artifact_exists(recovery):
+        retained, first_control_flow = _probe_artifact(
+            recovery,
+            f"{description} recovery artifact",
+            problems,
+            first_control_flow,
+        )
+        if retained is True:
             problems.append(f"failed to restore {description} from {recovery}: {error}")
     return first_control_flow
+
+
+def _collect_retained_artifacts(paths, kind, problems, first_control_flow):
+    retained = []
+    for path in paths:
+        exists, first_control_flow = _probe_artifact(
+            path,
+            f"{kind} artifact",
+            problems,
+            first_control_flow,
+        )
+        if exists is True:
+            retained.append(path)
+    return retained, first_control_flow
 
 
 def _rollback_transaction(state, primary, warning_reporter):
@@ -348,16 +405,18 @@ def _rollback_transaction(state, primary, warning_reporter):
         first_control_flow,
     )
 
-    retained_staging = [
-        path
-        for path in (state["staged_executable"], state["staged_internal"])
-        if _artifact_exists(path)
-    ]
-    retained_recovery = [
-        path
-        for path in (state["executable_recovery"], state["internal_recovery"])
-        if _artifact_exists(path)
-    ]
+    retained_staging, first_control_flow = _collect_retained_artifacts(
+        (state["staged_executable"], state["staged_internal"]),
+        "staging",
+        problems,
+        first_control_flow,
+    )
+    retained_recovery, first_control_flow = _collect_retained_artifacts(
+        (state["executable_recovery"], state["internal_recovery"]),
+        "recovery",
+        problems,
+        first_control_flow,
+    )
     artifact_messages = [
         message
         for message in (
@@ -388,13 +447,25 @@ def _cleanup_after_commit(recovery_paths, warning_reporter):
     first_control_flow = None
     messages = []
     for recovery in recovery_paths:
-        if not _artifact_exists(recovery):
+        exists, first_control_flow = _probe_artifact(
+            recovery,
+            "recovery artifact",
+            messages,
+            first_control_flow,
+        )
+        if exists is not True:
             continue
         try:
             _remove_leaf(recovery)
         except BaseException as error:
             first_control_flow = _remember_control_flow(first_control_flow, error)
-            if _artifact_exists(recovery):
+            retained, first_control_flow = _probe_artifact(
+                recovery,
+                "recovery artifact",
+                messages,
+                first_control_flow,
+            )
+            if retained is True:
                 messages.append(f"failed to clean retained recovery artifact {recovery}: {error}")
 
     first_control_flow = _report_messages(

@@ -984,3 +984,161 @@ def test_post_commit_cleanup_failure_warns_with_exact_retained_recovery_path(tmp
     assert warnings == [
         f"failed to clean retained recovery artifact {retained[0]}: cleanup failed"
     ]
+
+
+def test_rollback_existence_probe_control_flow_is_preserved_and_later_cleanup_runs(
+    tmp_path, monkeypatch
+):
+    paths = _bundle_paths(tmp_path)
+    _write(paths[2] / "new.txt", "new internal")
+    first = SystemExit(31)
+    real_exists = program_bundle._artifact_exists
+    real_remove = program_bundle._remove_leaf
+    existence_calls = 0
+    removal_attempts = []
+
+    def fail_first_existence_probe(path):
+        nonlocal existence_calls
+        if path is None:
+            return real_exists(path)
+        existence_calls += 1
+        if existence_calls == 1:
+            raise first
+        return real_exists(path)
+
+    def record_removal(path):
+        removal_attempts.append(Path(path).name)
+        return real_remove(path)
+
+    def fail_internal_stage(_source, destination, expected_stat=None):
+        _write(Path(destination) / "partial.txt", "partial")
+        raise OSError("ordinary staging failure")
+
+    monkeypatch.setattr(program_bundle, "_artifact_exists", fail_first_existence_probe)
+    monkeypatch.setattr(program_bundle, "_remove_leaf", record_removal)
+    monkeypatch.setattr(program_bundle, "_stage_internal_directory", fail_internal_stage)
+
+    with pytest.raises(SystemExit) as raised:
+        _replace(paths)
+
+    assert raised.value is first
+    assert len(removal_attempts) == 1
+    assert removal_attempts[0].startswith("._internal.program-bundle-stage-")
+
+
+def test_rollback_secondary_existence_signal_does_not_replace_first_or_stop_cleanup(
+    tmp_path, monkeypatch
+):
+    paths = _bundle_paths(tmp_path)
+    _write(paths[2] / "new.txt", "new internal")
+    first = KeyboardInterrupt("first removal signal")
+    secondary = SystemExit(32)
+    real_exists = program_bundle._artifact_exists
+    real_remove = program_bundle._remove_leaf
+    existence_calls = 0
+    removal_attempts = []
+
+    def signal_during_recheck(path):
+        nonlocal existence_calls
+        if path is None:
+            return real_exists(path)
+        existence_calls += 1
+        if existence_calls == 2:
+            raise secondary
+        return real_exists(path)
+
+    def signal_then_remove(path):
+        removal_attempts.append(Path(path).name)
+        if len(removal_attempts) == 1:
+            raise first
+        return real_remove(path)
+
+    def fail_internal_stage(_source, destination, expected_stat=None):
+        _write(Path(destination) / "partial.txt", "partial")
+        raise OSError("ordinary staging failure")
+
+    monkeypatch.setattr(program_bundle, "_artifact_exists", signal_during_recheck)
+    monkeypatch.setattr(program_bundle, "_remove_leaf", signal_then_remove)
+    monkeypatch.setattr(program_bundle, "_stage_internal_directory", fail_internal_stage)
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        _replace(paths)
+
+    assert raised.value is first
+    assert len(removal_attempts) == 2
+    assert removal_attempts[1].startswith("._internal.program-bundle-stage-")
+
+
+def test_post_commit_existence_probe_control_flow_is_preserved_and_later_cleanup_runs(
+    tmp_path, monkeypatch
+):
+    paths = _bundle_paths(tmp_path)
+    _write(paths[2] / "new.txt", "new internal")
+    _write(paths[1], "old executable")
+    _write(paths[3] / "old.txt", "old internal")
+    first = SystemExit(33)
+    real_exists = program_bundle._artifact_exists
+    real_remove = program_bundle._remove_leaf
+    existence_calls = 0
+    removal_attempts = []
+
+    def fail_first_existence_probe(path):
+        nonlocal existence_calls
+        existence_calls += 1
+        if existence_calls == 1:
+            raise first
+        return real_exists(path)
+
+    def record_removal(path):
+        removal_attempts.append(Path(path).name)
+        return real_remove(path)
+
+    monkeypatch.setattr(program_bundle, "_artifact_exists", fail_first_existence_probe)
+    monkeypatch.setattr(program_bundle, "_remove_leaf", record_removal)
+
+    with pytest.raises(SystemExit) as raised:
+        _replace(paths)
+
+    assert raised.value is first
+    assert len(removal_attempts) == 1
+    assert removal_attempts[0].startswith("._internal.program-bundle-recovery-")
+    assert paths[1].read_text(encoding="utf-8") == "new executable"
+    assert (paths[3] / "new.txt").read_text(encoding="utf-8") == "new internal"
+
+
+def test_post_commit_secondary_existence_signal_does_not_replace_first_or_stop_cleanup(
+    tmp_path, monkeypatch
+):
+    paths = _bundle_paths(tmp_path)
+    _write(paths[2] / "new.txt", "new internal")
+    _write(paths[1], "old executable")
+    _write(paths[3] / "old.txt", "old internal")
+    first = KeyboardInterrupt("first removal signal")
+    secondary = SystemExit(34)
+    real_exists = program_bundle._artifact_exists
+    real_remove = program_bundle._remove_leaf
+    existence_calls = 0
+    removal_attempts = []
+
+    def signal_during_recheck(path):
+        nonlocal existence_calls
+        existence_calls += 1
+        if existence_calls == 2:
+            raise secondary
+        return real_exists(path)
+
+    def signal_then_remove(path):
+        removal_attempts.append(Path(path).name)
+        if len(removal_attempts) == 1:
+            raise first
+        return real_remove(path)
+
+    monkeypatch.setattr(program_bundle, "_artifact_exists", signal_during_recheck)
+    monkeypatch.setattr(program_bundle, "_remove_leaf", signal_then_remove)
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        _replace(paths)
+
+    assert raised.value is first
+    assert len(removal_attempts) == 2
+    assert removal_attempts[1].startswith("._internal.program-bundle-recovery-")
