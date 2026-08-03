@@ -49,6 +49,7 @@ def install_fake_upgrade(
     logger_factory_calls = []
     recovery_files = {"database": True, "config": True}
     received_loggers = []
+    received_db_upgrade_versions = []
 
     def stage_result(stage):
         if stage != failure_stage:
@@ -81,8 +82,9 @@ def install_fake_upgrade(
             events.append("database_restore")
             return _perform_behavior(database_restore, "database_restore")
 
-        def upgrade(self):
+        def upgrade(self, current_version=None):
             events.append("db_upgrade")
+            received_db_upgrade_versions.append(current_version)
             return stage_result("db_upgrade")
 
         def update_version(self):
@@ -168,6 +170,7 @@ def install_fake_upgrade(
         logger=logger,
         logger_factory_calls=logger_factory_calls,
         received_loggers=received_loggers,
+        received_db_upgrade_versions=received_db_upgrade_versions,
         recovery_files=recovery_files,
     )
 
@@ -179,6 +182,7 @@ def test_run_upgrade_uses_default_logger_and_orders_commit_before_cleanup(monkey
 
     assert scenario.logger_factory_calls == ["core"]
     assert scenario.received_loggers == [scenario.logger]
+    assert scenario.received_db_upgrade_versions == ["0.1"]
     assert scenario.events == [
         "backup_db",
         "db_upgrade",
@@ -319,7 +323,7 @@ def test_missing_ordinary_source_does_not_trigger_orchestration_rollback(
             database_events.append("restore")
             return True
 
-        def upgrade(self):
+        def upgrade(self, current_version=None):
             database_events.append("upgrade")
             return True
 
@@ -461,7 +465,7 @@ def test_existing_invalid_split_database_fails_final_persistence_and_rolls_back(
             events.append("database_restore")
             return True
 
-        def upgrade(self):
+        def upgrade(self, current_version=None):
             events.append("db_upgrade")
             return True
 
@@ -1017,7 +1021,7 @@ def test_later_failures_restore_exact_json_bytes_with_real_config_manager(
             events.append("database_restore")
             return True
 
-        def upgrade(self):
+        def upgrade(self, current_version=None):
             events.append("db_upgrade")
             return True
 

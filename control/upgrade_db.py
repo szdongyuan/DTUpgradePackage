@@ -8,6 +8,9 @@ from consts.program_config import DATABASE_PATH, SYSTEM_DATABASE_PATH, BACKUP_DI
 from log_model.log_manager import LogManager
 
 
+_CURRENT_VERSION_UNSET = object()
+
+
 def read_current_version_from_db(db_path):
     if not os.path.exists(db_path):
         return None
@@ -186,13 +189,23 @@ class DataBaseManager:
         sql_connect.close()
         return True
 
-    def upgrade(self):
+    def upgrade(self, current_version=_CURRENT_VERSION_UNSET):
         try:
-            db_current_version = self.get_current_version()
+            if current_version is _CURRENT_VERSION_UNSET:
+                db_current_version = self.get_current_version()
+                if db_current_version is None:
+                    db_current_version = self.create_system_info_table()
+            else:
+                db_current_version = current_version
+                if (
+                    not isinstance(db_current_version, str)
+                    or db_current_version not in ALL_VERSIONS
+                ):
+                    raise ValueError(
+                        f"无效的显式数据库版本: {db_current_version}"
+                    )
             print(f"当前数据库版本: {db_current_version}")
             self.logger.info(f"当前数据库版本: {db_current_version}")
-            if db_current_version is None:
-                db_current_version = self.create_system_info_table()
             # 需要更新的版本列表
             start_idx = ALL_VERSIONS.index(db_current_version) + 1
             end_idx = ALL_VERSIONS.index(TARGET_VERSION) + 1

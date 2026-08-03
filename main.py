@@ -145,7 +145,7 @@ def run_upgrade(logger=None):
         config_manager = ConfigManager(logger, current_version)
         db = DataBaseManager(DATABASE_PATH)
 
-        _require_success(db.upgrade(), "数据库升级")
+        _require_success(db.upgrade(current_version), "数据库升级")
         _require_success(config_manager.update_config_file(), "配置文件升级")
 
         exe_manager = ExeUpgradeManager(

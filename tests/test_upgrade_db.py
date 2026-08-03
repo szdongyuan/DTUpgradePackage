@@ -1,3 +1,4 @@
+import os
 import shutil
 import sqlite3
 import uuid
@@ -139,6 +140,192 @@ def delete_version_metadata(path, name):
         conn.commit()
     finally:
         conn.close()
+
+
+def read_table_names(path):
+    conn = sqlite3.connect(path)
+    try:
+        return {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    finally:
+        conn.close()
+
+
+def test_explicit_target_version_makes_split_audio_database_rerun_a_noop(
+    monkeypatch,
+    local_tmp_path,
+):
+    database_path = local_tmp_path / "audio_data.db"
+    system_database_path = local_tmp_path / "system_data.db"
+    conn = sqlite3.connect(database_path)
+    try:
+        conn.execute(
+            "CREATE TABLE migrated_data (id INTEGER PRIMARY KEY, migrated TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO migrated_data (migrated) VALUES ('preserved')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    create_version_db(system_database_path, "0.26.07.01")
+    authoritative_version = upgrade_db.read_current_version_from_db(
+        str(system_database_path)
+    )
+    package_dir = local_tmp_path / "package"
+    resources_dir = package_dir / "resources"
+    resources_dir.mkdir(parents=True)
+    (resources_dir / "version_0.26.07.01.yml").write_text(
+        "db:\n"
+        "  sqls_operate:\n"
+        "    - ALTER TABLE migrated_data ADD COLUMN migrated TEXT\n"
+        "  data_check:\n"
+        "    add: []\n"
+        "    del: []\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        upgrade_db,
+        "ALL_VERSIONS",
+        ["0.12", "0.26.07.01"],
+    )
+    monkeypatch.setattr(upgrade_db, "TARGET_VERSION", "0.26.07.01")
+    monkeypatch.setattr(upgrade_db, "DEFAULT_DIR", str(package_dir) + os.sep)
+    monkeypatch.setattr(
+        upgrade_db.LogManager,
+        "set_log_handler",
+        staticmethod(lambda _name: DummyLogger()),
+    )
+    manager = DataBaseManager(str(database_path))
+    manager.check_table_data = lambda: True
+
+    assert manager.upgrade(authoritative_version) is True
+
+    assert "system_info_table" not in read_table_names(database_path)
+    conn = sqlite3.connect(database_path)
+    try:
+        assert conn.execute(
+            "SELECT migrated FROM migrated_data"
+        ).fetchall() == [("preserved",)]
+    finally:
+        conn.close()
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        manager.conn.execute("SELECT 1")
+
+
+def test_explicit_older_version_applies_updates_to_connected_audio_database(
+    monkeypatch,
+    local_tmp_path,
+):
+    database_path = local_tmp_path / "audio_data.db"
+    conn = sqlite3.connect(database_path)
+    try:
+        conn.execute("CREATE TABLE audio_records (id INTEGER PRIMARY KEY)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    package_dir = local_tmp_path / "package"
+    resources_dir = package_dir / "resources"
+    resources_dir.mkdir(parents=True)
+    (resources_dir / "version_2.0.yml").write_text(
+        "db:\n"
+        "  sqls_operate:\n"
+        "    - ALTER TABLE audio_records ADD COLUMN migrated TEXT\n"
+        "  data_check:\n"
+        "    add: []\n"
+        "    del: []\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(upgrade_db, "ALL_VERSIONS", ["1.0", "2.0"])
+    monkeypatch.setattr(upgrade_db, "TARGET_VERSION", "2.0")
+    monkeypatch.setattr(upgrade_db, "DEFAULT_DIR", str(package_dir) + os.sep)
+    monkeypatch.setattr(
+        upgrade_db.LogManager,
+        "set_log_handler",
+        staticmethod(lambda _name: DummyLogger()),
+    )
+    manager = DataBaseManager(str(database_path))
+    manager.check_table_data = lambda: True
+
+    assert manager.upgrade("1.0") is True
+
+    conn = sqlite3.connect(database_path)
+    try:
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(audio_records)").fetchall()
+        }
+    finally:
+        conn.close()
+    assert columns == {"id", "migrated"}
+    assert "system_info_table" not in read_table_names(database_path)
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        manager.conn.execute("SELECT 1")
+
+
+@pytest.mark.parametrize("current_version", [None, "", "9.9", 123])
+def test_invalid_explicit_version_fails_without_database_mutation_and_closes(
+    monkeypatch,
+    local_tmp_path,
+    current_version,
+):
+    database_path = local_tmp_path / "audio_data.db"
+    conn = sqlite3.connect(database_path)
+    try:
+        conn.execute("CREATE TABLE marker (value TEXT)")
+        conn.execute("INSERT INTO marker (value) VALUES ('unchanged')")
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(upgrade_db, "ALL_VERSIONS", ["1.0", "2.0"])
+    monkeypatch.setattr(upgrade_db, "TARGET_VERSION", "2.0")
+    monkeypatch.setattr(
+        upgrade_db.LogManager,
+        "set_log_handler",
+        staticmethod(lambda _name: DummyLogger()),
+    )
+    manager = DataBaseManager(str(database_path))
+
+    assert manager.upgrade(current_version) is False
+
+    assert read_table_names(database_path) == {"marker"}
+    conn = sqlite3.connect(database_path)
+    try:
+        assert conn.execute("SELECT value FROM marker").fetchall() == [
+            ("unchanged",)
+        ]
+    finally:
+        conn.close()
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        manager.conn.execute("SELECT 1")
+
+
+def test_upgrade_without_explicit_version_preserves_legacy_initialization(
+    monkeypatch,
+    local_tmp_path,
+):
+    database_path = local_tmp_path / "audio_data.db"
+    sqlite3.connect(database_path).close()
+    monkeypatch.setattr(upgrade_db, "ALL_VERSIONS", ["0.12"])
+    monkeypatch.setattr(upgrade_db, "TARGET_VERSION", "0.12")
+    monkeypatch.setattr(
+        upgrade_db.LogManager,
+        "set_log_handler",
+        staticmethod(lambda _name: DummyLogger()),
+    )
+    manager = DataBaseManager(str(database_path))
+    manager.check_table_data = lambda: True
+
+    assert manager.upgrade() is True
+    assert read_version_value(database_path, "current_version") == "0.12"
 
 
 def test_version_database_path_uses_audio_database_for_legacy_single_db(monkeypatch, local_tmp_path):
