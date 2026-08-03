@@ -32,6 +32,12 @@ function Get-AbsolutePath {
 
 $repositoryRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
 $distRoot = Get-AbsolutePath (Join-Path $repositoryRoot "dist")
+if (Test-Path -LiteralPath $distRoot) {
+    $distRootItem = Get-Item -LiteralPath $distRoot -Force
+    if (($distRootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Repository dist directory must not be a symbolic link or junction: $distRoot"
+    }
+}
 
 if ([string]::IsNullOrWhiteSpace($StageDirectory)) {
     $StageDirectory = Join-Path $distRoot "UpgradePackage"
@@ -106,33 +112,46 @@ if (Test-Path -LiteralPath $stagePath) {
 }
 New-Item -ItemType Directory -Path $stagePath | Out-Null
 
-$stagedExecutable = Join-Path $stagePath "main.exe"
-$stagedResources = Join-Path $stagePath "resources"
-Copy-Item -LiteralPath $executablePath -Destination $stagedExecutable -Force
-Copy-Item -LiteralPath $resourcesPath -Destination $stagedResources -Recurse -Force
-
-$stagedVersionPath = Join-Path $stagedResources "version.yml"
-if (-not (Test-Path -LiteralPath $stagedExecutable -PathType Leaf)) {
-    throw "Staged executable verification failed: $stagedExecutable"
-}
-if (-not (Test-Path -LiteralPath $stagedVersionPath -PathType Leaf)) {
-    throw "Staged version configuration verification failed: $stagedVersionPath"
-}
-
-$validationCode = "import sys; from consts.version_config import load_version_config; load_version_config(sys.argv[1])"
-Push-Location $repositoryRoot
 try {
-    & $PythonExecutable -c $validationCode $stagedVersionPath
-    $validationSucceeded = $?
-    $validationExitCodeVariable = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue
-    $validationExitCode = if ($null -eq $validationExitCodeVariable) { 0 } else { $validationExitCodeVariable.Value }
+    $stagedExecutable = Join-Path $stagePath "main.exe"
+    $stagedResources = Join-Path $stagePath "resources"
+    Copy-Item -LiteralPath $executablePath -Destination $stagedExecutable -Force
+    Copy-Item -LiteralPath $resourcesPath -Destination $stagedResources -Recurse -Force
+
+    $stagedVersionPath = Join-Path $stagedResources "version.yml"
+    if (-not (Test-Path -LiteralPath $stagedExecutable -PathType Leaf)) {
+        throw "Staged executable verification failed: $stagedExecutable"
+    }
+    if (-not (Test-Path -LiteralPath $stagedVersionPath -PathType Leaf)) {
+        throw "Staged version configuration verification failed: $stagedVersionPath"
+    }
+
+    $validationCode = "import sys; from consts.version_config import load_version_config; load_version_config(sys.argv[1])"
+    Push-Location $repositoryRoot
+    try {
+        & $PythonExecutable -c $validationCode $stagedVersionPath
+        $validationSucceeded = $?
+        $validationExitCodeVariable = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue
+        $validationExitCode = if ($null -eq $validationExitCodeVariable) { 0 } else { $validationExitCodeVariable.Value }
+    }
+    finally {
+        Pop-Location
+    }
+    if (-not $validationSucceeded -or ($null -ne $validationExitCode -and $validationExitCode -ne 0)) {
+        throw "Staged version configuration validation failed with exit code $validationExitCode"
+    }
 }
-finally {
-    Pop-Location
-}
-if (-not $validationSucceeded -or ($null -ne $validationExitCode -and $validationExitCode -ne 0)) {
-    Remove-Item -LiteralPath $stagePath -Recurse -Force
-    throw "Staged version configuration validation failed with exit code $validationExitCode"
+catch {
+    $originalFailure = $_
+    try {
+        if (Test-Path -LiteralPath $stagePath) {
+            Remove-Item -LiteralPath $stagePath -Recurse -Force
+        }
+    }
+    catch {
+        Write-Warning "Failed to clean incomplete stage directory: $stagePath"
+    }
+    throw $originalFailure
 }
 
 Write-Output "Staged release: $stagePath"

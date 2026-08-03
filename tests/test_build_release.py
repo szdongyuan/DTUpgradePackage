@@ -39,12 +39,12 @@ def write_resources(root):
     return resources
 
 
-def run_build_script(*arguments, env=None):
+def run_build_script(*arguments, env=None, script=BUILD_SCRIPT):
     command = [
         "powershell",
         "-NoProfile",
         "-File",
-        str(BUILD_SCRIPT),
+        str(script),
         *map(str, arguments),
     ]
     return subprocess.run(
@@ -296,6 +296,86 @@ def test_invalid_staged_version_config_fails_without_release_artifact(
     assert "Staged version configuration validation failed" in output
     assert "Staged release:" not in output
     assert not stage.exists()
+
+
+def test_validator_launch_failure_removes_partial_stage(release_test_root):
+    executable = release_test_root / "fake-main.exe"
+    executable.write_bytes(b"fake")
+    resources = write_resources(release_test_root)
+    stage = release_test_root / "validator-launch-failure-stage"
+    missing_python = release_test_root / "missing-python.exe"
+
+    result = run_build_script(
+        "-SkipBuild",
+        "-ExecutableSource",
+        executable,
+        "-ResourcesSource",
+        resources,
+        "-StageDirectory",
+        stage,
+        "-PythonExecutable",
+        missing_python,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert missing_python.name in output
+    assert "not recognized" in output
+    assert "Staged release:" not in output
+    assert not stage.exists()
+
+
+def test_repository_dist_reparse_point_is_rejected_without_touching_target(release_test_root):
+    fake_repository = release_test_root / "fake-repository"
+    copied_script = fake_repository / "scripts" / "build_release.ps1"
+    copied_script.parent.mkdir(parents=True)
+    shutil.copy2(BUILD_SCRIPT, copied_script)
+
+    external_dist = release_test_root / "external-dist-target"
+    external_dist.mkdir()
+    sentinel = external_dist / "sentinel.txt"
+    sentinel.write_text("preserve me", encoding="utf-8")
+    dist_link = fake_repository / "dist"
+    try:
+        dist_link.symlink_to(external_dist, target_is_directory=True)
+    except (NotImplementedError, OSError):
+        junction_result = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(dist_link), str(external_dist)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if junction_result.returncode != 0:
+            pytest.skip(
+                "Windows directory symlink and junction creation are unavailable: "
+                + junction_result.stderr
+            )
+
+    executable = release_test_root / "fake-main.exe"
+    executable.write_bytes(b"fake")
+    resources = write_resources(release_test_root)
+    try:
+        result = run_build_script(
+            "-SkipBuild",
+            "-ExecutableSource",
+            executable,
+            "-ResourcesSource",
+            resources,
+            "-PythonExecutable",
+            sys.executable,
+            script=copied_script,
+        )
+
+        output = result.stdout + result.stderr
+        assert result.returncode != 0
+        assert "repository dist directory must not be a symbolic link or junction" in output.lower()
+        assert sentinel.read_text(encoding="utf-8") == "preserve me"
+        assert not (external_dist / "UpgradePackage").exists()
+    finally:
+        if dist_link.is_symlink():
+            dist_link.unlink()
+        else:
+            os.rmdir(dist_link)
 
 
 @pytest.mark.parametrize("unsafe_stage", [DIST_ROOT, REPO_ROOT])
