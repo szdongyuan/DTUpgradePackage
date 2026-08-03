@@ -24,6 +24,9 @@ def test_version_manifest_contains_only_empty_upgrade_operations():
     }
 
 
-def test_version_is_latest_target_after_0_26_07_01():
-    assert ALL_VERSIONS[-2:] == ["0.26.07.01", "0.26.07.02"]
-    assert TARGET_VERSION == "0.26.07.02"
+def test_external_version_file_defines_current_release():
+    path = Path(__file__).resolve().parents[1] / "resources" / "version.yml"
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+
+    assert data["versions"] == ALL_VERSIONS
+    assert data["target_version"] == TARGET_VERSION == "0.26.07.02"

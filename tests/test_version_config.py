@@ -1,6 +1,12 @@
+import json
+import os
 from pathlib import Path
+import shutil
+import subprocess
+import sys
 
 import pytest
+import yaml
 
 from consts.version_config import (
     LEGACY_INITIAL_VERSION,
@@ -218,3 +224,74 @@ def test_compare_version_positions_uses_declared_indices():
 def test_sequence_helpers_reject_unknown_versions(helper, target, current, unknown):
     with pytest.raises(UnknownVersionError, match=unknown):
         helper(["0.12", "10", "2", "3"], target, current)
+
+
+def test_program_config_loads_external_snapshot_from_source_root(tmp_path):
+    repo = Path(__file__).resolve().parents[1]
+    away_from_repo = tmp_path / "working-directory"
+    away_from_repo.mkdir()
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(repo)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json, sys; "
+                "from consts.program_config import "
+                "ALL_VERSIONS, DEFAULT_DIR, DEFAULT_TARGET_DIR, "
+                "TARGET_VERSION, VERSION_CONFIG_PATH; "
+                "print(json.dumps({"
+                "'argv0': sys.argv[0], "
+                "'default_dir': DEFAULT_DIR, "
+                "'default_target_dir': DEFAULT_TARGET_DIR, "
+                "'version_config_path': str(VERSION_CONFIG_PATH), "
+                "'versions': ALL_VERSIONS, "
+                "'target': TARGET_VERSION}))"
+            ),
+        ],
+        cwd=away_from_repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    data = json.loads(result.stdout)
+    argv_dir = os.path.dirname(
+        os.path.realpath(away_from_repo / data["argv0"])
+    ).replace("\\", "/")
+    external_data = yaml.safe_load(
+        (repo / "resources" / "version.yml").read_text(encoding="utf-8")
+    )
+
+    assert Path(data["version_config_path"]) == repo / "resources" / "version.yml"
+    assert data["versions"] == external_data["versions"]
+    assert data["target"] == external_data["target_version"]
+    assert data["default_dir"] == argv_dir + "/"
+    assert data["default_target_dir"] == argv_dir + "/../"
+
+
+def test_program_config_import_fails_without_external_version_file(tmp_path):
+    repo = Path(__file__).resolve().parents[1]
+    isolated_source = tmp_path / "source"
+    shutil.copytree(
+        repo / "consts",
+        isolated_source / "consts",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+    away_from_source = tmp_path / "working-directory"
+    away_from_source.mkdir()
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(isolated_source)
+
+    result = subprocess.run(
+        [sys.executable, "-c", "import consts.program_config"],
+        cwd=away_from_source,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "version.yml" in result.stdout + result.stderr

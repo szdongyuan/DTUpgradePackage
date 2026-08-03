@@ -1,5 +1,8 @@
 import os
+from pathlib import Path
 import sys
+
+from consts.version_config import load_version_config, resolve_application_dir
 
 # DEFAULT_TARGET_DIR = os.path.split(os.path.realpath(__file__))[0].replace("\\", "/") + "/../../SpeakerAnomalyDetection/"
 # DEFAULT_DIR = os.path.split(os.path.realpath(__file__))[0].replace("\\", "/") + "/../"
@@ -24,8 +27,13 @@ BACKUP_UI_CONFIG_PATH = BACKUP_DIR + "ui_config/"
 BACKUP_AI_MODEL_CONFIG_PATH = BACKUP_DIR + "ai_model_config/"
 BACKUP_SCANNER_BARCODE_CONFIG_PATH = BACKUP_DIR + "scanner_barcode_config/"
 
-ALL_VERSIONS = ["0.12", "0.25.06.01", "0.25.07.01", "0.25.09.01", "0.25.12.01", "0.26.02.01", "0.26.06.01", "0.26.07.01", "0.26.07.02"]
-TARGET_VERSION = "0.26.07.02"
+_VERSION_CONFIG_ROOT = resolve_application_dir(
+    module_file=Path(__file__),
+    executable=Path(sys.executable),
+    frozen=getattr(sys, "frozen", False),
+)
+VERSION_CONFIG_PATH = _VERSION_CONFIG_ROOT / "resources" / "version.yml"
+ALL_VERSIONS, TARGET_VERSION = load_version_config(VERSION_CONFIG_PATH)
 
 KB = 1 << 10
 MB = 1 << 20
