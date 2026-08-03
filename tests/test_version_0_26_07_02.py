@@ -25,8 +25,22 @@ def test_version_manifest_contains_only_empty_upgrade_operations():
 
 
 def test_external_version_file_defines_current_release():
+    expected_versions = [
+        "0.12",
+        "0.25.06.01",
+        "0.25.07.01",
+        "0.25.09.01",
+        "0.25.12.01",
+        "0.26.02.01",
+        "0.26.06.01",
+        "0.26.07.01",
+        "0.26.07.02",
+    ]
+    expected_target = "0.26.07.02"
     path = Path(__file__).resolve().parents[1] / "resources" / "version.yml"
     data = yaml.safe_load(path.read_text(encoding="utf-8"))
 
-    assert data["versions"] == ALL_VERSIONS
-    assert data["target_version"] == TARGET_VERSION == "0.26.07.02"
+    assert data["versions"] == expected_versions
+    assert ALL_VERSIONS == expected_versions
+    assert data["target_version"] == expected_target
+    assert TARGET_VERSION == expected_target
