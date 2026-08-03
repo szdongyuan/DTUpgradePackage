@@ -57,6 +57,41 @@ def run_build_script(*arguments, env=None, script=BUILD_SCRIPT):
     )
 
 
+def create_directory_reparse_point(link, target):
+    assert link.is_absolute()
+    assert target.is_absolute()
+    try:
+        link.symlink_to(target, target_is_directory=True)
+        return
+    except (NotImplementedError, OSError):
+        if os.path.lexists(link):
+            remove_directory_reparse_point(link)
+
+    junction_result = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if junction_result.returncode != 0:
+        pytest.skip(
+            "Windows directory symlink and junction creation are unavailable: "
+            + junction_result.stderr
+        )
+
+
+def remove_directory_reparse_point(link):
+    if not os.path.lexists(link):
+        return
+    if link.is_symlink():
+        link.unlink()
+        return
+    if getattr(os.path, "isjunction", lambda _path: False)(link):
+        os.rmdir(link)
+        return
+    raise AssertionError(f"Refusing to remove non-reparse directory: {link}")
+
+
 def test_skip_build_stages_executable_and_external_resources(release_test_root):
     executable = release_test_root / "fake-main.exe"
     executable_bytes = b"fake executable marker\x00\xff"
@@ -336,20 +371,7 @@ def test_repository_dist_reparse_point_is_rejected_without_touching_target(relea
     sentinel = external_dist / "sentinel.txt"
     sentinel.write_text("preserve me", encoding="utf-8")
     dist_link = fake_repository / "dist"
-    try:
-        dist_link.symlink_to(external_dist, target_is_directory=True)
-    except (NotImplementedError, OSError):
-        junction_result = subprocess.run(
-            ["cmd.exe", "/d", "/c", "mklink", "/J", str(dist_link), str(external_dist)],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if junction_result.returncode != 0:
-            pytest.skip(
-                "Windows directory symlink and junction creation are unavailable: "
-                + junction_result.stderr
-            )
+    create_directory_reparse_point(dist_link, external_dist.resolve())
 
     executable = release_test_root / "fake-main.exe"
     executable.write_bytes(b"fake")
@@ -372,10 +394,74 @@ def test_repository_dist_reparse_point_is_rejected_without_touching_target(relea
         assert sentinel.read_text(encoding="utf-8") == "preserve me"
         assert not (external_dist / "UpgradePackage").exists()
     finally:
-        if dist_link.is_symlink():
-            dist_link.unlink()
-        else:
-            os.rmdir(dist_link)
+        remove_directory_reparse_point(dist_link)
+
+
+def test_stage_descendant_reparse_point_is_rejected_without_touching_target(
+    release_test_root, tmp_path
+):
+    executable = (release_test_root / "fake-main.exe").resolve()
+    executable.write_bytes(b"fake")
+    resources = write_resources(release_test_root).resolve()
+
+    resolved_tmp_path = tmp_path.resolve()
+    external_target = (resolved_tmp_path / "external-stage-target").resolve()
+    assert external_target.parent == resolved_tmp_path
+    assert not external_target.is_relative_to(DIST_ROOT.resolve())
+    (external_target / "existing").mkdir(parents=True)
+    (external_target / "sentinel.txt").write_bytes(b"preserve sentinel exactly\x00\xff")
+    (external_target / "existing" / "content.bin").write_bytes(b"existing target content")
+    before_files = {
+        path.relative_to(external_target): path.read_bytes()
+        for path in external_target.rglob("*")
+        if path.is_file()
+    }
+    before_directories = {
+        path.relative_to(external_target)
+        for path in external_target.rglob("*")
+        if path.is_dir()
+    }
+
+    stage_link = release_test_root / "linked-stage-component"
+    try:
+        create_directory_reparse_point(stage_link, external_target)
+        # Keep the absolute lexical path under repository dist. Resolving it after
+        # link creation would follow the link and bypass the component-specific guard.
+        stage = stage_link / "nested-stage"
+        result = run_build_script(
+            "-SkipBuild",
+            "-ExecutableSource",
+            executable,
+            "-ResourcesSource",
+            resources,
+            "-StageDirectory",
+            stage,
+            "-PythonExecutable",
+            Path(sys.executable).resolve(),
+        )
+
+        output = result.stdout + result.stderr
+        assert result.returncode != 0
+        assert "Stage directory must not traverse a symbolic link or junction:" in output
+        assert "Staged release:" not in output
+        after_files = {
+            path.relative_to(external_target): path.read_bytes()
+            for path in external_target.rglob("*")
+            if path.is_file()
+        }
+        after_directories = {
+            path.relative_to(external_target)
+            for path in external_target.rglob("*")
+            if path.is_dir()
+        }
+        assert after_files == before_files
+        assert after_directories == before_directories
+        assert not (external_target / "nested-stage").exists()
+    finally:
+        remove_directory_reparse_point(stage_link)
+        if external_target.exists():
+            assert external_target.parent == resolved_tmp_path
+            shutil.rmtree(external_target)
 
 
 @pytest.mark.parametrize("unsafe_stage", [DIST_ROOT, REPO_ROOT])
