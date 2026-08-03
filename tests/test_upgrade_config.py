@@ -5996,6 +5996,62 @@ def test_ordinary_config_source_swap_during_copy_then_restore_is_rejected(
     assert swap_artifacts(target) == []
 
 
+@pytest.mark.parametrize("destination_existed", [True, False])
+def test_source_swap_during_final_destination_check_aborts_before_commit(
+    configured_tree,
+    monkeypatch,
+    destination_existed,
+):
+    target = (
+        configured_tree.roots["ui_config"]
+        / f"final-source-check-{destination_existed}.bin"
+    )
+    source = configured_tree.config_dir / target.name
+    displaced_source = (
+        configured_tree.config_dir / f".{target.name}.original"
+    )
+    original_target = b"installed target"
+    if destination_existed:
+        target.write_bytes(original_target)
+    source.write_bytes(b"validated replacement")
+    manager = make_manager()
+    expected_source_state, source_error = (
+        manager._ordinary_config_source_state(str(source))
+    )
+    assert source_error is None
+    real_destination_is_current = (
+        manager._ordinary_config_destination_is_current
+    )
+    destination_check_calls = []
+
+    def swap_during_final_destination_check(destination_path):
+        result = real_destination_is_current(destination_path)
+        destination_check_calls.append(destination_path)
+        if len(destination_check_calls) == 2:
+            os.replace(source, displaced_source)
+            source.write_bytes(b"substituted replacement")
+        return result
+
+    monkeypatch.setattr(
+        manager,
+        "_ordinary_config_destination_is_current",
+        swap_during_final_destination_check,
+    )
+
+    assert manager._replace_with_staged_ordinary_config(
+        str(source),
+        str(target),
+        expected_source_state=expected_source_state,
+    ) is False
+
+    assert len(destination_check_calls) == 2
+    if destination_existed:
+        assert target.read_bytes() == original_target
+    else:
+        assert not target.exists()
+    assert swap_artifacts(target) == []
+
+
 def test_ordinary_config_concurrent_destination_creation_is_preserved(
     configured_tree,
     monkeypatch,
