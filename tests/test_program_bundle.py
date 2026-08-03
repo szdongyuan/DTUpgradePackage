@@ -1142,3 +1142,51 @@ def test_post_commit_secondary_existence_signal_does_not_replace_first_or_stop_c
     assert raised.value is first
     assert len(removal_attempts) == 2
     assert removal_attempts[1].startswith("._internal.program-bundle-recovery-")
+
+
+@pytest.mark.parametrize(
+    ("boundary", "target_call"),
+    [
+        ("internal_displacement", 1),
+        ("executable_displacement", 2),
+        ("internal_installation", 3),
+        ("executable_installation", 4),
+    ],
+)
+@pytest.mark.parametrize(
+    "signal",
+    [KeyboardInterrupt("after effect"), SystemExit(41)],
+    ids=["interrupt", "system_exit"],
+)
+def test_after_effect_control_flow_reconciles_transition_and_restores_original_bundle(
+    tmp_path, monkeypatch, boundary, target_call, signal
+):
+    paths = _bundle_paths(tmp_path)
+    _write(paths[2] / "new.txt", "new internal")
+    _write(paths[1], "old executable")
+    _write(paths[3] / "old.txt", "old internal")
+    original_executable = paths[1].stat()
+    original_internal = paths[3].stat()
+    real_replace = program_bundle.os.replace
+    replace_calls = 0
+
+    def replace_then_signal(source, destination):
+        nonlocal replace_calls
+        replace_calls += 1
+        result = real_replace(source, destination)
+        if replace_calls == target_call:
+            raise signal
+        return result
+
+    monkeypatch.setattr(program_bundle.os, "replace", replace_then_signal)
+
+    with pytest.raises(type(signal)) as raised:
+        _replace(paths)
+
+    assert raised.value is signal, boundary
+    assert paths[1].stat().st_ino == original_executable.st_ino
+    assert paths[1].read_text(encoding="utf-8") == "old executable"
+    assert paths[3].stat().st_ino == original_internal.st_ino
+    assert (paths[3] / "old.txt").read_text(encoding="utf-8") == "old internal"
+    assert not (paths[3] / "new.txt").exists()
+    _assert_no_transaction_artifacts(paths[1].parent)

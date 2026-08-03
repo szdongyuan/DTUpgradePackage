@@ -228,12 +228,10 @@ def _temporary_recovery_path(parent, leaf):
     return tempfile.mktemp(prefix=f".{leaf}.program-bundle-recovery-", dir=parent)
 
 
-def _move_destination_to_recovery(destination):
+def _prepare_destination_recovery(destination):
     if not os.path.lexists(destination):
         return None
-    recovery = _temporary_recovery_path(os.path.dirname(destination), os.path.basename(destination))
-    os.replace(destination, recovery)
-    return recovery
+    return _temporary_recovery_path(os.path.dirname(destination), os.path.basename(destination))
 
 
 def _report_warning_best_effort(warning_reporter, message):
@@ -358,9 +356,64 @@ def _collect_retained_artifacts(paths, kind, problems, first_control_flow):
     return retained, first_control_flow
 
 
+def _probe_expected_identity(path, expected_stat, description, problems, first_control_flow):
+    exists, first_control_flow = _probe_artifact(
+        path,
+        description,
+        problems,
+        first_control_flow,
+    )
+    if exists is not True:
+        return False if exists is False else None, first_control_flow
+    try:
+        current_stat = _stat_no_follow(path)
+    except BaseException as error:
+        first_control_flow = _remember_control_flow(first_control_flow, error)
+        problems.append(f"failed to inspect identity of {description} {path}: {error}")
+        return None, first_control_flow
+    return _same_identity(current_stat, expected_stat), first_control_flow
+
+
+def _reconcile_interrupted_installations(state, problems, first_control_flow):
+    for name, description in (
+        ("executable", "staged executable"),
+        ("internal", "staged internal directory"),
+    ):
+        if state[f"{name}_installed"] or not state[f"{name}_install_started"]:
+            continue
+
+        staged_exists, first_control_flow = _probe_artifact(
+            state[f"staged_{name}"],
+            description,
+            problems,
+            first_control_flow,
+        )
+        destination_matches, first_control_flow = _probe_expected_identity(
+            state[f"destination_{name}"],
+            state[f"staged_{name}_identity"],
+            f"installed {name}",
+            problems,
+            first_control_flow,
+        )
+        if destination_matches is True:
+            state[f"{name}_installed"] = True
+        elif staged_exists is False and destination_matches is False:
+            problems.append(
+                f"cannot reconcile interrupted {name} installation; staged and destination "
+                "objects do not contain the staged identity"
+            )
+    return first_control_flow
+
+
 def _rollback_transaction(state, primary, warning_reporter):
     first_control_flow = _remember_control_flow(None, primary)
     problems = []
+
+    first_control_flow = _reconcile_interrupted_installations(
+        state,
+        problems,
+        first_control_flow,
+    )
 
     if state["executable_installed"]:
         first_control_flow = _remove_artifact(
@@ -377,20 +430,22 @@ def _rollback_transaction(state, primary, warning_reporter):
             first_control_flow,
         )
 
-    first_control_flow = _restore_recovery(
-        state["executable_recovery"],
-        state["destination_executable"],
-        "prior executable",
-        problems,
-        first_control_flow,
-    )
-    first_control_flow = _restore_recovery(
-        state["internal_recovery"],
-        state["destination_internal"],
-        "prior internal object",
-        problems,
-        first_control_flow,
-    )
+    if state["executable_displacement_started"]:
+        first_control_flow = _restore_recovery(
+            state["executable_recovery"],
+            state["destination_executable"],
+            "prior executable",
+            problems,
+            first_control_flow,
+        )
+    if state["internal_displacement_started"]:
+        first_control_flow = _restore_recovery(
+            state["internal_recovery"],
+            state["destination_internal"],
+            "prior internal object",
+            problems,
+            first_control_flow,
+        )
 
     first_control_flow = _remove_artifact(
         state["staged_executable"],
@@ -502,6 +557,12 @@ def replace_program_bundle(
         "staged_internal": None,
         "executable_recovery": None,
         "internal_recovery": None,
+        "executable_displacement_started": False,
+        "internal_displacement_started": False,
+        "executable_install_started": False,
+        "internal_install_started": False,
+        "staged_executable_identity": None,
+        "staged_internal_identity": None,
         "executable_installed": False,
         "internal_installed": False,
     }
@@ -516,6 +577,7 @@ def replace_program_bundle(
             state["staged_executable"],
             expected_stat=executable_stat,
         )
+        state["staged_executable_identity"] = _stat_no_follow(state["staged_executable"])
 
         if internal_participates:
             state["staged_internal"] = tempfile.mkdtemp(
@@ -527,15 +589,24 @@ def replace_program_bundle(
                 state["staged_internal"],
                 expected_stat=internal_stat,
             )
+            state["staged_internal_identity"] = _stat_no_follow(state["staged_internal"])
 
         if internal_participates:
-            state["internal_recovery"] = _move_destination_to_recovery(destination_internal)
-        state["executable_recovery"] = _move_destination_to_recovery(destination_executable)
+            state["internal_recovery"] = _prepare_destination_recovery(destination_internal)
+            if state["internal_recovery"] is not None:
+                state["internal_displacement_started"] = True
+                os.replace(destination_internal, state["internal_recovery"])
+        state["executable_recovery"] = _prepare_destination_recovery(destination_executable)
+        if state["executable_recovery"] is not None:
+            state["executable_displacement_started"] = True
+            os.replace(destination_executable, state["executable_recovery"])
 
         if internal_participates:
+            state["internal_install_started"] = True
             os.replace(state["staged_internal"], destination_internal)
             state["staged_internal"] = None
             state["internal_installed"] = True
+        state["executable_install_started"] = True
         os.replace(state["staged_executable"], destination_executable)
         state["staged_executable"] = None
         state["executable_installed"] = True
