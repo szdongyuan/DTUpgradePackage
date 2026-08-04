@@ -355,7 +355,7 @@ def test_validator_launch_failure_removes_partial_stage(release_test_root):
     output = result.stdout + result.stderr
     assert result.returncode != 0
     assert missing_python.name in output
-    assert "not recognized" in output
+    assert "CommandNotFoundException" in output
     assert "Staged release:" not in output
     assert not stage.exists()
 
