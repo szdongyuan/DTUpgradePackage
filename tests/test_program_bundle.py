@@ -21,10 +21,10 @@ def _bundle_paths(tmp_path):
     destination_parent = tmp_path / "deployed"
     source_parent.mkdir(parents=True)
     destination_parent.mkdir()
-    source_executable = _write(source_parent / "DiTing.exe", "new executable")
+    source_executable = _write(source_parent / "xiting.exe", "new executable")
     return (
         source_executable,
-        destination_parent / "DiTing.exe",
+        destination_parent / "xiting.exe",
         source_parent / "_internal",
         destination_parent / "_internal",
     )
@@ -74,15 +74,15 @@ def test_success_resolves_parent_aliases_and_keeps_fixed_leaf_names(tmp_path):
     destination_alias = tmp_path / "destination-alias"
     _make_directory_alias(source_alias, source_real_parent)
     _make_directory_alias(destination_alias, destination_real_parent)
-    paths[0] = source_alias / "DiTing.exe"
+    paths[0] = source_alias / "xiting.exe"
     paths[2] = source_alias / "_internal"
-    paths[1] = destination_alias / "DiTing.exe"
+    paths[1] = destination_alias / "xiting.exe"
     paths[3] = destination_alias / "_internal"
 
     result = _replace(paths)
 
     assert result.internal_replaced is False
-    assert (destination_real_parent / "DiTing.exe").read_text(encoding="utf-8") == "new executable"
+    assert (destination_real_parent / "xiting.exe").read_text(encoding="utf-8") == "new executable"
     _assert_no_transaction_artifacts(destination_real_parent)
 
 

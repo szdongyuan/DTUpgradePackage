@@ -10,6 +10,15 @@ from control.program_bundle import ProgramBundleError, ProgramBundleResult
 from control import upgrade_config, upgrade_db
 
 
+@pytest.fixture(autouse=True)
+def isolate_real_desktop(monkeypatch):
+    monkeypatch.setattr(
+        upgrade_main, "ensure_desktop_shortcut",
+        lambda _target: SimpleNamespace(status="existing", path="fake-desktop/xiting.lnk"),
+        raising=False,
+    )
+
+
 class RecordingLogger:
     def __init__(self):
         self.messages = []
@@ -22,6 +31,74 @@ class RecordingLogger:
 
     def error(self, message):
         self.messages.append(("error", message))
+
+
+def test_shortcut_runs_only_after_bundle_success_with_absolute_target(monkeypatch):
+    events = []
+    monkeypatch.setattr(upgrade_main, "DEFAULT_TARGET_DIR", "deployed-root/")
+
+    def replace(*_args, **_kwargs):
+        events.append("bundle")
+        return ProgramBundleResult(internal_replaced=True)
+
+    def shortcut(target):
+        events.append(("shortcut", target))
+        return SimpleNamespace(status="created", path="fake-desktop/xiting.lnk")
+
+    monkeypatch.setattr(upgrade_main, "replace_program_bundle", replace)
+    monkeypatch.setattr(upgrade_main, "ensure_desktop_shortcut", shortcut)
+    logger = RecordingLogger()
+    assert upgrade_main.update_version_program(logger)[0] is True
+    assert events == ["bundle", ("shortcut", os.path.abspath("deployed-root/xiting.exe"))]
+    assert any("快捷方式" in message for _level, message in logger.messages)
+
+
+def test_bundle_failure_prevents_shortcut_maintenance(monkeypatch):
+    def fail_bundle(*_args, **_kwargs):
+        raise ProgramBundleError("replacement failed")
+
+    monkeypatch.setattr(upgrade_main, "replace_program_bundle", fail_bundle)
+    monkeypatch.setattr(
+        upgrade_main, "ensure_desktop_shortcut",
+        lambda _target: pytest.fail("shortcut must follow successful replacement"),
+    )
+    assert upgrade_main.update_version_program(RecordingLogger())[0] is False
+
+
+@pytest.mark.parametrize("reporter_failure", [None, "print", "logger"])
+def test_shortcut_failure_warns_without_rollback(monkeypatch, reporter_failure):
+    real_update = upgrade_main.update_version_program
+    scenario = install_fake_upgrade(monkeypatch)
+    monkeypatch.setattr(upgrade_main, "update_version_program", real_update)
+    monkeypatch.setattr(
+        upgrade_main, "replace_program_bundle",
+        lambda *_args, **_kwargs: ProgramBundleResult(internal_replaced=False),
+    )
+
+    def fail_shortcut(_target):
+        raise OSError("desktop access denied")
+
+    printed = []
+
+    def report(message):
+        printed.append(message)
+        if reporter_failure == "print" and "快捷方式" in message:
+            raise OSError("console unavailable")
+
+    monkeypatch.setattr(upgrade_main, "ensure_desktop_shortcut", fail_shortcut)
+    monkeypatch.setattr(upgrade_main, "print", report, raising=False)
+    if reporter_failure == "logger":
+        def fail_warning(_message):
+            raise OSError("logger unavailable")
+
+        monkeypatch.setattr(scenario.logger, "warning", fail_warning)
+    assert upgrade_main.run_upgrade(scenario.logger) is True
+    assert "version_update" in scenario.events
+    assert "database_restore" not in scenario.events
+    assert "config_restore" not in scenario.events
+    assert any("快捷方式" in message and "desktop access denied" in message for message in printed)
+    if reporter_failure != "logger":
+        assert any(level == "warning" and "快捷方式" in message for level, message in scenario.logger.messages)
 
 
 def _perform_behavior(behavior, name, on_success=None):
@@ -707,8 +784,8 @@ def test_program_bundle_uses_fixed_paths_and_result_driven_logging(
     assert len(calls) == 1
     args, kwargs = calls[0]
     assert args == (
-        "package-root/resources/DiTing.exe",
-        "deployed-root/DiTing.exe",
+        "package-root/resources/xiting.exe",
+        "deployed-root/xiting.exe",
         "package-root/resources/_internal",
         "deployed-root/_internal",
     )
@@ -722,7 +799,7 @@ def test_program_bundle_warning_reports_retained_artifact_without_failing(
 ):
     logger = RecordingLogger()
     printed = []
-    retained_path = "deployed-root/.DiTing.exe.program-bundle-recovery-retained"
+    retained_path = "deployed-root/.xiting.exe.program-bundle-recovery-retained"
 
     def fake_replace_program_bundle(*_args, warning_reporter, **_kwargs):
         warning_reporter(f"retained recovery artifact: {retained_path}")
@@ -763,7 +840,7 @@ def test_program_bundle_error_preserves_retained_artifact_and_required_stage_fai
 ):
     real_update_version_program = upgrade_main.update_version_program
     scenario = install_fake_upgrade(monkeypatch)
-    retained_path = "deployed-root/.DiTing.exe.program-bundle-stage-retained"
+    retained_path = "deployed-root/.xiting.exe.program-bundle-stage-retained"
 
     def fail_bundle(*_args, **_kwargs):
         raise ProgramBundleError(f"retained staging artifact: {retained_path}")
@@ -847,8 +924,8 @@ def test_successful_program_bundle_reporting_failure_still_commits_and_cleans_up
     scenario = install_fake_upgrade(monkeypatch)
     package_dir = tmp_path / "package"
     target_dir = tmp_path / "target"
-    source_program = package_dir / "resources" / "DiTing.exe"
-    target_program = target_dir / "DiTing.exe"
+    source_program = package_dir / "resources" / "xiting.exe"
+    target_program = target_dir / "xiting.exe"
     source_bytes = b"new executable bytes"
     original_target_bytes = b"old executable bytes"
     source_program.parent.mkdir(parents=True)

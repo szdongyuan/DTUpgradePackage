@@ -15,7 +15,7 @@ class ProgramBundleResult:
     internal_replaced: bool
 
 
-_EXPECTED_EXECUTABLE_LEAF = "DiTing.exe"
+_EXPECTED_EXECUTABLE_LEAF = "xiting.exe"
 _EXPECTED_INTERNAL_LEAF = "_internal"
 _COPY_BUFFER_SIZE = 1024 * 1024
 

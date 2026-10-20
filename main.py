@@ -1,6 +1,7 @@
 import os
 import sys
 
+from control.desktop_shortcut import ensure_desktop_shortcut
 from control.program_bundle import (
     ProgramBundleError,
     ProgramBundleResult,
@@ -27,8 +28,8 @@ def update_version_program(
     _print_safely("正在更新主程序...")
     _log_safely(logger, "info", "正在更新主程序...")
 
-    source_executable = DEFAULT_DIR + "resources/DiTing.exe"
-    destination_executable = DEFAULT_TARGET_DIR + "DiTing.exe"
+    source_executable = DEFAULT_DIR + "resources/xiting.exe"
+    destination_executable = DEFAULT_TARGET_DIR + "xiting.exe"
     source_internal = DEFAULT_DIR + "resources/_internal"
     destination_internal = DEFAULT_TARGET_DIR + "_internal"
 
@@ -54,6 +55,16 @@ def update_version_program(
     else:
         internal_message = "主程序 _internal 源不存在，跳过目录替换"
     _log_safely(logger, "info", internal_message)
+
+    try:
+        shortcut = ensure_desktop_shortcut(os.path.abspath(destination_executable))
+        if shortcut.status in ("created", "existing"):
+            action = "已创建" if shortcut.status == "created" else "已存在"
+            shortcut_message = f"桌面快捷方式{action}: {shortcut.path}"
+            _print_safely(shortcut_message)
+            _log_safely(logger, "info", shortcut_message)
+    except Exception as error:
+        report_warning(f"桌面快捷方式检查或创建失败: {error}")
 
     _print_safely("更新主程序成功")
     _log_safely(logger, "info", "更新主程序成功")
